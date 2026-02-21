@@ -104,20 +104,26 @@ func (e *Engine) evalFunction(ctx context.Context, fc *FunctionCall, start, end 
 		if len(fc.Args) != 1 {
 			return nil, fmt.Errorf("rate() requires exactly 1 argument")
 		}
+		rs, ok := fc.Args[0].(*RangeSelector)
+		if !ok {
+			return nil, fmt.Errorf("rate() requires a range vector argument, e.g. rate(metric[5m])")
+		}
 		series, err := e.eval(ctx, fc.Args[0], start, end)
 		if err != nil {
 			return nil, err
 		}
+		rangeMs := rs.Duration.Milliseconds()
 		var results []ResultSeries
 		for _, s := range series {
-			ratePoints := rate(s.Points)
-			if len(ratePoints) > 0 {
-				results = append(results, ResultSeries{
-					Name:   s.Name,
-					Labels: s.Labels,
-					Points: ratePoints,
-				})
+			v, ok := rate(s.Points, rangeMs, end)
+			if !ok {
+				continue
 			}
+			results = append(results, ResultSeries{
+				Name:   s.Name,
+				Labels: s.Labels,
+				Points: []storage.Point{{Timestamp: end, Value: v}},
+			})
 		}
 		return results, nil
 

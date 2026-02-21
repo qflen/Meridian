@@ -39,7 +39,11 @@ func (e *Engine) Execute(ctx context.Context, query string, start, end int64, st
 	}
 
 	plan := Plan(expr, start, end, step)
-	return e.eval(ctx, plan.Expr, plan.TimeRange[0], end)
+	// Pass the original start through. The planner's TimeRange records the widest
+	// data span a future stepped evaluator will need to fetch (start - maxRange);
+	// the per-selector range window is applied exactly once, in evalRange, so it
+	// must not be pre-subtracted here as well.
+	return e.eval(ctx, plan.Expr, start, end)
 }
 
 func (e *Engine) eval(ctx context.Context, expr Expr, start, end int64) ([]ResultSeries, error) {
@@ -83,8 +87,11 @@ func (e *Engine) evalVector(ctx context.Context, vs *VectorSelector, start, end 
 }
 
 func (e *Engine) evalRange(ctx context.Context, rs *RangeSelector, start, end int64) ([]ResultSeries, error) {
-	// For range selectors, extend start by the duration
-	rangeStart := start - rs.Duration.Milliseconds()
+	// A range vector m[d] evaluated at instant `end` covers (end-d, end]. We anchor
+	// the window at `end` rather than `start` so rate()/range functions read exactly
+	// one selector-width of samples regardless of how wide [start,end] is. This is
+	// the single place the range duration is subtracted (see Execute).
+	rangeStart := end - rs.Duration.Milliseconds()
 	return e.evalVector(ctx, rs.Vector, rangeStart, end)
 }
 

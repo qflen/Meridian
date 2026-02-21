@@ -36,7 +36,9 @@ func (*FunctionCall) exprNode() {}
 type AggregateExpr struct {
 	Op       string
 	Expr     Expr
-	Grouping []string // label names for by() clause
+	Param    Expr     // optional scalar parameter, e.g. k in topk(k, v)
+	Grouping []string // label names for the by()/without() clause
+	Without  bool     // true when Grouping is a without() exclusion list
 }
 
 func (*AggregateExpr) exprNode() {}

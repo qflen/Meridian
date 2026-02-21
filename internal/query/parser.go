@@ -14,6 +14,7 @@ type Parser struct {
 // aggregation operator names recognized by the parser.
 var aggregateOps = map[string]bool{
 	"sum": true, "avg": true, "max": true, "min": true, "count": true,
+	"topk": true, "bottomk": true,
 }
 
 // function names recognized by the parser.
@@ -130,60 +131,90 @@ func (p *Parser) parseAggregateOrFunction() (Expr, error) {
 	name := p.peek().Literal
 	p.advance()
 
-	// Handle: avg by (labels)(expr) — grouping before arguments
-	if p.peek().Type == TokenBy {
+	// Grouping can precede the argument list: avg by (labels) (expr).
+	if p.peek().Type == TokenBy || p.peek().Type == TokenWithout {
+		without := p.peek().Type == TokenWithout
 		p.advance()
 		grouping, err := p.parseGrouping()
 		if err != nil {
 			return nil, err
 		}
-		if p.peek().Type != TokenLParen {
-			return nil, fmt.Errorf("expected '(' after grouping at position %d", p.peek().Pos)
-		}
-		p.advance()
-		arg, err := p.parseExpr()
+		expr, err := p.parseAggregateArgs(name)
 		if err != nil {
 			return nil, err
 		}
-		if p.peek().Type != TokenRParen {
-			return nil, fmt.Errorf("expected ')' at position %d", p.peek().Pos)
-		}
-		p.advance()
-		return &AggregateExpr{Op: name, Expr: arg, Grouping: grouping}, nil
+		return applyGrouping(expr, grouping, without)
 	}
 
 	if p.peek().Type == TokenLParen {
-		// Could be function call: sum(expr) or aggregate: sum(expr) by (labels)
-		p.advance()
-		arg, err := p.parseExpr()
+		expr, err := p.parseAggregateArgs(name)
 		if err != nil {
 			return nil, err
 		}
-		if p.peek().Type != TokenRParen {
-			return nil, fmt.Errorf("expected ')' at position %d", p.peek().Pos)
-		}
-		p.advance()
-
-		// Check for "by" clause
-		if p.peek().Type == TokenBy {
+		// Grouping can also follow the argument list: sum(expr) without (labels).
+		if p.peek().Type == TokenBy || p.peek().Type == TokenWithout {
+			without := p.peek().Type == TokenWithout
 			p.advance()
 			grouping, err := p.parseGrouping()
 			if err != nil {
 				return nil, err
 			}
-			return &AggregateExpr{Op: name, Expr: arg, Grouping: grouping}, nil
+			return applyGrouping(expr, grouping, without)
 		}
-
-		// If it's an aggregate op without "by", treat as aggregate
-		if aggregateOps[name] && !onlyFunctionNames[name] {
-			return &AggregateExpr{Op: name, Expr: arg}, nil
-		}
-
-		return &FunctionCall{Name: name, Args: []Expr{arg}}, nil
+		return expr, nil
 	}
 
 	// Bare aggregate name without parens? That's a metric name.
-	return p.parseVectorSelectorFrom(name)
+	return p.finishSelector(name)
+}
+
+// parseAggregateArgs parses the ( arg [, arg] ) following an aggregate or
+// function name. Two arguments mean a parameterized aggregate such as
+// topk(k, v); one argument yields an aggregate or a function call.
+func (p *Parser) parseAggregateArgs(name string) (Expr, error) {
+	if p.peek().Type != TokenLParen {
+		return nil, fmt.Errorf("expected '(' after %q at position %d", name, p.peek().Pos)
+	}
+	p.advance()
+
+	first, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+
+	if p.peek().Type == TokenComma {
+		p.advance()
+		second, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.peek().Type != TokenRParen {
+			return nil, fmt.Errorf("expected ')' at position %d", p.peek().Pos)
+		}
+		p.advance()
+		return &AggregateExpr{Op: name, Param: first, Expr: second}, nil
+	}
+
+	if p.peek().Type != TokenRParen {
+		return nil, fmt.Errorf("expected ')' at position %d", p.peek().Pos)
+	}
+	p.advance()
+
+	if aggregateOps[name] && !onlyFunctionNames[name] {
+		return &AggregateExpr{Op: name, Expr: first}, nil
+	}
+	return &FunctionCall{Name: name, Args: []Expr{first}}, nil
+}
+
+// applyGrouping attaches a by()/without() clause to an aggregate expression.
+func applyGrouping(expr Expr, grouping []string, without bool) (Expr, error) {
+	ae, ok := expr.(*AggregateExpr)
+	if !ok {
+		return nil, fmt.Errorf("grouping clause is only valid on an aggregation")
+	}
+	ae.Grouping = grouping
+	ae.Without = without
+	return ae, nil
 }
 
 var onlyFunctionNames = map[string]bool{

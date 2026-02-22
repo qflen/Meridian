@@ -139,18 +139,7 @@ func (e *Engine) evalFunction(ctx context.Context, fc *FunctionCall, start, end 
 		if err != nil {
 			return nil, err
 		}
-		var results []ResultSeries
-		for _, s := range series {
-			pts := histogramQuantile(phiExpr.Value, s.Points)
-			if len(pts) > 0 {
-				results = append(results, ResultSeries{
-					Name:   s.Name,
-					Labels: s.Labels,
-					Points: pts,
-				})
-			}
-		}
-		return results, nil
+		return histogramQuantile(phiExpr.Value, series), nil
 
 	default:
 		// Treat unknown function names as aggregate ops if they match

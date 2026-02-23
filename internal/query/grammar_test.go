@@ -87,7 +87,8 @@ func TestUnaryExpressions(t *testing.T) {
 
 	check := func(q string, want float64) {
 		t.Helper()
-		res, err := engine.Execute(context.Background(), q, 0, 3000, 15*time.Second)
+		// Evaluate at the instant of the last sample (ts=2000) so -cpu negates 8.
+		res, err := engine.Execute(context.Background(), q, 2000, 2000, 15*time.Second)
 		if err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
@@ -132,7 +133,7 @@ func TestBareSelectorEval(t *testing.T) {
 	db.Ingest("up", map[string]string{"job": "db"}, 1000, 1)
 	engine := NewEngine(db)
 
-	res, err := engine.Execute(context.Background(), `{job="api"}`, 0, 2000, 15*time.Second)
+	res, err := engine.Execute(context.Background(), `{job="api"}`, 1000, 1000, 15*time.Second)
 	if err != nil {
 		t.Fatalf("eval: %v", err)
 	}

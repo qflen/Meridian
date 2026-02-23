@@ -37,7 +37,7 @@ func TestTopKBottomK(t *testing.T) {
 	db.Ingest("metric", map[string]string{"host": "c"}, 1000, 20)
 	engine := NewEngine(db)
 
-	top, err := engine.Execute(context.Background(), "topk(2, metric)", 0, 2000, 15*time.Second)
+	top, err := engine.Execute(context.Background(), "topk(2, metric)", 1000, 1000, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestTopKBottomK(t *testing.T) {
 		t.Fatalf("topk(2) should have dropped host=a (value 10)")
 	}
 
-	bottom, err := engine.Execute(context.Background(), "bottomk(1, metric)", 0, 2000, 15*time.Second)
+	bottom, err := engine.Execute(context.Background(), "bottomk(1, metric)", 1000, 1000, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestAggregationWithout(t *testing.T) {
 	db.Ingest("m", map[string]string{"host": "h2", "instance": "i1"}, 1000, 5)
 	engine := NewEngine(db)
 
-	res, err := engine.Execute(context.Background(), "sum(m) without (instance)", 0, 2000, 15*time.Second)
+	res, err := engine.Execute(context.Background(), "sum(m) without (instance)", 1000, 1000, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +113,7 @@ func TestAggregationByMissingLabel(t *testing.T) {
 	db.Ingest("m", map[string]string{"dc": "z"}, 1000, 5) // no host label
 	engine := NewEngine(db)
 
-	res, err := engine.Execute(context.Background(), "sum(m) by (host)", 0, 2000, 15*time.Second)
+	res, err := engine.Execute(context.Background(), "sum(m) by (host)", 1000, 1000, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -21,7 +21,7 @@ func TestVectorVectorDivision(t *testing.T) {
 	db.Ingest("errors", map[string]string{"host": "web3"}, 1000, 1)
 
 	engine := NewEngine(db)
-	res, err := engine.Execute(context.Background(), "errors / requests", 0, 2000, 15*time.Second)
+	res, err := engine.Execute(context.Background(), "errors / requests", 1000, 1000, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,8 +78,9 @@ func TestUnknownBinaryOperatorErrors(t *testing.T) {
 	defer db.Close()
 	engine := NewEngine(db)
 
-	_, err := engine.eval(context.Background(),
-		&BinaryExpr{Op: "%", Left: &NumberLiteral{Value: 1}, Right: &NumberLiteral{Value: 1}}, 0, 1000)
+	ec := &evalContext{ctx: context.Background(), lookback: defaultLookbackDelta.Milliseconds()}
+	_, err := engine.evalInstant(ec,
+		&BinaryExpr{Op: "%", Left: &NumberLiteral{Value: 1}, Right: &NumberLiteral{Value: 1}}, 0)
 	if err == nil {
 		t.Fatal("expected error for unknown binary operator, got nil")
 	}

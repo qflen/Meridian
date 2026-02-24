@@ -165,9 +165,10 @@ func (s *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	start := parseTimestamp(r.URL.Query().Get("start"), time.Now().Add(-1*time.Hour).UnixMilli())
 	end := parseTimestamp(r.URL.Query().Get("end"), time.Now().UnixMilli())
-	stepStr := r.URL.Query().Get("step")
-	step := 15 * time.Second
-	if stepStr != "" {
+	// An unset or unparseable step is left at 0 so the engine derives one from
+	// [start,end] (~250 points); an explicit duration (e.g. "30s") is honored.
+	var step time.Duration
+	if stepStr := r.URL.Query().Get("step"); stepStr != "" {
 		if d, err := query.ParseDuration(stepStr); err == nil {
 			step = d
 		}

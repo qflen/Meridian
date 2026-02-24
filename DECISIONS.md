@@ -143,16 +143,23 @@ incorrect rather than merely incomplete: a range window was subtracted twice,
 vector÷vector returned the left operand, and `/0` returned `0`. Making the engine
 *correct* required committing to specific semantics.
 **Decision**:
-- **One window, anchored at `end`.** A range vector `m[d]` evaluated at instant
-  `end` covers `[end-d, end]`. The duration is subtracted in exactly one place
-  (`evalRange`), not in the planner. The planner's `TimeRange` is kept as the
-  block-pruning span a future stepped evaluator will fetch; it no longer feeds the
-  eval start. Anchoring at `end` (not `start`) makes `rate(m[5m])` read one
-  selector-width of samples regardless of the `[start,end]` span.
+- **Stepped range evaluation → matrix.** `Execute(start, end, step)` evaluates the
+  expression as an instant query at each `t` in `{start, start+step, …, end}` and
+  assembles a matrix: one point list per series, keyed by label set, in time order.
+  `start == end` is a single instant.
+- **Range windows are half-open `(t-d, t]`, applied once.** A range vector `m[d]`
+  at instant `t` covers `(t-d, t]` (lower-exclusive, upper-inclusive, per
+  Prometheus). The duration is subtracted in exactly one place — the per-step slice
+  — never twice. Anchoring each window at its step `t` makes `rate(m[5m])` read one
+  selector-width of samples per step regardless of the `[start,end]` span.
+- **Instant vectors use a 5-minute look-back.** At `t`, a selector takes each
+  series' most recent sample with timestamp in `[t-5m, t]`, stamped at `t`. 5m is
+  Prometheus's staleness delta; with no sample in that window the series yields no
+  point — a gap, never a zero, so "no data" stays distinct from "zero".
 - **`rate()` follows Prometheus.** Divide the increase by the *range* (threaded in
   from the selector), correct counter resets by adding the post-reset value, and
-  extrapolate to the window edges. `rate()` takes the window end explicitly and
-  returns a single value, so it composes with a future per-step matrix evaluator.
+  extrapolate to the window edges. `rate()` takes the window end explicitly, so it
+  runs unchanged per step and `rate(x[5m])` becomes a multi-point series.
 - **`histogram_quantile()` interpolates cumulative buckets.** Group `_bucket`
   series by their non-`le` labels, sort by numeric `le` (`+Inf` parsed), and
   linearly interpolate within the bucket holding rank `φ·total`.
@@ -163,8 +170,18 @@ vector÷vector returned the left operand, and `/0` returned `0`. Making the engi
 - **One duration grammar.** The query layer parses durations via
   `config.ParseDuration`, so compound/decimal forms (`1h30m`, `1.5h`) are accepted
   consistently and the two layers cannot drift.
-**Consequences**: Engine output matches Prometheus for the supported subset, and
-the README's Query Engine claims are now backed by code paths and regression
-tests. Evaluation is still single-instant (at `end`); per-step matrix evaluation
-remains future work (`PLAN.md` §5.5), at which point the planner's `TimeRange` and
-the `end`-anchored window become the per-step fetch and window.
+- **Fetch once, slice per step.** Each leaf selector's full needed window —
+  `[start - maxRange - lookback, end]`, the planner's block-pruning span widened by
+  the look-back — is fetched from storage once and sliced in memory for every step,
+  avoiding an N+1 over steps. Matchers are pushed down per selector.
+- **Step defaults and guards.** `step ≤ 0` derives a step so the range yields ~250
+  points (floored at 1s); `start > end` is rejected; the step count is capped at
+  11000. The cap bounds output size and pre-empts a denial-of-service via
+  attacker-controlled `start`/`end`/`step`.
+**Consequences**: Evaluation is stepped/range — a query returns a matrix with one
+point per step per series — so `rate(x[5m])`, `sum(...) by (...)`, and `a/b` render
+as smooth multi-point lines rather than single values. The planner's `TimeRange`
+now feeds the single per-step fetch, as the prior revision anticipated. Output
+matches Prometheus for the supported subset, backed by regression tests for matrix
+shape, look-back/staleness, step alignment, per-step aggregation and vector
+matching, counter resets across windows, and the step-count guard.

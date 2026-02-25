@@ -2,11 +2,32 @@ package storage
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
 
 	"github.com/meridiandb/meridian/internal/compress"
+)
+
+const (
+	// Field-size limits. Metric names and label keys/values are length-prefixed
+	// with a uint16 in both WAL frames (wal.go) and block index entries (block.go),
+	// so they must fit in 65535 bytes to round-trip without silent truncation.
+	// These are enforced at ingest; oversized input is rejected, never truncated.
+	MaxMetricNameLength = 4096
+	MaxLabelNameLength  = 1024
+	MaxLabelValueLength = 1<<16 - 1
+	maxFieldLen         = 1<<16 - 1 // hard uint16 limit for length-prefixed fields
+)
+
+// ingestResult reports the outcome of an ordered append to the head.
+type ingestResult int
+
+const (
+	ingestAccepted   ingestResult = iota // appended to the series
+	ingestDuplicate                      // identical to the series' last sample; deduplicated
+	ingestOutOfOrder                     // older than the series' last sample, or a conflicting value at the same ts
 )
 
 // HeadBlock is the in-memory active write buffer. All incoming samples go here first.
@@ -66,9 +87,21 @@ func NewHeadBlock() *HeadBlock {
 		seriesByKey: make(map[string]uint64),
 		index:       NewInvertedIndex(),
 	}
-	h.minTime.Store(0)
-	h.maxTime.Store(0)
+	// Sentinels so "no data" is distinct from a real sample at ts==0. Callers must
+	// gate on SampleCount()>0 before trusting MinTime/MaxTime.
+	h.minTime.Store(math.MaxInt64)
+	h.maxTime.Store(math.MinInt64)
 	return h
+}
+
+// copyLabels returns an independent copy of a labels map so that a caller reusing
+// or pooling its map cannot mutate the stored series or the inverted index.
+func copyLabels(labels map[string]string) map[string]string {
+	cp := make(map[string]string, len(labels))
+	for k, v := range labels {
+		cp[k] = v
+	}
+	return cp
 }
 
 // GetOrCreateSeries returns an existing series or creates a new one.
@@ -92,43 +125,107 @@ func (h *HeadBlock) GetOrCreateSeries(name string, labels map[string]string) (*M
 	}
 
 	id := h.nextID.Add(1)
+	cp := copyLabels(labels)
 	s := &MemSeries{
 		ID:     id,
 		Name:   name,
-		Labels: labels,
+		Labels: cp,
 	}
 	h.series[id] = s
 	h.seriesByKey[key] = id
 
 	// Index by __name__ and all labels
 	h.index.Add(id, "__name__", name)
-	for k, v := range labels {
+	for k, v := range cp {
 		h.index.Add(id, k, v)
 	}
 
 	return s, true
 }
 
-// Ingest adds a single sample to the head block.
-func (h *HeadBlock) Ingest(seriesID uint64, ts int64, val float64) {
+// getOrCreateSeriesWithID recreates a series under an explicit ID during WAL replay.
+// Sample frames reference their series by the ID they were logged with, so replay
+// must restore that exact ID rather than minting a fresh one. nextID is kept ahead
+// of every restored ID so post-replay creations never collide.
+func (h *HeadBlock) getOrCreateSeriesWithID(id uint64, name string, labels map[string]string) *MemSeries {
+	key := seriesKey(name, labels)
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if existing, ok := h.seriesByKey[key]; ok {
+		return h.series[existing]
+	}
+
+	cp := copyLabels(labels)
+	s := &MemSeries{ID: id, Name: name, Labels: cp}
+	h.series[id] = s
+	h.seriesByKey[key] = id
+
+	h.index.Add(id, "__name__", name)
+	for k, v := range cp {
+		h.index.Add(id, k, v)
+	}
+
+	for {
+		cur := h.nextID.Load()
+		if cur >= id {
+			break
+		}
+		if h.nextID.CompareAndSwap(cur, id) {
+			break
+		}
+	}
+
+	return s
+}
+
+// Ingest appends a single sample to the head block in timestamp order, enforcing a
+// monotonic-per-series policy: a sample older than the series' last is rejected, an
+// exact duplicate of the last sample is deduplicated, and a conflicting value at the
+// last timestamp is rejected. The returned status lets callers account for drops.
+// Enforcing order here is what keeps each series' timestamps sorted, so block/head
+// time bounds and range checks stay correct.
+func (h *HeadBlock) Ingest(seriesID uint64, ts int64, val float64) ingestResult {
 	h.mu.RLock()
 	s, ok := h.series[seriesID]
 	h.mu.RUnlock()
 	if !ok {
-		return
+		return ingestOutOfOrder
 	}
 
 	s.mu.Lock()
+	if n := len(s.Timestamps); n > 0 {
+		last := s.Timestamps[n-1]
+		switch {
+		case ts < last:
+			s.mu.Unlock()
+			return ingestOutOfOrder
+		case ts == last:
+			if s.Values[n-1] == val {
+				s.mu.Unlock()
+				return ingestDuplicate
+			}
+			s.mu.Unlock()
+			return ingestOutOfOrder
+		}
+	}
 	s.Timestamps = append(s.Timestamps, ts)
 	s.Values = append(s.Values, val)
 	s.mu.Unlock()
 
+	// Update bounds before publishing the count so that an observer seeing
+	// SampleCount()>0 always sees consistent min/max.
+	h.updateBounds(ts)
 	h.numSamples.Add(1)
+	return ingestAccepted
+}
 
-	// Update min/max time atomically
+// updateBounds widens the head's [min,max] timestamp range to include ts.
+func (h *HeadBlock) updateBounds(ts int64) {
 	for {
 		cur := h.minTime.Load()
-		if cur != 0 && cur <= ts {
+		if ts >= cur {
 			break
 		}
 		if h.minTime.CompareAndSwap(cur, ts) {
@@ -137,7 +234,7 @@ func (h *HeadBlock) Ingest(seriesID uint64, ts int64, val float64) {
 	}
 	for {
 		cur := h.maxTime.Load()
-		if cur >= ts {
+		if ts <= cur {
 			break
 		}
 		if h.maxTime.CompareAndSwap(cur, ts) {
@@ -214,8 +311,8 @@ func (h *HeadBlock) Reset() {
 	h.series = make(map[uint64]*MemSeries)
 	h.seriesByKey = make(map[string]uint64)
 	h.index = NewInvertedIndex()
-	h.minTime.Store(0)
-	h.maxTime.Store(0)
+	h.minTime.Store(math.MaxInt64)
+	h.maxTime.Store(math.MinInt64)
 	h.numSamples.Store(0)
 }
 

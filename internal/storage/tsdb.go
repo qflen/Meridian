@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,11 +35,11 @@ func DefaultTSDBOptions() TSDBOptions {
 
 // TSDBStats holds database-level statistics.
 type TSDBStats struct {
-	TotalSamples     int64
-	TotalSeries      int
-	HeadSamples      int64
-	HeadSeries       int
-	BlockCount       int
+	TotalSamples int64
+	TotalSeries  int
+	HeadSamples  int64
+	HeadSeries   int
+	BlockCount   int
 	// StorageBytesRaw is the cost of the data if stored as raw 16-byte (ts,val) samples.
 	StorageBytesRaw int64
 	// ChunkBytes is the actual Gorilla-compressed size: compressed chunk bytes across all
@@ -50,6 +50,9 @@ type TSDBStats struct {
 	// framing overhead and is only a good compression proxy once blocks have been flushed.
 	StorageBytesDisk int64
 	WALSize          int64
+	// OutOfOrderSamples is the running count of samples rejected for arriving out of
+	// order (older than the series' last sample, or a conflicting value at the same ts).
+	OutOfOrderSamples int64
 }
 
 // IngestSample represents a single sample for batch ingestion.
@@ -74,16 +77,25 @@ type ResultSeries struct {
 type TSDB struct {
 	opts      TSDBOptions
 	wal       *WAL
-	head      *HeadBlock
 	startTime time.Time
 
+	// mu guards head and blocks. Ingest takes it as a reader so the WAL append and
+	// the head append form one critical section; Flush takes it as a writer for the
+	// brief head-swap + WAL-rotate cut, so no sample ever straddles a flush.
 	mu     sync.RWMutex
+	head   *HeadBlock
 	blocks []*Block
 
-	ingested     atomic.Int64
-	flushTicker  *time.Ticker
-	done         chan struct{}
-	closed       atomic.Bool
+	// flushMu serializes the whole Flush operation (including the out-of-lock block
+	// write), so block WAL low-water-marks are recorded in increasing order.
+	flushMu     sync.Mutex
+	flushFailed atomic.Bool
+
+	ingested    atomic.Int64
+	outOfOrder  atomic.Int64
+	flushTicker *time.Ticker
+	done        chan struct{}
+	closed      atomic.Bool
 }
 
 // Open creates or opens a TSDB at the given data directory.
@@ -126,8 +138,9 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 		return nil, fmt.Errorf("load blocks: %w", err)
 	}
 
-	// Replay WAL into head
-	if err := wal.Replay(db); err != nil {
+	// Replay only the WAL beyond what persisted blocks already cover. A crash that
+	// left both a block and its source WAL segments on disk replays exactly once.
+	if err := wal.ReplayFrom(db.maxCoveredWAL(), db); err != nil {
 		wal.Close()
 		return nil, fmt.Errorf("replay WAL: %w", err)
 	}
@@ -139,13 +152,16 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 	return db, nil
 }
 
-// HandleSeries implements WALHandler for replay.
+// HandleSeries implements WALHandler for replay. It restores the series under the
+// exact ID it was logged with so replayed sample frames resolve correctly.
 func (db *TSDB) HandleSeries(id uint64, name string, labels map[string]string) error {
-	db.head.GetOrCreateSeries(name, labels)
+	db.head.getOrCreateSeriesWithID(id, name, labels)
 	return nil
 }
 
-// HandleSamples implements WALHandler for replay.
+// HandleSamples implements WALHandler for replay. It applies the same ordering
+// policy as live ingest, so the replayed head is identical to the pre-crash head
+// (out-of-order frames logged before the policy check are rejected identically).
 func (db *TSDB) HandleSamples(samples []Sample) error {
 	for _, s := range samples {
 		db.head.Ingest(s.SeriesID, s.Timestamp, s.Value)
@@ -153,55 +169,115 @@ func (db *TSDB) HandleSamples(samples []Sample) error {
 	return nil
 }
 
-// Ingest adds a single sample to the database.
+// maxCoveredWAL returns the highest WAL low-water-mark durably covered by a loaded
+// block. Replay skips segments at or below it. Blocks predating the field report 0,
+// which conservatively replays the whole WAL.
+func (db *TSDB) maxCoveredWAL() int {
+	maxCovered := 0
+	for _, b := range db.blocks {
+		if b.meta.WALLowWaterMark > maxCovered {
+			maxCovered = b.meta.WALLowWaterMark
+		}
+	}
+	return maxCovered
+}
+
+// Ingest adds a single sample to the database. Samples are written to the WAL first,
+// then applied to the head under the in-order policy; out-of-order samples are
+// dropped and counted, not returned as errors. Oversized names/labels are rejected.
 func (db *TSDB) Ingest(name string, labels map[string]string, ts int64, val float64) error {
-	series, created := db.head.GetOrCreateSeries(name, labels)
+	if err := validateSeriesLabels(name, labels); err != nil {
+		return err
+	}
+
+	// RLock spans the WAL append and the head append so the pair is atomic with
+	// respect to a concurrent Flush cut (which takes the write lock).
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	head := db.head
+
+	series, created := head.GetOrCreateSeries(name, labels)
 	if created {
 		if err := db.wal.LogSeries(series.ID, name, labels); err != nil {
 			return fmt.Errorf("WAL log series: %w", err)
 		}
 	}
-
 	if err := db.wal.LogSamples([]Sample{{SeriesID: series.ID, Timestamp: ts, Value: val}}); err != nil {
 		return fmt.Errorf("WAL log sample: %w", err)
 	}
 
-	db.head.Ingest(series.ID, ts, val)
-	db.ingested.Add(1)
+	switch head.Ingest(series.ID, ts, val) {
+	case ingestAccepted:
+		db.ingested.Add(1)
+	case ingestOutOfOrder:
+		db.outOfOrder.Add(1)
+	case ingestDuplicate:
+		// identical to the series' last sample — deduplicated, not stored.
+	}
 	return nil
 }
 
-// IngestBatch adds multiple samples to the database.
+// IngestBatch adds multiple samples to the database. The whole batch is validated
+// first, then logged and applied under the RLock as one critical section.
 func (db *TSDB) IngestBatch(samples []IngestSample) error {
-	walSamples := make([]Sample, 0, len(samples))
+	for i := range samples {
+		if err := validateSeriesLabels(samples[i].Name, samples[i].Labels); err != nil {
+			return err
+		}
+	}
 
-	for _, s := range samples {
-		series, created := db.head.GetOrCreateSeries(s.Name, s.Labels)
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	head := db.head
+
+	walSamples := make([]Sample, 0, len(samples))
+	ids := make([]uint64, len(samples))
+	for i, s := range samples {
+		series, created := head.GetOrCreateSeries(s.Name, s.Labels)
 		if created {
 			if err := db.wal.LogSeries(series.ID, s.Name, s.Labels); err != nil {
 				return fmt.Errorf("WAL log series: %w", err)
 			}
 		}
+		ids[i] = series.ID
 		walSamples = append(walSamples, Sample{
 			SeriesID:  series.ID,
 			Timestamp: s.Timestamp,
 			Value:     s.Value,
 		})
-		db.head.Ingest(series.ID, s.Timestamp, s.Value)
 	}
 
 	if err := db.wal.LogSamples(walSamples); err != nil {
 		return fmt.Errorf("WAL log samples: %w", err)
 	}
 
-	db.ingested.Add(int64(len(samples)))
+	var accepted, ooo int64
+	for i, s := range samples {
+		switch head.Ingest(ids[i], s.Timestamp, s.Value) {
+		case ingestAccepted:
+			accepted++
+		case ingestOutOfOrder:
+			ooo++
+		case ingestDuplicate:
+		}
+	}
+	db.ingested.Add(accepted)
+	db.outOfOrder.Add(ooo)
 	return nil
 }
 
 // Query executes a query against the head block and all persistent blocks.
 func (db *TSDB) Query(_ context.Context, matchers []LabelMatcher, start, end int64) (SeriesSet, error) {
+	// Snapshot head + blocks under the lock so a concurrent flush cut can't swap the
+	// head out from under us mid-query.
+	db.mu.RLock()
+	head := db.head
+	blocks := make([]*Block, len(db.blocks))
+	copy(blocks, db.blocks)
+	db.mu.RUnlock()
+
 	// Query head block
-	headSeries := db.head.Query(matchers, start, end)
+	headSeries := head.Query(matchers, start, end)
 
 	// Merge results from head
 	resultMap := make(map[string]*ResultSeries)
@@ -232,11 +308,6 @@ func (db *TSDB) Query(_ context.Context, matchers []LabelMatcher, start, end int
 	}
 
 	// Query blocks
-	db.mu.RLock()
-	blocks := make([]*Block, len(db.blocks))
-	copy(blocks, db.blocks)
-	db.mu.RUnlock()
-
 	for _, block := range blocks {
 		blockResults := block.Query(matchers, start, end)
 		for _, br := range blockResults {
@@ -275,12 +346,13 @@ func (db *TSDB) Query(_ context.Context, matchers []LabelMatcher, start, end int
 
 // Series returns metadata for all known series.
 func (db *TSDB) Series() []SeriesInfo {
-	return db.head.SeriesInfos()
+	return db.Head().SeriesInfos()
 }
 
 // Stats returns database-level statistics.
 func (db *TSDB) Stats() TSDBStats {
 	db.mu.RLock()
+	head := db.head
 	nBlocks := len(db.blocks)
 	var blockSamples int64
 	var blockChunkBytes int64
@@ -290,27 +362,36 @@ func (db *TSDB) Stats() TSDBStats {
 	}
 	db.mu.RUnlock()
 
-	headSamples := db.head.SampleCount()
+	headSamples := head.SampleCount()
 	totalSamples := headSamples + blockSamples
 	rawBytes := totalSamples * 16 // 8 bytes timestamp + 8 bytes value
-	headCompressed := db.head.CompressedSize()
+	headCompressed := head.CompressedSize()
+	walSize := db.wal.Size()
 
 	return TSDBStats{
-		TotalSamples:     totalSamples,
-		TotalSeries:      db.head.SeriesCount(),
-		HeadSamples:      headSamples,
-		HeadSeries:       db.head.SeriesCount(),
-		BlockCount:       nBlocks,
-		StorageBytesRaw:  rawBytes,
-		ChunkBytes:       blockChunkBytes + headCompressed,
-		StorageBytesDisk: blockChunkBytes + db.wal.Size(),
-		WALSize:          db.wal.Size(),
+		TotalSamples:      totalSamples,
+		TotalSeries:       head.SeriesCount(),
+		HeadSamples:       headSamples,
+		HeadSeries:        head.SeriesCount(),
+		BlockCount:        nBlocks,
+		StorageBytesRaw:   rawBytes,
+		ChunkBytes:        blockChunkBytes + headCompressed,
+		StorageBytesDisk:  blockChunkBytes + walSize,
+		WALSize:           walSize,
+		OutOfOrderSamples: db.outOfOrder.Load(),
 	}
 }
 
-// Head returns the head block for direct access.
+// Head returns the current head block for direct access.
 func (db *TSDB) Head() *HeadBlock {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
 	return db.head
+}
+
+// OutOfOrderTotal returns the number of samples rejected for arriving out of order.
+func (db *TSDB) OutOfOrderTotal() int64 {
+	return db.outOfOrder.Load()
 }
 
 // StartTime returns when this TSDB instance was opened.
@@ -323,25 +404,61 @@ func (db *TSDB) IngestionRate() int64 {
 	return db.ingested.Load()
 }
 
-// Flush forces the head block to be persisted to disk.
+// Flush persists the current head to a durable on-disk block. It is crash-consistent
+// and loses no concurrently-ingested sample:
+//
+//  1. Under db.mu (writer), it captures the old head, installs a fresh head, and
+//     rotates the WAL so in-flight and future writes land in a new segment. The
+//     returned low-water-mark is the cut: everything the old head holds is in WAL
+//     segments <= it; everything the new head will hold is beyond it.
+//  2. Outside the lock, it writes the old head to a block (temp dir → fsync → atomic
+//     rename → fsync parent). The rename is the single durable commit point. The
+//     block records the low-water-mark.
+//  3. Only after the block is durable does it best-effort delete the now-covered WAL
+//     segments. Deletion is pure cleanup — replay skips covered segments by the
+//     recorded low-water-mark whether or not they were deleted.
+//
+// If the block write fails, the old head's data is still safe in the rotated WAL
+// segments (which are never deleted on failure) and is recovered on the next Open.
+// Further flushes are then disabled until restart so a later flush cannot record a
+// higher low-water-mark that would skip those uncovered segments on replay.
 func (db *TSDB) Flush() error {
-	if db.head.SampleCount() == 0 {
-		return nil
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
+
+	if db.flushFailed.Load() {
+		return fmt.Errorf("flush disabled after a prior durable block write failure; restart to recover")
 	}
 
-	block, err := WriteBlock(db.opts.BlockDir, db.head)
+	// Phase 1 — atomic cut.
+	db.mu.Lock()
+	old := db.head
+	if old.SampleCount() == 0 {
+		db.mu.Unlock()
+		return nil
+	}
+	lowWaterMark, err := db.wal.Rotate()
 	if err != nil {
+		db.mu.Unlock()
+		return fmt.Errorf("rotate WAL: %w", err)
+	}
+	db.head = NewHeadBlock()
+	db.mu.Unlock()
+
+	// Phase 2 — flush the old head; the rename inside WriteBlock is the commit point.
+	block, err := WriteBlock(db.opts.BlockDir, old, lowWaterMark)
+	if err != nil {
+		db.flushFailed.Store(true)
 		return fmt.Errorf("write block: %w", err)
 	}
 
+	// Phase 3 — publish the block, then best-effort cleanup.
 	db.mu.Lock()
 	db.blocks = append(db.blocks, block)
 	db.mu.Unlock()
 
-	db.head.Reset()
-
-	if err := db.wal.Truncate(); err != nil {
-		return fmt.Errorf("truncate WAL: %w", err)
+	if err := db.wal.RemoveSegmentsThrough(lowWaterMark); err != nil {
+		log.Printf("TSDB: WAL cleanup of segments <= %d failed (non-fatal): %v", lowWaterMark, err)
 	}
 
 	return nil
@@ -359,7 +476,10 @@ func (db *TSDB) Close() error {
 	}
 
 	// Flush remaining head data
-	if db.head.SampleCount() > 0 {
+	db.mu.RLock()
+	hasData := db.head.SampleCount() > 0
+	db.mu.RUnlock()
+	if hasData {
 		if err := db.Flush(); err != nil {
 			log.Printf("TSDB: error flushing on close: %v", err)
 		}
@@ -380,11 +500,15 @@ func (db *TSDB) flushLoop() {
 }
 
 func (db *TSDB) maybeFlush() {
-	headDuration := db.head.MaxTime() - db.head.MinTime()
-	if db.head.MinTime() == 0 {
+	db.mu.RLock()
+	head := db.head
+	db.mu.RUnlock()
+
+	if head.SampleCount() == 0 {
 		return
 	}
-	if headDuration >= db.opts.BlockDuration.Milliseconds() || db.head.SampleCount() >= 1000000 {
+	headDuration := head.MaxTime() - head.MinTime()
+	if headDuration >= db.opts.BlockDuration.Milliseconds() || head.SampleCount() >= 1_000_000 {
 		if err := db.Flush(); err != nil {
 			log.Printf("TSDB: flush error: %v", err)
 		}
@@ -401,13 +525,24 @@ func (db *TSDB) loadBlocks() error {
 	}
 
 	for _, e := range entries {
+		name := e.Name()
+		// Leftover temp block dirs (".<ulid>.tmp") are interrupted, never-committed
+		// flushes; remove them and rely on WAL replay for their data.
+		if strings.HasPrefix(name, ".") {
+			if e.IsDir() {
+				if err := os.RemoveAll(filepath.Join(db.opts.BlockDir, name)); err != nil {
+					log.Printf("TSDB: failed to remove stale temp block %s: %v", name, err)
+				}
+			}
+			continue
+		}
 		if !e.IsDir() {
 			continue
 		}
-		blockDir := filepath.Join(db.opts.BlockDir, e.Name())
+		blockDir := filepath.Join(db.opts.BlockDir, name)
 		block, err := OpenBlock(blockDir)
 		if err != nil {
-			log.Printf("TSDB: skipping block %s: %v", e.Name(), err)
+			log.Printf("TSDB: skipping block %s: %v", name, err)
 			continue
 		}
 		db.blocks = append(db.blocks, block)
@@ -476,21 +611,37 @@ func (db *TSDB) CompressionRatio() float64 {
 	return float64(stats.StorageBytesRaw) / float64(stats.ChunkBytes)
 }
 
-// LabelNames returns all known label names across head and blocks.
+// LabelNames returns all known label names in the current head.
 func (db *TSDB) LabelNames() []string {
-	return db.head.index.LabelNames()
+	return db.Head().index.LabelNames()
 }
 
-// LabelValues returns known values for a label name.
+// LabelValues returns known values for a label name in the current head.
 func (db *TSDB) LabelValues(name string) []string {
-	return db.head.index.LabelValues(name)
+	return db.Head().index.LabelValues(name)
 }
 
-// IngestDirect ingests directly into head without WAL (used during WAL replay).
-func (db *TSDB) IngestDirect(name string, labels map[string]string, ts int64, val float64) {
-	series, _ := db.head.GetOrCreateSeries(name, labels)
-	db.head.Ingest(series.ID, ts, val)
+// validateSeriesLabels enforces the size limits required so names and labels
+// round-trip through the uint16 length fields in WAL frames and block index entries
+// without truncation. Oversized input is rejected here rather than silently
+// corrupting the WAL or index downstream.
+func validateSeriesLabels(name string, labels map[string]string) error {
+	if name == "" {
+		return fmt.Errorf("metric name cannot be empty")
+	}
+	if len(name) > MaxMetricNameLength {
+		return fmt.Errorf("metric name length %d exceeds limit %d", len(name), MaxMetricNameLength)
+	}
+	for k, v := range labels {
+		if k == "" {
+			return fmt.Errorf("label name cannot be empty")
+		}
+		if len(k) > MaxLabelNameLength {
+			return fmt.Errorf("label name %q length %d exceeds limit %d", k, len(k), MaxLabelNameLength)
+		}
+		if len(v) > MaxLabelValueLength {
+			return fmt.Errorf("label %q value length %d exceeds limit %d", k, len(v), MaxLabelValueLength)
+		}
+	}
+	return nil
 }
-
-// needed for unused import suppression
-var _ = math.MaxInt64

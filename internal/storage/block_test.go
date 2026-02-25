@@ -21,7 +21,7 @@ func TestWriteAndReadBlock(t *testing.T) {
 	}
 
 	// Write block
-	block, err := WriteBlock(dir, h)
+	block, err := WriteBlock(dir, h, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestBlockPredicatePushdown(t *testing.T) {
 		h.Ingest(s.ID, int64(1000+i*5000), float64(i))
 	}
 
-	block, err := WriteBlock(dir, h)
+	block, err := WriteBlock(dir, h, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestBlockReopenFromDisk(t *testing.T) {
 		h.Ingest(s.ID, int64(i)*1000, float64(i)*1.5)
 	}
 
-	block, err := WriteBlock(dir, h)
+	block, err := WriteBlock(dir, h, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +149,7 @@ func TestBlockIndexLookup(t *testing.T) {
 		}
 	}
 
-	block, err := WriteBlock(dir, h)
+	block, err := WriteBlock(dir, h, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestBlockEmptyHead(t *testing.T) {
 	dir := t.TempDir()
 	h := NewHeadBlock()
 
-	_, err := WriteBlock(dir, h)
+	_, err := WriteBlock(dir, h, 0)
 	if err == nil {
 		t.Fatal("expected error for empty head")
 	}

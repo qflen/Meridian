@@ -185,3 +185,85 @@ now feeds the single per-step fetch, as the prior revision anticipated. Output
 matches Prometheus for the supported subset, backed by regression tests for matrix
 shape, look-back/staleness, step alignment, per-step aggregation and vector
 matching, counter resets across windows, and the step-count guard.
+
+## ADR-015: Reject Out-of-Order Samples
+
+**Status**: Accepted
+**Context**: Samples were appended to a series in arrival order without any ordering
+check, and `WriteBlock` took `Timestamps[0]`/`Timestamps[last]` as a block's min/max
+assuming sorted input. Ingesting `100, 50, 200, 10` therefore produced an *inverted*
+block (`minTime=200, maxTime=10`), which silently dropped overlapping queries
+(`Overlaps` compares against these bounds) and poisoned retention (the enforcer
+deletes by `MaxTime`). A policy was required; the options were reject, sort-on-flush,
+or full out-of-order support.
+**Decision**: **Reject**, the Prometheus-classic model.
+- A sample with a timestamp strictly older than the series' last is dropped and
+  counted in `meridian_out_of_order_samples_total`.
+- A sample whose timestamp equals the series' last is **deduplicated** if its value
+  is identical (a harmless retransmit) and **rejected** (counted) if the value
+  conflicts.
+- Otherwise the sample is appended. This keeps every series' timestamps monotonic.
+- Belt-and-braces: `WriteBlock` computes each series' min/max by **scanning** its
+  timestamps rather than trusting position, so block bounds can never be inverted
+  even if unsorted data reaches it by another path.
+- Ordering is enforced at apply time, not before the WAL write: ingest logs the
+  sample to the WAL first and then applies the policy, and replay applies the *same*
+  policy, so the recovered head is identical to the live head. The counter is a
+  process-lifetime gauge incremented only on the live path (not during replay).
+- The policy is scoped to the **active head**. After a flush the head is empty, so a
+  series' "last" resets; a post-flush sample older than already-flushed data is
+  accepted into the new head. Blocks may then overlap in time, which the read path
+  already handles (it merges and sorts). Cross-flush ordering is intentionally not
+  enforced, matching the head-relative out-of-order window of mainstream TSDBs.
+**Consequences**: Series stay sorted, so `Timestamps[0]`/`[last]` range checks and
+non-inverted block bounds hold; retention expires correctly. Out-of-order data is
+visibly dropped and counted rather than silently corrupting bounds. Full
+out-of-order ingestion (an out-of-order head plus m-block overlap resolution) is
+future work.
+
+## ADR-016: Crash-Consistent Flush with a Per-Block WAL Low-Water-Mark
+
+**Status**: Accepted
+**Context**: `Flush()` ran `WriteBlock(head)` → `head.Reset()` → `wal.Truncate()`
+with no lock spanning the three steps. A sample ingested after the block snapshot but
+before `Reset()` was discarded from the head *and* erased from the WAL by `Truncate()`
+— silent loss. A crash after the block was persisted but before `Truncate()` left the
+next `Open()` to load the block *and* replay the whole WAL — a double-count. Block
+writes were also non-atomic (no temp/rename, nothing fsynced, several ignored I/O
+errors).
+**Decision**: A three-phase flush with an atomic in-memory cut and a durable
+low-water-mark.
+1. **Cut (under `db.mu` as writer).** Capture the old head, install a fresh head, and
+   `Rotate()` the WAL so in-flight and future writes land in a new segment. The
+   rotation returns the sealed segment sequence — the **low-water-mark**: every
+   sample the old head holds is in WAL segments `<= mark`; every later sample is
+   beyond it. Ingest holds `db.mu` as a *reader* across its WAL-append + head-append
+   pair, so the cut (a brief writer section) never splits a sample between the old and
+   new generation.
+2. **Persist (outside the lock).** Write the old head to a block in a temp dir, fsync
+   the files and their directories, atomically `rename` into place, then fsync the
+   parent directory. The **rename is the single durable commit point**. The block
+   records the low-water-mark in its metadata.
+3. **Reclaim (best-effort).** Only after the block is durable are the covered WAL
+   segments deleted. Deletion is pure space reclamation, never a correctness
+   dependency.
+
+   On `Open`, replay skips every WAL segment at or below the maximum low-water-mark
+   across all loaded blocks. Blocks written before the field carries a `0` mark,
+   which conservatively replays the whole WAL (`data/` is disposable local state).
+   A failed block write disables further flushes until restart, so a later flush
+   cannot record a higher mark that would skip the failed flush's still-uncovered
+   segments; that data remains in the WAL and is recovered on the next open. Leftover
+   temp block dirs from an interrupted write are removed on open.
+**Consequences**: Exactly-once recovery. A crash **before the block is durable**
+leaves no committed block and an un-truncated WAL, so replay rebuilds the data once
+from the WAL (the in-memory cut is lost with the crash, so there is no persistent
+gap). A crash **after the block is durable but before WAL cleanup** leaves both on
+disk, but the low-water-mark makes replay skip the covered segments — no
+double-count. Concurrent ingestion during a flush loses nothing. Every I/O error in
+the write path is checked, and durability is confirmed (rename + parent fsync) before
+any WAL is reclaimed. The trade-off is a brief ingest stall during the cut (one
+segment sync while the writer lock is held) and that a (rare) block-write failure
+makes the in-flight generation queryable only after a restart. Group-commit of WAL
+frames (one fsync for coalesced writes) is noted as future work; today each frame
+still fsyncs individually.

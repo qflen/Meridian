@@ -49,7 +49,15 @@ Live compression figures (blocks + in-memory head) are exposed on `/api/v1/stats
 
 ### Storage Engine
 - **Gorilla compression**: delta-of-delta timestamps + XOR float encoding
-- **Write-ahead log**: CRC32-framed, 128 MB segment rotation
+- **Write-ahead log**: CRC32-framed, 128 MB segment rotation, fsync per write;
+  corrupt frames resync to the next 8-byte boundary instead of discarding the rest
+  of the segment
+- **Crash-consistent flush**: an atomic head-swap + WAL-rotate cut, a block written
+  via temp-dir → fsync → atomic rename, and a per-block WAL low-water-mark so a crash
+  mid-flush neither loses concurrently-ingested samples nor double-counts on replay
+- **Out-of-order policy**: samples older than a series' last are rejected and counted
+  (`meridian_out_of_order_samples_total`); duplicates are deduplicated — so series
+  stay sorted and block/retention time bounds never invert
 - **Inverted index**: sorted-slice intersection, no external bitmap dependencies
 - **Block storage**: ULID-named immutable blocks with a binary index
 
@@ -81,7 +89,7 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
 - **Themes**: dark, light, high-contrast
 
 ### Observability
-- **`/metrics`**: Prometheus exposition format (head/block stats, query-latency histogram, compression ratio, WS client count, uptime)
+- **`/metrics`**: Prometheus exposition format (head/block stats, samples ingested, out-of-order samples rejected, query-latency histogram, compression ratio, WS client count, uptime)
 - **`/health`**: liveness probe for orchestrators
 - **`/api/v1/stats`**: JSON snapshot of storage, WAL, ingestion, compression
 
@@ -178,9 +186,10 @@ dashboard/          React + TypeScript + Tailwind + Canvas
 
 ## Design Decisions
 
-See [DECISIONS.md](DECISIONS.md) for 13 ADRs covering key trade-offs:
+See [DECISIONS.md](DECISIONS.md) for the ADRs covering key trade-offs:
 Gorilla vs generic compression, sorted slices vs roaring bitmaps, JSON vs protobuf
-ingestion, rAF batching for WebSocket, and more.
+ingestion, rAF batching for WebSocket, the out-of-order sample policy, the
+crash-consistent flush model, and more.
 
 ## Development
 

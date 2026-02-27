@@ -34,6 +34,17 @@ func (c *StorageClient) Addrs() []string {
 	return c.addrs
 }
 
+// statusError drains resp.Body and returns a non-nil error when the response is not
+// 200 OK. A storage node that returns 500 must surface as an error rather than being
+// decoded into a zero-valued struct and reported as success-with-0.
+func statusError(resp *http.Response, action string) error {
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return fmt.Errorf("%s: unexpected status %d", action, resp.StatusCode)
+	}
+	return nil
+}
+
 // Write sends a write request to the appropriate storage node based on metric name hash.
 func (c *StorageClient) Write(ctx context.Context, req WriteRequest) (*WriteResponse, error) {
 	// Group time series by target node (hash-based sharding by metric name)
@@ -62,9 +73,16 @@ func (c *StorageClient) Write(ctx context.Context, req WriteRequest) (*WriteResp
 		if err != nil {
 			return nil, fmt.Errorf("write to storage %s: %w", c.addrs[idx], err)
 		}
+		if err := statusError(resp, "write to storage "+c.addrs[idx]); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
 		var wr WriteResponse
-		json.NewDecoder(resp.Body).Decode(&wr)
+		decErr := json.NewDecoder(resp.Body).Decode(&wr)
 		resp.Body.Close()
+		if decErr != nil {
+			return nil, fmt.Errorf("decode write response from %s: %w", c.addrs[idx], decErr)
+		}
 		totalIngested += wr.SamplesIngested
 	}
 
@@ -107,6 +125,10 @@ func (c *StorageClient) Query(ctx context.Context, matchers []storage.LabelMatch
 				return
 			}
 			defer resp.Body.Close()
+			if err := statusError(resp, "query storage "+addr); err != nil {
+				results <- result{err: err}
+				return
+			}
 
 			var qr QueryResponse
 			if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
@@ -173,8 +195,15 @@ func (c *StorageClient) FetchBlocks(ctx context.Context) ([]BlockInfo, error) {
 				return
 			}
 			defer resp.Body.Close()
+			if err := statusError(resp, "fetch blocks "+addr); err != nil {
+				results <- result{err: err}
+				return
+			}
 			var blocks []BlockInfo
-			json.NewDecoder(resp.Body).Decode(&blocks)
+			if err := json.NewDecoder(resp.Body).Decode(&blocks); err != nil {
+				results <- result{err: err}
+				return
+			}
 			results <- result{blocks: blocks}
 		}(addr)
 	}
@@ -210,8 +239,15 @@ func (c *StorageClient) FetchStats(ctx context.Context) (*AggregatedStats, error
 				return
 			}
 			defer resp.Body.Close()
+			if err := statusError(resp, "fetch stats "+addr); err != nil {
+				results <- result{err: err}
+				return
+			}
 			var s StatsResponse
-			json.NewDecoder(resp.Body).Decode(&s)
+			if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
+				results <- result{err: err}
+				return
+			}
 			results <- result{stats: s}
 		}(addr)
 	}
@@ -256,6 +292,10 @@ func HealthCheck(addr string) (string, bool) {
 		return "", false
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return "", false
+	}
 	var h struct {
 		NodeID string `json:"node_id"`
 		Status string `json:"status"`
@@ -286,7 +326,15 @@ func (c *StorageClient) FetchSeries(ctx context.Context) ([]SeriesInfo, error) {
 				return
 			}
 			defer resp.Body.Close()
-			body, _ := io.ReadAll(resp.Body)
+			if err := statusError(resp, "fetch series "+addr); err != nil {
+				results <- result{err: err}
+				return
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
 			var wrapper struct {
 				Data []SeriesInfo `json:"data"`
 			}
@@ -334,6 +382,10 @@ func (c *StorageClient) FetchLabels(ctx context.Context) ([]string, error) {
 				return
 			}
 			defer resp.Body.Close()
+			if err := statusError(resp, "fetch labels "+addr); err != nil {
+				results <- result{err: err}
+				return
+			}
 			var wrapper struct {
 				Data []string `json:"data"`
 			}
@@ -380,6 +432,10 @@ func (c *StorageClient) FetchLabelValues(ctx context.Context, name string) ([]st
 				return
 			}
 			defer resp.Body.Close()
+			if err := statusError(resp, "fetch label values "+addr); err != nil {
+				results <- result{err: err}
+				return
+			}
 			var wrapper struct {
 				Data []string `json:"data"`
 			}

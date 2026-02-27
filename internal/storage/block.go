@@ -344,6 +344,20 @@ func (b *Block) LabelNames() []string {
 	return names
 }
 
+// SeriesKeys returns the canonical "name{sorted_labels}" key for every series in the
+// block, matching the head's key format so distinct series can be counted across the
+// head and all blocks. A series' labels here exclude "__name__" (it is carried as the
+// name), matching how the head builds its keys.
+func (b *Block) SeriesKeys() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	keys := make([]string, 0, len(b.series))
+	for _, s := range b.series {
+		keys = append(keys, seriesKey(s.name, s.labels))
+	}
+	return keys
+}
+
 // LabelValues returns the sorted values for a label name in this block's index.
 func (b *Block) LabelValues(name string) []string {
 	b.mu.RLock()

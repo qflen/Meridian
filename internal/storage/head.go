@@ -288,6 +288,19 @@ func (h *HeadBlock) SeriesCount() int {
 	return len(h.series)
 }
 
+// SeriesKeys returns the canonical "name{sorted_labels}" key for every series in the
+// head. The format matches Block.SeriesKeys so distinct series can be counted across
+// the head and all blocks.
+func (h *HeadBlock) SeriesKeys() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	keys := make([]string, 0, len(h.seriesByKey))
+	for k := range h.seriesByKey {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // SampleCount returns the total number of samples in the head.
 func (h *HeadBlock) SampleCount() int64 {
 	return h.numSamples.Load()

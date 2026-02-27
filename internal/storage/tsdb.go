@@ -389,14 +389,27 @@ func (db *TSDB) Series() []SeriesInfo {
 func (db *TSDB) Stats() TSDBStats {
 	db.mu.RLock()
 	head := db.head
-	nBlocks := len(db.blocks)
+	blocks := make([]*Block, len(db.blocks))
+	copy(blocks, db.blocks)
+	db.mu.RUnlock()
+
+	// Count series distinct across the head and every block: the same (name,labels)
+	// tuple can live in the head and in one or more blocks, so summing per-container
+	// counts would over-report. Block meta fields are immutable after creation, so
+	// they are safe to read outside db.mu.
 	var blockSamples int64
 	var blockChunkBytes int64
-	for _, b := range db.blocks {
+	distinct := make(map[string]struct{})
+	for _, b := range blocks {
 		blockSamples += b.meta.Stats.NumSamples
 		blockChunkBytes += int64(len(b.chunks))
+		for _, k := range b.SeriesKeys() {
+			distinct[k] = struct{}{}
+		}
 	}
-	db.mu.RUnlock()
+	for _, k := range head.SeriesKeys() {
+		distinct[k] = struct{}{}
+	}
 
 	headSamples := head.SampleCount()
 	totalSamples := headSamples + blockSamples
@@ -406,10 +419,10 @@ func (db *TSDB) Stats() TSDBStats {
 
 	return TSDBStats{
 		TotalSamples:      totalSamples,
-		TotalSeries:       head.SeriesCount(),
+		TotalSeries:       len(distinct),
 		HeadSamples:       headSamples,
 		HeadSeries:        head.SeriesCount(),
-		BlockCount:        nBlocks,
+		BlockCount:        len(blocks),
 		StorageBytesRaw:   rawBytes,
 		ChunkBytes:        blockChunkBytes + headCompressed,
 		StorageBytesDisk:  blockChunkBytes + walSize,

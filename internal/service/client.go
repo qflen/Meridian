@@ -281,7 +281,9 @@ type AggregatedStats struct {
 	HeadSamples      int64
 	HeadSeries       int
 	WALSize          int64
-	IngestionRate    int64
+	// IngestionRate is the cluster-wide samples/sec rate: the sum of each storage
+	// node's windowed rate (rates are additive across nodes).
+	IngestionRate int64
 }
 
 // HealthCheck probes a service's /health endpoint.

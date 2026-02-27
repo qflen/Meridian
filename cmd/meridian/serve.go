@@ -148,17 +148,12 @@ func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingSer
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastIngested int64
-
 	for range ticker.C {
 		stats := db.Stats()
-		currentIngested := db.IngestionRate()
-		ingestionRate := currentIngested - lastIngested
-		lastIngested = currentIngested
 
 		metrics := map[string]interface{}{
 			"type":            "stats",
-			"ingestionRate":   ingestionRate,
+			"ingestionRate":   db.IngestionRate(),
 			"activeSeries":    stats.TotalSeries,
 			"memoryBytes":     stats.HeadSamples * 16, // approximate
 			"compressedBytes": stats.ChunkBytes,

@@ -270,8 +270,6 @@ func (gw *gatewayServer) broadcastLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastIngested int64
-
 	for range ticker.C {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 
@@ -281,12 +279,11 @@ func (gw *gatewayServer) broadcastLoop() {
 			continue
 		}
 
-		ingestionRate := agg.IngestionRate - lastIngested
-		lastIngested = agg.IngestionRate
-
+		// Each storage node already reports a windowed samples/sec rate; the cluster
+		// rate is their sum (FetchStats aggregates it).
 		gw.wsHub.BroadcastMetrics(map[string]interface{}{
 			"type":            "stats",
-			"ingestionRate":   ingestionRate,
+			"ingestionRate":   agg.IngestionRate,
 			"activeSeries":    agg.TotalSeries,
 			"memoryBytes":     agg.HeadSamples * 16,
 			"compressedBytes": agg.StorageBytesDisk,

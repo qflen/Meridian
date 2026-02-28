@@ -36,11 +36,12 @@ type HTTPServer struct {
 	wsHub      *WebSocketHub
 	mux        *http.ServeMux
 	httpServer *http.Server
-	startTime    time.Time
-	nodeID       string
-	peerAddrs    []string // HTTP addresses of cluster peers
-	latency      *latencyTracker
-	queryTimeout time.Duration
+	startTime      time.Time
+	nodeID         string
+	peerAddrs      []string // HTTP addresses of cluster peers
+	latency        *latencyTracker
+	queryTimeout   time.Duration
+	allowedOrigins []string // CORS allow-list; empty = localhost only
 }
 
 // latencyTracker records query execution latency into histogram buckets.
@@ -100,11 +101,17 @@ func (s *HTTPServer) SetQueryTimeout(d time.Duration) {
 	}
 }
 
+// SetAllowedOrigins sets the CORS allow-list. Empty (the default) permits only
+// localhost origins; a single "*" entry permits all. See CORSMiddleware.
+func (s *HTTPServer) SetAllowedOrigins(origins []string) {
+	s.allowedOrigins = origins
+}
+
 // Start begins serving HTTP requests.
 func (s *HTTPServer) Start(addr string) error {
 	s.httpServer = &http.Server{
 		Addr:    addr,
-		Handler: s.corsMiddleware(s.mux),
+		Handler: CORSMiddleware(s.allowedOrigins, s.mux),
 	}
 	go s.wsHub.Run()
 	log.Printf("HTTP server listening on %s", addr)
@@ -190,19 +197,6 @@ func containsDotDot(v string) bool {
 		}
 	}
 	return false
-}
-
-func (s *HTTPServer) corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
 }
 
 func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {

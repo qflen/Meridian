@@ -107,6 +107,9 @@ type ServerConfig struct {
 	// QueryTimeout bounds how long a single /api/v1/query may run. Zero leaves the
 	// server default (30s) in place.
 	QueryTimeout Duration `yaml:"query_timeout"`
+	// AllowedOrigins is the CORS allow-list for the HTTP API. Empty (the default)
+	// permits only localhost origins; a single "*" entry permits all origins.
+	AllowedOrigins []string `yaml:"allowed_origins"`
 }
 
 // StorageConfig holds storage engine parameters.

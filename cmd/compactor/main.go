@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
 )
 
@@ -37,7 +38,7 @@ func main() {
 
 	// Start health HTTP server
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", comp.handleHealth)
+	comp.registerRoutes(mux)
 
 	httpServer := &http.Server{Addr: httpAddr, Handler: mux}
 	go func() {
@@ -67,6 +68,16 @@ type compactorServer struct {
 	storage   *service.StorageClient
 	retention time.Duration
 	startTime time.Time
+}
+
+func (c *compactorServer) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/health", c.handleHealth)
+	mux.HandleFunc("/metrics", c.handleMetrics)
+}
+
+func (c *compactorServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	server.WriteServiceMetrics(w, c.nodeID, "compactor", time.Since(c.startTime))
 }
 
 func (c *compactorServer) handleHealth(w http.ResponseWriter, r *http.Request) {

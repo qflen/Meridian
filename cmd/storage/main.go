@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
 	"github.com/meridiandb/meridian/internal/storage"
 )
@@ -75,7 +76,14 @@ func (s *storageServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/internal/label/", s.handleLabelValues)
 	mux.HandleFunc("/api/internal/stats", s.handleStats)
 	mux.HandleFunc("/api/internal/blocks", s.handleBlocks)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	// DELETE for specific block: /api/internal/blocks/{ulid}
+}
+
+func (s *storageServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	server.WriteStorageMetrics(w, s.db, s.nodeID)
+	server.WriteServiceMetrics(w, s.nodeID, "storage", time.Since(s.startTime))
 }
 
 func (s *storageServer) handleHealth(w http.ResponseWriter, r *http.Request) {

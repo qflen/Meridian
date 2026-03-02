@@ -107,11 +107,18 @@ func (s *HTTPServer) SetAllowedOrigins(origins []string) {
 	s.allowedOrigins = origins
 }
 
+// handler composes the full middleware chain in front of the mux: CORS, then a
+// traversal guard that rejects "../" paths before http.ServeMux can path-clean and
+// 301-redirect them.
+func (s *HTTPServer) handler() http.Handler {
+	return CORSMiddleware(s.allowedOrigins, GuardTraversal(s.mux))
+}
+
 // Start begins serving HTTP requests.
 func (s *HTTPServer) Start(addr string) error {
 	s.httpServer = &http.Server{
 		Addr:    addr,
-		Handler: CORSMiddleware(s.allowedOrigins, s.mux),
+		Handler: s.handler(),
 	}
 	go s.wsHub.Run()
 	log.Printf("HTTP server listening on %s", addr)
@@ -185,6 +192,20 @@ func newStaticHandler(dashboardDir string) http.Handler {
 			return
 		}
 		http.ServeFile(w, r, index)
+	})
+}
+
+// GuardTraversal rejects any request whose path contains a ".." element with 400,
+// before it reaches http.ServeMux (which would otherwise path-clean and 301-redirect
+// it). Applied at the server boundary so directory-traversal attempts get an explicit
+// 4xx and never resolve against the filesystem.
+func GuardTraversal(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if containsDotDot(r.URL.Path) {
+			http.Error(w, "invalid URL path", http.StatusBadRequest)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

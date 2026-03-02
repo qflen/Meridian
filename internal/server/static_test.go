@@ -104,3 +104,20 @@ func TestStaticHandlerRejectsEncodedTraversal(t *testing.T) {
 		t.Fatalf("encoded traversal leaked sentinel file content")
 	}
 }
+
+// TestServerHandlerRejectsTraversalAtBoundary exercises the full server handler
+// chain (CORS → GuardTraversal → mux). The boundary guard must return 400 before
+// http.ServeMux can path-clean and 301-redirect the traversal.
+func TestServerHandlerRejectsTraversalAtBoundary(t *testing.T) {
+	s := NewHTTPServer(nil, "node-1", nil)
+	h := s.handler()
+	for _, p := range []string{"/../../../../etc/passwd", "/assets/../../secret", "/api/v1/../../etc/passwd"} {
+		req := httptest.NewRequest("GET", "http://example.com/", nil)
+		req.URL.Path = p
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("GET %s through full handler: status=%d, want 400", p, rec.Code)
+		}
+	}
+}

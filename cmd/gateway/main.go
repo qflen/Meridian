@@ -47,7 +47,7 @@ func main() {
 	mux := http.NewServeMux()
 	gw.registerRoutes(mux)
 
-	httpServer := &http.Server{Addr: httpAddr, Handler: server.CORSMiddleware(allowedOrigins, mux)}
+	httpServer := &http.Server{Addr: httpAddr, Handler: server.CORSMiddleware(allowedOrigins, server.GuardTraversal(mux))}
 
 	// Background: broadcast stats to WebSocket clients
 	go gw.broadcastLoop()

@@ -267,3 +267,73 @@ segment sync while the writer lock is held) and that a (rare) block-write failur
 makes the in-flight generation queryable only after a restart. Group-commit of WAL
 frames (one fsync for coalesced writes) is noted as future work; today each frame
 still fsyncs individually.
+
+## ADR-017: Ingestion Rate as a Windowed Rate, Cumulative Count for the Counter
+
+**Status**: Accepted
+**Context**: `TSDB.IngestionRate()` returned the cumulative `ingested` counter. The
+dashboard samples that value once per second and charts it as a rate, so it drew a
+monotonically rising line instead of throughput. Separately, the Prometheus
+exposition needs a *cumulative* `meridian_samples_ingested_total` — a `..._total`
+counter is correct by Prometheus convention (the scraper computes `rate()`). One
+method could not honestly serve both roles.
+**Decision**: Split the two concerns.
+- `IngestionRate()` returns a **windowed** samples/sec rate: a moving average over
+  `RateWindow` (default 5s), fed by a background sampler that records the cumulative
+  count every `RateSampleInterval` (default 1s). Idle intervals contribute the same
+  total as the previous one, so the rate decays smoothly to 0 when ingestion stops. A
+  counter reset (process restart, total decreases) is clamped to a non-negative rate.
+- `IngestedTotal()` returns the cumulative count and backs
+  `meridian_samples_ingested_total`, which stays a monotonic counter.
+- `/api/v1/stats` `ingestion_rate` and the WebSocket `ingestionRate` carry the
+  windowed rate. Wire types stay `int64` (the rate is rounded to whole samples/sec),
+  so neither the dashboard nor the inter-service protocol changes. Per-node rates are
+  additive, so the gateway sums them into the cluster rate.
+**Consequences**: The dashboard charts a true rate that tracks load and falls back to
+~0 when idle, with no dashboard change. The Prometheus counter remains a proper
+cumulative counter. The reported rate lags a step change by up to the window, and
+each TSDB runs one extra lightweight sampler goroutine. Verified live: under load the
+rate read ~140/s and fell to 0 within a window of going idle, while
+`samples_ingested_total` held at its cumulative value.
+
+## ADR-018: CORS Restricted to Configured Origins (Default Localhost)
+
+**Status**: Accepted
+**Context**: Both the monolith and the gateway returned
+`Access-Control-Allow-Origin: *` for every method, POST included. Any web page the
+operator visited could therefore script cross-origin reads and writes against a
+Meridian instance reachable from that browser (e.g. on a private network).
+**Decision**: Replace the blanket wildcard with an origin-checked middleware that
+echoes only permitted origins.
+- Default (unconfigured): allow only `localhost` / `127.0.0.1` / `[::1]` origins —
+  the local dashboard and its Vite dev server — and nothing else.
+- An explicit allow-list is exact-matched (`server.allowed_origins` for the monolith,
+  `GATEWAY_ALLOWED_ORIGINS` for the gateway). A single `"*"` entry re-enables
+  allow-all for deliberately trusted networks.
+- The matched origin is reflected back (with `Vary: Origin`) rather than `"*"`, so the
+  policy is also correct for credentialed requests. A disallowed cross-origin request
+  receives no CORS headers and is blocked by the browser.
+**Consequences**: Same-origin dashboard use is unchanged (a same-origin request sends
+no `Origin` header and proceeds normally). Cross-origin browser access now requires
+explicit configuration. The internal service APIs (storage/querier/ingestor) are not
+browser-facing surfaces and keep their permissive CORS; the public entry points
+(monolith `serve`, gateway) enforce the policy.
+
+## ADR-019: Prometheus /metrics on Every Service
+
+**Status**: Accepted
+**Context**: Only the monolith exposed `/metrics`. In the docker-compose topology the
+gateway, querier, storage, ingestor, and compactor had no scrape endpoint, so the
+"cluster" the README advertises could not actually be observed by a
+Prometheus-compatible collector.
+**Decision**: Register `/metrics` on every service through shared
+`WriteStorageMetrics`/`WriteServiceMetrics` helpers. Storage nodes expose the full
+storage metrics — the cumulative `meridian_samples_ingested_total`,
+`meridian_out_of_order_samples_total`, head samples, active series, block count,
+storage bytes by layer, and compression ratio. Every service additionally exposes
+`meridian_up` and `meridian_uptime_seconds`, and the gateway reports connected
+WebSocket clients. The monolith handler reuses the same storage helper so a storage
+node emits identical metrics whether run as the monolith or as the storage service.
+**Consequences**: The cluster is scrapeable end-to-end and metric names/labels are
+consistent across deployment modes. The endpoints are unauthenticated and intended
+for an internal scrape network (the same trust boundary as the internal RPC APIs).

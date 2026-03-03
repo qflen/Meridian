@@ -531,3 +531,97 @@ smaller than the configured N degrades gracefully rather than rejecting every wr
 - **Topology/ownership in the UI**: `/api/v1/cluster` still reports per-service
   health, not per-series replica ownership; surfacing the ring there and in the
   dashboard is left as-is.
+
+## ADR-023: Write-Path Backpressure — Bounded Queues with Block-Then-Shed Load Shedding
+
+**Status**: Accepted
+**Context**: The ingest buffers were effectively unbounded. The monolith
+`BatchWriter` appended into a slice that grew without limit; the ingestor fanned
+out an unbounded number of concurrent quorum writes (one goroutine per HTTP/TCP
+request); the storage node ingested inline, one goroutine per request. Under
+sustained overload — and replication makes this sharper, because a quorum write
+can stall on a single slow replica, and a storage node's WAL fsync can become the
+bottleneck — the arrival rate exceeds the service rate, the backlog grows, and the
+process simply consumes memory until it OOMs. There was no flow control: no signal
+to the producer to slow down, and no bound on resident work. A policy was required:
+how much to buffer, when to push back, and what to do past the limit.
+**Decision**: Put a **bounded queue between accept and the drain-to-storage
+worker** on every ingest path, with **block-then-shed** enqueue. This is flow
+control by a bounded queue: queue depth ≈ arrival_rate × service_time (Little's
+Law), so bounding the depth bounds both resident memory and tail latency, and
+overload is shed as a counted, observable event rather than a silent OOM.
+
+- **Shared primitive** (`internal/backpressure.Queue[T]`). A FIFO bounded by an
+  additive *cost* — for ingest the cost is a sample count, so the queue's depth is
+  a sample budget and **depth ≤ capacity always**, which is the memory bound.
+  `Enqueue(val, cost, deadline)` adds the item if there is room; if the queue is
+  full it **blocks up to the deadline** waiting for the drain to free room — this
+  is the backpressure — and if the deadline elapses it **sheds**: drops the item,
+  counts it, and returns `Accepted=false` so the caller can NACK the producer. An
+  item larger than the whole capacity can never fit and is shed at once rather than
+  blocking forever.
+- **Three zones via a high-water mark.** Below the high-water mark the queue
+  accepts freely; at or above it the producer is flagged to **throttle** (an early
+  hint, before any drop); when the queue is full the enqueue blocks then sheds.
+  Capacity is the hard cap; the high-water mark is the soft warning.
+- **Monolith** (`ingestion.BatchWriter`). Producers coalesce samples and enqueue
+  full batches; a **single drain goroutine** pulls in FIFO order and calls
+  `IngestBatch`. A slow TSDB backpressures the producer instead of growing a
+  buffer; past the deadline batches are shed. `Server.Write` returns the shed count
+  so the TCP producer is NACKed (`WriteResponse.Shed`/`Throttled`); the round-trip
+  stall itself slows a synchronous producer like the simulator. A single drain
+  keeps the queue FIFO, so an in-order producer's per-series timestamps are not
+  reordered into out-of-order rejections (ADR-015).
+- **Ingestor** (`service.WritePool`). A bounded queue plus a fixed **worker pool**
+  draining to the quorum `Write`. `Submit` blocks while the queue is full and sheds
+  past the deadline, returning `ErrShed`, which the HTTP handler maps to **429 +
+  `Retry-After`** and the TCP handler to a NACK. The workers call `Write`
+  unchanged, so **replication/quorum semantics are untouched** — only the
+  submission rate is bounded, capping the concurrent in-flight writes that a stalled
+  replica would otherwise let pile up.
+- **Storage node**. The same pool drains into the local TSDB. A node whose WAL
+  fsync is the bottleneck backpressures and, past the deadline, sheds with **429**;
+  that non-200 makes the ingestor's quorum write observe the overload, so
+  backpressure **propagates end-to-end** (producer → ingestor → storage) under one
+  model.
+- **Why block-then-shed** (not block-forever, not drop-immediately). Blocking
+  forever turns a slow downstream into a stuck producer with unbounded queued
+  goroutines — the OOM moves, it does not go away — and couples every producer to
+  the slowest replica. Dropping the moment the queue is full wastes the burst
+  absorption a small queue provides and sheds on transient spikes that a short block
+  would have ridden out. A bounded block absorbs bursts (true backpressure) while a
+  hard deadline guarantees the producer is never blocked unboundedly and memory is
+  capped; **shedding with an accounted drop is strictly better than a silent OOM**,
+  and propagating a 429/NACK lets a cooperative producer back off.
+- **Config & metrics.** `queue_capacity`, `queue_high_watermark`, and
+  `block_deadline` are configurable (with `max_concurrent_writes` sizing the
+  service worker pools), validated at load. Every node exposes
+  `meridian_dropped_samples_total`, `meridian_ingest_shed_events_total`, and
+  `meridian_ingest_backpressure_events_total` (counters) plus
+  `meridian_ingest_queue_depth`/`_capacity`/`_high_watermark` (gauges) on
+  `/metrics`; queue depth/capacity and cumulative drops are on `/api/v1/stats` and
+  the WebSocket stats frame. The drop counter stays **cumulative**
+  (Prometheus-correct); the dashboard derives a per-second shed rate from successive
+  samples, mirroring the windowed-rate / cumulative-counter split of ADR-017.
+
+**Consequences**: Resident ingest memory is bounded by the queue capacity on every
+path — the monolith, the ingestor, and the storage node — so overload can no longer
+grow the process without limit. A slow consumer is felt by the producer as a
+stalled round-trip (TCP) or a 429 (HTTP), and once the block deadline is exceeded
+load is shed with an exact, counted drop; when the consumer recovers, throughput
+resumes and shedding stops. The per-response shed count is best-effort (batches
+coalesce samples across calls), but `meridian_dropped_samples_total` is the
+authoritative count. Verified by tests on **both** paths: backpressure while full,
+deadline shedding with exact drop counts, depth never exceeding capacity under a
+concurrent flood, and recovery — all under `-race`, plus the HTTP 429 / TCP NACK
+wiring.
+
+**Deferred (honest scope)**:
+- **Per-series / priority shedding**: past the cap all series are shed equally;
+  there is no per-series fairness, priority class, or token-bucket rate limit
+  (cardinality control is noted as future work in the roadmap).
+- **Adaptive control**: the block deadline and capacity are static, not an
+  AIMD/aware-of-latency controller; there is no spill-to-disk overflow.
+- **Storage parallelism**: the storage pool's workers serialize on the TSDB write
+  lock, so its worker count is an admission bound rather than true write
+  parallelism; group-commit (ADR-016) would raise the service rate it bounds.

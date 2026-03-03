@@ -68,12 +68,13 @@ func runSimulate(cmd *cobra.Command, args []string) error {
 	defer ticker.Stop()
 
 	totalSamples := int64(0)
+	totalShed := int64(0)
 	startTime := time.Now()
 
 	for {
 		select {
 		case <-sigCh:
-			fmt.Printf("\nSimulator stopped. Total samples: %d\n", totalSamples)
+			fmt.Printf("\nSimulator stopped. Total samples: %d (shed: %d)\n", totalSamples, totalShed)
 			return nil
 		case t := <-ticker.C:
 			samples := gen.Generate(t)
@@ -91,9 +92,19 @@ func runSimulate(cmd *cobra.Command, args []string) error {
 			}
 
 			totalSamples += resp.SamplesIngested
+			totalShed += resp.Shed
 			elapsed := time.Since(startTime)
 			rate := float64(totalSamples) / elapsed.Seconds()
-			fmt.Printf("\rSamples: %d | Rate: %.1f/s | Elapsed: %s", totalSamples, rate, elapsed.Truncate(time.Second))
+			// Surface backpressure: a non-zero Shed is the server NACKing under
+			// overload; Throttled is the early high-water hint.
+			status := ""
+			if resp.Throttled {
+				status = " | THROTTLED"
+			}
+			if totalShed > 0 {
+				status = fmt.Sprintf(" | shed: %d%s", totalShed, status)
+			}
+			fmt.Printf("\rSamples: %d | Rate: %.1f/s | Elapsed: %s%s", totalSamples, rate, elapsed.Truncate(time.Second), status)
 		}
 	}
 }

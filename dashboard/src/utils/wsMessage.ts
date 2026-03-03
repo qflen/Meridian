@@ -33,6 +33,10 @@ export function parseWSMessage(raw: unknown): WSMessage | null {
         walSegments: num(obj.walSegments),
         blockCount: num(obj.blockCount),
         uptimeSeconds: num(obj.uptimeSeconds),
+        ingestQueueDepth: num(obj.ingestQueueDepth),
+        ingestQueueCapacity: num(obj.ingestQueueCapacity),
+        ingestQueueHighWatermark: num(obj.ingestQueueHighWatermark),
+        droppedSamples: num(obj.droppedSamples),
       };
 
     case 'metric':

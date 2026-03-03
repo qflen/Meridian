@@ -95,10 +95,30 @@ Implements rate(), histogram_quantile(), and all aggregation functions.
 ### Ingestion
 
 **TCP Server** (`internal/ingestion/server.go`): JSON-over-TCP ingestion
-protocol. Accepts WriteRequest messages containing batched time-series samples.
+protocol. Accepts WriteRequest messages containing batched time-series samples,
+under a per-message size cap, a per-message read deadline, and a concurrent-
+connection bound. A write that the bounded queue sheds is NACKed in the response
+(`Shed`/`Throttled`).
 
-**Batch Writer** (`internal/ingestion/batch.go`): Buffers incoming samples and
-flushes on either a size threshold or timeout, whichever comes first.
+**Batch Writer** (`internal/ingestion/batch.go`): Coalesces incoming samples into
+batches and drains them to the TSDB through a **bounded queue** with block-then-shed
+flow control (ADR-023). Producers enqueue full batches; a single drain goroutine
+writes them in FIFO order; a full queue blocks the producer up to a deadline (the
+backpressure) and then sheds — dropping and counting the batch — instead of growing
+without bound. Queue bounds come from ingestion config; a single drain preserves
+FIFO so an in-order producer is not reordered into out-of-order rejections.
+
+**Backpressure primitive** (`internal/backpressure/queue.go`): the shared
+cost-bounded, block-then-shed FIFO behind every ingest path. The cost is a sample
+count, so queue depth is a memory bound (depth ≤ capacity); `Enqueue` blocks up to a
+deadline when full, then sheds.
+
+**Service write pool** (`internal/service/pool.go`): the ingestor and storage node
+bound in-flight writes with a fixed worker pool draining a bounded queue. `Submit`
+blocks while the queue is full and sheds past the deadline (`ErrShed` → HTTP 429 +
+`Retry-After` / TCP NACK), so a stalled quorum write or a slow WAL fsync caps
+concurrency rather than piling up unbounded goroutines — quorum semantics are
+unchanged, only the submission rate is bounded.
 
 ### HTTP & WebSocket
 
@@ -123,7 +143,11 @@ reader cannot linger and leak its read/write goroutines.
 The monolith and all five microservices serve `/metrics`; storage nodes expose the
 full storage metric set, and the cumulative `meridian_samples_ingested_total` counter
 is kept distinct from the windowed ingestion rate reported on `/api/v1/stats`
-(ADR-017, ADR-019).
+(ADR-017, ADR-019). Every ingest-bounding node (monolith, ingestor, storage) also
+exports the write-path flow-control families via `WriteQueueMetrics`:
+`meridian_dropped_samples_total`, `meridian_ingest_shed_events_total`, and
+`meridian_ingest_backpressure_events_total` (cumulative counters), plus
+`meridian_ingest_queue_depth`/`_capacity`/`_high_watermark` (gauges) — ADR-023.
 
 ### Cluster (microservices tier)
 
@@ -165,9 +189,11 @@ aggregates (min, max, avg, sum, count) per time window, enabling the
 
 ## Data Flow
 
-1. **Ingest**: Samples arrive via TCP → BatchWriter → WAL (fsync) → HeadBlock
-   (in-order policy). The TCP server bounds message size, applies a per-message
-   read deadline, and caps concurrent connections.
+1. **Ingest**: Samples arrive via TCP → BatchWriter's bounded queue (block-then-shed
+   backpressure) → drain → WAL (fsync) → HeadBlock (in-order policy). The TCP server
+   bounds message size, applies a per-message read deadline, and caps concurrent
+   connections; a full queue sheds and NACKs the producer rather than growing memory
+   (ADR-023).
 2. **Flush**: Head swap + WAL rotate (cut) → Gorilla-compressed block written via
    temp-dir + fsync + atomic rename → covered WAL segments reclaimed.
 3. **Query**: Parser → Planner → merge(HeadBlock, Blocks) → Executor → Result

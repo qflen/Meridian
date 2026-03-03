@@ -13,6 +13,10 @@ describe('parseWSMessage', () => {
       walSegments: 1,
       blockCount: 0,
       uptimeSeconds: 42,
+      ingestQueueDepth: 120,
+      ingestQueueCapacity: 50000,
+      ingestQueueHighWatermark: 40000,
+      droppedSamples: 7,
     };
     expect(parseWSMessage(frame)).toEqual(frame);
   });
@@ -23,6 +27,10 @@ describe('parseWSMessage', () => {
     if (msg && msg.type === 'stats') {
       expect(msg.uptimeSeconds).toBe(0);
       expect(msg.ingestionRate).toBe(0);
+      // Backpressure fields default cleanly when an older server omits them.
+      expect(msg.ingestQueueDepth).toBe(0);
+      expect(msg.ingestQueueCapacity).toBe(0);
+      expect(msg.droppedSamples).toBe(0);
       expect(Number.isNaN(msg.uptimeSeconds)).toBe(false);
     }
   });

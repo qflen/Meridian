@@ -166,6 +166,7 @@ func (gw *gatewayServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	if agg.StorageBytesDisk > 0 {
 		ratio = float64(agg.StorageBytesRaw) / float64(agg.StorageBytesDisk)
 	}
+	iq := gw.fetchIngestStats(r.Context())
 	writeJSON(w, map[string]interface{}{
 		"total_samples":            agg.TotalSamples,
 		"total_series":             agg.TotalSeries,
@@ -177,8 +178,50 @@ func (gw *gatewayServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		"head_series":              agg.HeadSeries,
 		"wal_size":                 agg.WALSize,
 		"ingestion_rate":           agg.IngestionRate,
+		"ingest_queue_depth":       iq.Depth,
+		"ingest_queue_capacity":    iq.Capacity,
+		"dropped_samples":          iq.DroppedSamples,
 		"uptime":                   time.Since(gw.startTime).String(),
 	})
+}
+
+// ingestQueueStats is the ingest-queue load aggregated across ingestors.
+type ingestQueueStats struct {
+	Depth          int64
+	Capacity       int64
+	HighWatermark  int64
+	DroppedSamples int64
+}
+
+// fetchIngestStats sums each ingestor's bounded-queue snapshot so the dashboard can
+// show cluster-wide ingest-queue depth and drops. Unreachable ingestors are skipped.
+func (gw *gatewayServer) fetchIngestStats(ctx context.Context) ingestQueueStats {
+	var agg ingestQueueStats
+	for _, addr := range gw.ingestorAddrs {
+		req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/api/internal/ingest_stats", addr), nil)
+		if err != nil {
+			continue
+		}
+		resp, err := gw.httpClient.Do(req)
+		if err != nil {
+			continue
+		}
+		var s struct {
+			Depth          int64 `json:"depth"`
+			Capacity       int64 `json:"capacity"`
+			HighWatermark  int64 `json:"high_watermark"`
+			DroppedSamples int64 `json:"dropped_samples"`
+		}
+		if resp.StatusCode == http.StatusOK {
+			json.NewDecoder(resp.Body).Decode(&s)
+		}
+		resp.Body.Close()
+		agg.Depth += s.Depth
+		agg.Capacity += s.Capacity
+		agg.HighWatermark += s.HighWatermark
+		agg.DroppedSamples += s.DroppedSamples
+	}
+	return agg
 }
 
 // handleCluster returns the full microservice topology.
@@ -289,6 +332,9 @@ func (gw *gatewayServer) broadcastLoop() {
 			continue
 		}
 
+		// Aggregate ingest-queue load across ingestors for the dashboard load view.
+		iq := gw.fetchIngestStats(ctx)
+
 		// Each storage node already reports a windowed samples/sec rate; the cluster
 		// rate is their sum (FetchStats aggregates it).
 		gw.wsHub.BroadcastMetrics(map[string]interface{}{
@@ -301,6 +347,11 @@ func (gw *gatewayServer) broadcastLoop() {
 			"walSegments":     agg.WALSize,
 			"blockCount":      agg.BlockCount,
 			"uptimeSeconds":   int(time.Since(gw.startTime).Seconds()),
+			// Write-path backpressure (ADR-023), summed across ingestors.
+			"ingestQueueDepth":         iq.Depth,
+			"ingestQueueCapacity":      iq.Capacity,
+			"ingestQueueHighWatermark": iq.HighWatermark,
+			"droppedSamples":           iq.DroppedSamples,
 		})
 
 		// Broadcast live metric stream from storage nodes

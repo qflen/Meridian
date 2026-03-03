@@ -47,6 +47,13 @@ export interface WSStatsMessage {
   walSegments: number;
   blockCount: number;
   uptimeSeconds: number;
+  // Write-path backpressure (ADR-023): bounded ingest queue depth/capacity and the
+  // cumulative shed count. droppedSamples is cumulative; the load view derives a
+  // drop rate from successive samples.
+  ingestQueueDepth: number;
+  ingestQueueCapacity: number;
+  ingestQueueHighWatermark: number;
+  droppedSamples: number;
 }
 
 export type WSMessage = WSMetricMessage | WSLiveMessage | WSStatsMessage;

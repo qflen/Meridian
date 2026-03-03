@@ -82,6 +82,79 @@ func TestDefaultConfigClusterValid(t *testing.T) {
 	}
 }
 
+func TestIngestionConfigValidate(t *testing.T) {
+	valid := []IngestionConfig{
+		{BatchSize: 1000, MaxConcurrentWrites: 64, QueueCapacity: 50000, QueueHighWatermark: 40000, BlockDeadline: Duration(250 * time.Millisecond)},
+		{BatchSize: 1, MaxConcurrentWrites: 1, QueueCapacity: 1, QueueHighWatermark: 1, BlockDeadline: 0}, // minimal, non-blocking
+	}
+	for _, c := range valid {
+		if err := c.Validate(); err != nil {
+			t.Errorf("expected %+v to be valid, got %v", c, err)
+		}
+	}
+
+	invalid := []IngestionConfig{
+		{BatchSize: 0, MaxConcurrentWrites: 1, QueueCapacity: 10, QueueHighWatermark: 5},        // batch_size < 1
+		{BatchSize: 1000, MaxConcurrentWrites: 0, QueueCapacity: 10000, QueueHighWatermark: 5},  // workers < 1
+		{BatchSize: 1000, MaxConcurrentWrites: 1, QueueCapacity: 500, QueueHighWatermark: 400},  // capacity < batch_size
+		{BatchSize: 100, MaxConcurrentWrites: 1, QueueCapacity: 1000, QueueHighWatermark: 0},    // hw < 1
+		{BatchSize: 100, MaxConcurrentWrites: 1, QueueCapacity: 1000, QueueHighWatermark: 2000}, // hw > capacity
+		{BatchSize: 100, MaxConcurrentWrites: 1, QueueCapacity: 1000, QueueHighWatermark: 500, BlockDeadline: Duration(-time.Second)}, // negative deadline
+	}
+	for _, c := range invalid {
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected %+v to be invalid", c)
+		}
+	}
+}
+
+func TestDefaultConfigIngestionValid(t *testing.T) {
+	if err := DefaultConfig().Ingestion.Validate(); err != nil {
+		t.Fatalf("default ingestion config must validate: %v", err)
+	}
+}
+
+func TestLoadRejectsBadIngestion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "meridian.yaml")
+	// queue_capacity below batch_size: a batch could never enqueue.
+	yaml := `
+ingestion:
+  batch_size: 1000
+  queue_capacity: 100
+  queue_high_watermark: 50
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load should reject queue_capacity < batch_size")
+	}
+}
+
+func TestLoadDefaultsIngestionQueue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "meridian.yaml")
+	// An ingestion block that sets only batch_size keeps the queue defaults.
+	yaml := `
+ingestion:
+  batch_size: 500
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Ingestion.QueueCapacity != 50000 {
+		t.Errorf("queue_capacity: got %d, want default 50000", cfg.Ingestion.QueueCapacity)
+	}
+	if cfg.Ingestion.BlockDeadline.Std() != 250*time.Millisecond {
+		t.Errorf("block_deadline: got %v, want default 250ms", cfg.Ingestion.BlockDeadline.Std())
+	}
+}
+
 func TestLoadRejectsBadQuorum(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "meridian.yaml")

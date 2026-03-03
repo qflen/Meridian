@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/anomaly"
 	"github.com/meridiandb/meridian/internal/backpressure"
 	"github.com/meridiandb/meridian/internal/query"
 	"github.com/meridiandb/meridian/internal/storage"
@@ -47,6 +48,9 @@ type HTTPServer struct {
 	// /metrics and /api/v1/stats handlers. The ingestion server owns the queue, so
 	// the serve command wires this after constructing both.
 	ingestStats func() backpressure.Stats
+	// anomalyDet, when set, is the streaming anomaly detector fed by the broadcast
+	// loop. It backs the /api/v1/anomalies endpoint and the anomaly metrics/stats.
+	anomalyDet *anomaly.Detector
 }
 
 // latencyTracker records query execution latency into histogram buckets.
@@ -118,6 +122,13 @@ func (s *HTTPServer) SetIngestStatsSource(fn func() backpressure.Stats) {
 	s.ingestStats = fn
 }
 
+// SetAnomalyDetector wires the streaming anomaly detector (fed by the broadcast
+// loop) so /api/v1/anomalies, /api/v1/stats, and /metrics can surface recent
+// anomalies and their counters.
+func (s *HTTPServer) SetAnomalyDetector(d *anomaly.Detector) {
+	s.anomalyDet = d
+}
+
 // handler composes the full middleware chain in front of the mux: CORS, then a
 // traversal guard that rejects "../" paths before http.ServeMux can path-clean and
 // 301-redirect them.
@@ -166,6 +177,7 @@ func (s *HTTPServer) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/stats", s.handleStats)
 	s.mux.HandleFunc("/api/v1/cluster", s.handleCluster)
 	s.mux.HandleFunc("/api/v1/blocks", s.handleBlocks)
+	s.mux.HandleFunc("/api/v1/anomalies", s.handleAnomalies)
 	s.mux.HandleFunc("/api/v1/query_latency", s.handleQueryLatency)
 	s.mux.HandleFunc("/metrics", s.handlePromMetrics)
 	s.mux.HandleFunc("/ws/metrics", s.handleWSMetrics)
@@ -396,6 +408,12 @@ func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		out["ingest_queue_high_watermark"] = q.HighWatermark
 		out["dropped_samples"] = q.DroppedSamples
 	}
+	// Streaming anomaly detection (ADR-024): cumulative alerts raised and the number
+	// of series currently firing.
+	if s.anomalyDet != nil {
+		out["anomalies_total"] = s.anomalyDet.Total()
+		out["active_anomalies"] = s.anomalyDet.Active()
+	}
 	writeJSON(w, out)
 }
 
@@ -430,6 +448,29 @@ func (s *HTTPServer) handleQueryLatency(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, s.latency.buckets)
 }
 
+// handleAnomalies returns the bounded recent-anomalies buffer, most-recent-first,
+// so a late-joining dashboard can seed its alerts strip before live frames arrive.
+func (s *HTTPServer) handleAnomalies(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, RecentAnomaliesPayload(s.anomalyDet))
+}
+
+// RecentAnomaliesPayload snapshots a detector's recent buffer into the wire shape
+// shared by the monolith and the gateway: an `anomalies` list (most-recent-first)
+// plus the `total`/`active` counters. A nil detector yields an empty list and zero
+// counters so the endpoint is always well-formed.
+func RecentAnomaliesPayload(d *anomaly.Detector) map[string]interface{} {
+	if d == nil {
+		return map[string]interface{}{"anomalies": []anomaly.Event{}, "total": 0, "active": 0}
+	}
+	events := d.Recent()
+	anomaly.SortEventsRecentFirst(events)
+	return map[string]interface{}{
+		"anomalies": events,
+		"total":     d.Total(),
+		"active":    d.Active(),
+	}
+}
+
 // handlePromMetrics exposes Meridian's internal stats in Prometheus text format
 // (https://prometheus.io/docs/instrumenting/exposition_formats/). This lets the
 // server be scraped by a Prometheus-compatible collector — useful for running
@@ -444,6 +485,11 @@ func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	// Write-path flow-control metrics from the bounded ingest queue, when wired.
 	if s.ingestStats != nil {
 		WriteQueueMetrics(w, node, "monolith", s.ingestStats())
+	}
+
+	// Streaming anomaly detection metrics, when wired.
+	if s.anomalyDet != nil {
+		WriteAnomalyMetrics(w, node, "monolith", s.anomalyDet.Total(), s.anomalyDet.Active())
 	}
 
 	fmt.Fprintf(w, "# HELP meridian_query_latency_seconds Query executor latency histogram.\n")

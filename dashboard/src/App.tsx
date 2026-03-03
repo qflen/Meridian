@@ -9,6 +9,7 @@ import { CompressionStats } from './components/CompressionStats';
 import { LatencyHistogram } from './components/LatencyHistogram';
 import { RetentionTimeline } from './components/RetentionTimeline';
 import { LiveStream } from './components/LiveStream';
+import { AlertsPanel } from './components/AlertsPanel';
 import { ThemeToggle } from './components/ThemeToggle';
 import { Panel } from './components/Panel';
 import { Placeholder } from './components/Placeholder';
@@ -219,6 +220,10 @@ function Dashboard() {
           <IngestionMonitor />
           <ClusterTopology />
         </div>
+
+        {/* Streaming anomaly detection (ADR-024) — out-of-band points in the live
+            telemetry, raised and cleared in real time. */}
+        <AlertsPanel />
 
         <LiveStream />
 

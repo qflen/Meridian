@@ -147,7 +147,28 @@ is kept distinct from the windowed ingestion rate reported on `/api/v1/stats`
 exports the write-path flow-control families via `WriteQueueMetrics`:
 `meridian_dropped_samples_total`, `meridian_ingest_shed_events_total`, and
 `meridian_ingest_backpressure_events_total` (cumulative counters), plus
-`meridian_ingest_queue_depth`/`_capacity`/`_high_watermark` (gauges) — ADR-023.
+`meridian_ingest_queue_depth`/`_capacity`/`_high_watermark` (gauges) — ADR-023. The
+monolith and the gateway, where the anomaly detector runs, additionally export
+`meridian_anomalies_total` (counter) and `meridian_active_anomalies` (gauge) via
+`WriteAnomalyMetrics` (ADR-024).
+
+### Streaming anomaly detection
+
+**Detector** (`internal/anomaly/detector.go`): a pure, per-series online detector
+fed from the same per-series stream the broadcaster emits each tick, so it runs
+uniformly in the monolith (`cmd/meridian/serve.go`, from `Head().SeriesInfos()`) and
+the cluster gateway (`cmd/gateway`, from the aggregated `FetchSeries`). Each series
+keeps O(1) state: an **EWMA level** (baseline) and **EWMA variance** (dispersion);
+the score `|value − level| / dispersion` is a *local* z-score, so the slow diurnal
+swing and memory drift are tracked (small residual → no alert) while a spike departs
+sharply (large score → alert) — where a naive global z-score would flag the diurnal
+peak (ADR-024). A Welford warmup seeds the baseline; a Huber clamp bounds a spike's
+pull on the level/variance; a relative scale floor stops a flat series from collapsing
+the dispersion; debounce + a hysteresis clear band and timestamp dedup (on
+`SeriesInfo.LastTS`) avoid alert storms; stale series are evicted so memory follows
+live cardinality. Raise/clear transitions broadcast as a distinct `anomaly` WebSocket
+frame and into a bounded recent-events ring exposed at `/api/v1/anomalies` for
+late-joining clients; the dashboard's Anomalies strip lists them most-recent-first.
 
 ### Cluster (microservices tier)
 
@@ -197,7 +218,9 @@ aggregates (min, max, avg, sum, count) per time window, enabling the
 2. **Flush**: Head swap + WAL rotate (cut) → Gorilla-compressed block written via
    temp-dir + fsync + atomic rename → covered WAL segments reclaimed.
 3. **Query**: Parser → Planner → merge(HeadBlock, Blocks) → Executor → Result
-4. **Stream**: WebSocket hub broadcasts metrics + stats to dashboard at 60fps
+4. **Stream**: WebSocket hub broadcasts metrics + stats to dashboard at 60fps. The
+   same per-tick per-series stream feeds the anomaly detector, whose raise/clear
+   transitions broadcast as `anomaly` frames (ADR-024).
 5. **Retain**: Enforcer deletes expired blocks; downsampler creates rollups
 6. **Recover**: On open, load blocks, then replay only the WAL beyond the blocks'
    max low-water-mark → exactly-once reconstruction of the head.

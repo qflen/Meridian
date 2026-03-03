@@ -155,3 +155,148 @@ func TestRingEmpty(t *testing.T) {
 		t.Fatalf("expected 0 nodes for empty ring, got %d", len(nodes))
 	}
 }
+
+func TestRingSingleNode(t *testing.T) {
+	ring := NewRing(256)
+	ring.AddNode(Node{ID: "node-1", Addr: "host1:8080", State: NodeActive})
+
+	// Requesting 3 replicas from a 1-node ring yields exactly that one node.
+	nodes := ring.GetNodes("any_key", 3)
+	if len(nodes) != 1 || nodes[0].ID != "node-1" {
+		t.Fatalf("expected [node-1], got %v", nodes)
+	}
+	if n := ring.GetNode("any_key"); n == nil || n.ID != "node-1" {
+		t.Fatalf("expected primary node-1, got %v", n)
+	}
+}
+
+// TestRingFiltersDeadNodes verifies that a Dead node is excluded from every key's
+// replica set, and that a Leaving node is excluded too — routing must never target a
+// node that cannot serve the key (Appendix A4).
+func TestRingFiltersDeadNodes(t *testing.T) {
+	ring := NewRing(256)
+	ring.AddNode(Node{ID: "node-1", Addr: "host1:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-2", Addr: "host2:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-3", Addr: "host3:8080", State: NodeActive})
+
+	ring.SetState("node-2", NodeDead)
+	ring.SetState("node-3", NodeLeaving)
+
+	for i := 0; i < 2000; i++ {
+		key := fmt.Sprintf("series_%d", i)
+		for _, n := range ring.GetNodes(key, 3) {
+			if n.ID == "node-2" {
+				t.Fatalf("dead node-2 routed for key %q", key)
+			}
+			if n.ID == "node-3" {
+				t.Fatalf("leaving node-3 routed for key %q", key)
+			}
+		}
+	}
+
+	// With two of three nodes unavailable, every key resolves to the single live node.
+	nodes := ring.GetNodes("series_0", 3)
+	if len(nodes) != 1 || nodes[0].ID != "node-1" {
+		t.Fatalf("expected only live node-1, got %v", nodes)
+	}
+
+	live := ring.LiveNodes()
+	if len(live) != 1 || live[0].ID != "node-1" {
+		t.Fatalf("expected LiveNodes=[node-1], got %v", live)
+	}
+}
+
+// TestRingDeadThenActive verifies a node returning from Dead→Active is routed to
+// again — the property that lets a recovered replica resume receiving writes.
+func TestRingDeadThenActive(t *testing.T) {
+	ring := NewRing(256)
+	ring.AddNode(Node{ID: "node-1", Addr: "host1:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-2", Addr: "host2:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-3", Addr: "host3:8080", State: NodeActive})
+
+	// Find a key whose replica set includes node-2 while all are healthy.
+	var key string
+	for i := 0; i < 10000; i++ {
+		k := fmt.Sprintf("k_%d", i)
+		for _, n := range ring.GetNodes(k, 3) {
+			if n.ID == "node-2" {
+				key = k
+				break
+			}
+		}
+		if key != "" {
+			break
+		}
+	}
+	if key == "" {
+		t.Fatal("could not find a key routed to node-2")
+	}
+
+	ring.SetState("node-2", NodeDead)
+	if containsNode(ring.GetNodes(key, 3), "node-2") {
+		t.Fatal("dead node-2 should not be routed")
+	}
+
+	ring.SetState("node-2", NodeActive)
+	if !containsNode(ring.GetNodes(key, 3), "node-2") {
+		t.Fatal("revived node-2 should be routed again")
+	}
+}
+
+// TestRingDeterministicAcrossInsertionOrder proves the ring layout is a function of
+// its membership, not of the order nodes were added — required so independent clients
+// (ingestor and querier) agree on replica placement.
+func TestRingDeterministicAcrossInsertionOrder(t *testing.T) {
+	build := func(ids []string) *Ring {
+		r := NewRing(256)
+		for _, id := range ids {
+			r.AddNode(Node{ID: id, Addr: id + ":8080", State: NodeActive})
+		}
+		return r
+	}
+	a := build([]string{"node-1", "node-2", "node-3"})
+	b := build([]string{"node-3", "node-1", "node-2"})
+
+	for i := 0; i < 5000; i++ {
+		key := fmt.Sprintf("metric_%d{host=h-%d}", i%50, i)
+		na := a.GetNodes(key, 3)
+		nb := b.GetNodes(key, 3)
+		if len(na) != len(nb) {
+			t.Fatalf("replica-set size differs for %q: %d vs %d", key, len(na), len(nb))
+		}
+		for j := range na {
+			if na[j].ID != nb[j].ID {
+				t.Fatalf("replica order differs for %q at %d: %s vs %s", key, j, na[j].ID, nb[j].ID)
+			}
+		}
+	}
+}
+
+// TestRingHash64Bit guards against a regression to a 32-bit ring hash: across many
+// keys the high 32 bits must vary, which a uint32-truncated hash could never produce.
+func TestRingHash64Bit(t *testing.T) {
+	highBitsSeen := false
+	distinct := make(map[uint64]bool)
+	for i := 0; i < 1000; i++ {
+		h := hashKey(fmt.Sprintf("key_%d", i))
+		distinct[h] = true
+		if h>>32 != 0 {
+			highBitsSeen = true
+		}
+	}
+	if !highBitsSeen {
+		t.Fatal("ring hash never set bits above 32 — looks truncated to 32 bits")
+	}
+	if len(distinct) < 990 {
+		t.Fatalf("ring hash collided heavily: %d distinct of 1000", len(distinct))
+	}
+}
+
+func containsNode(nodes []Node, id string) bool {
+	for _, n := range nodes {
+		if n.ID == id {
+			return true
+		}
+	}
+	return false
+}

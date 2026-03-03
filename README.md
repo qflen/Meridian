@@ -77,10 +77,24 @@ auto-sizes so the range yields ~250 points; the step count is capped to bound wo
 and pre-empt a query-of-death. Each leaf selector's data is fetched once over the
 whole range and sliced per step, so cost scales with steps, not with re-queries.
 
-### Cluster
-- **Consistent hash ring**: SHA256 with virtual nodes
-- **Configurable replication**: writes fan out to N nodes
-- **Node lifecycle**: joining → active → leaving → dead
+### Cluster (microservices tier)
+- **Consistent-hash ring**: a 64-bit SHA-256 ring with virtual nodes and a
+  deterministic nodeID tie-break, so replica placement is a function of membership,
+  not of node-join order. It is the single routing source, built from the configured
+  storage nodes, and shared by the ingestor and querier so writes and reads agree.
+- **Quorum replication (N/W/R)**: each series is written to its **N** ring replicas
+  and succeeds at **W** acks; reads take **R** responses, merge and dedupe by
+  (series, timestamp), and asynchronously **read-repair** stale replicas. Defaults
+  N=3, W=2, R=2 — `W+R>N` gives read-your-writes. A node loss doesn't lose data: the
+  surviving replicas serve complete reads, and a recovered node is caught up by
+  read-repair. Too few live replicas returns a clear quorum error, never silent
+  partial data. (ADR-022.)
+- **Health-driven membership**: a background `/health` monitor marks nodes
+  active/dead so routing excludes the dead and re-includes the recovered. Graceful
+  `joining`/`leaving` with hinted handoff and rebalancing are future work — the ring
+  reserves those states but nothing assigns them yet.
+- **Scope**: this applies to the docker-compose tier (ingestor/storage/querier). The
+  single-binary `serve` is genuinely single-node.
 
 ### Dashboard
 - **Canvas-rendered**: charts drawn directly on the Canvas 2D API, no chart library
@@ -183,7 +197,16 @@ server:
 storage:
   block_duration: "15m"   # flush head to a compressed block this often
   retention:      "15d"   # drop blocks older than this
+cluster:                  # microservices tier only; W+R must exceed N
+  replication_factor: 3   # N — replicas per series
+  write_quorum:       2   # W — acks required for a write
+  read_quorum:        2   # R — replicas a read must hear from
+  virtual_nodes:      256 # ring virtual nodes per physical node
 ```
+
+The microservice binaries read the same knobs from the environment
+(`REPLICATION_FACTOR`, `WRITE_QUORUM`, `READ_QUORUM`, `VIRTUAL_NODES`); the effective
+values are clamped to the live node count so a cluster smaller than N still works.
 
 ## Docker
 
@@ -221,7 +244,8 @@ See [DECISIONS.md](DECISIONS.md) for the ADRs covering key trade-offs:
 Gorilla vs generic compression, sorted slices vs roaring bitmaps, JSON vs protobuf
 ingestion, rAF batching for WebSocket, the out-of-order sample policy, the
 crash-consistent flush model, the windowed ingestion-rate vs cumulative counter, the
-CORS policy, cluster-wide `/metrics`, and more.
+CORS policy, cluster-wide `/metrics`, the replication consistency model (quorum
+writes/reads + read-repair), and more.
 
 ## Development
 

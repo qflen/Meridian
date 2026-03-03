@@ -1,6 +1,9 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
+import { Panel } from './Panel';
+import { Placeholder } from './Placeholder';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
+import { PANEL_BODY } from '../utils/layout';
 
 interface Bucket {
   le: string;
@@ -52,6 +55,8 @@ export function LatencyHistogram() {
           { le: '1s', count: 0 },
         ];
 
+  const isEmpty = displayBuckets.every((b) => b.count === 0);
+
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -73,14 +78,9 @@ export function LatencyHistogram() {
     const barW = Math.max(4, plotW / displayBuckets.length - 4);
     const maxCount = Math.max(...displayBuckets.map((b) => b.count), 1);
 
-    // Draw "awaiting data" if all zeros
-    if (displayBuckets.every((b) => b.count === 0)) {
-      ctx.fillStyle = colors.textMuted;
-      ctx.font = canvasFont(11, { family: 'sans' });
-      ctx.textAlign = 'center';
-      ctx.fillText('Run a query to see latency distribution', w / 2, h / 2);
-
-      // Still draw x-axis labels
+    // When every bucket is empty, draw only the bucket axis (faint scaffolding);
+    // the shared Placeholder is overlaid in the DOM, so all empty states match.
+    if (isEmpty) {
       displayBuckets.forEach((bucket, i) => {
         const x = pad.left + (i / displayBuckets.length) * plotW + 2;
         ctx.fillStyle = colors.textMuted;
@@ -125,7 +125,7 @@ export function LatencyHistogram() {
       const y = pad.top + plotH - (i / 4) * plotH;
       ctx.fillText(String(v), pad.left - 6, y + 3);
     }
-  }, [displayBuckets]);
+  }, [displayBuckets, isEmpty]);
 
   useEffect(() => {
     render();
@@ -140,11 +140,18 @@ export function LatencyHistogram() {
   }, [render]);
 
   return (
-    <div className="card h-[294px]">
-      <h3 className="text-sm font-semibold mb-2">Query Latency Distribution</h3>
-      <div ref={containerRef} style={{ height: 180 }}>
-        <canvas ref={canvasRef} className="w-full h-full" style={{ height: 180 }} />
+    <Panel tier="tertiary" title="Query Latency Distribution" bodyHeight={PANEL_BODY.compact}>
+      <div ref={containerRef} className="relative flex-1 min-h-0">
+        <canvas ref={canvasRef} className="block w-full h-full" />
+        {isEmpty && (
+          <div className="pointer-events-none absolute inset-0">
+            <Placeholder
+              title="No query latencies recorded yet."
+              hint="Run a query and the distribution fills in."
+            />
+          </div>
+        )}
       </div>
-    </div>
+    </Panel>
   );
 }

@@ -44,6 +44,17 @@
     scrollbar-color: rgb(var(--color-border)) transparent;
   }
 
+  /*
+   * One keyboard-focus indicator everywhere, in the accent token. `:focus-visible`
+   * keeps pointer clicks clean while every keyboard focus shows a consistent ring,
+   * so components no longer hand-roll their own focus styles.
+   */
+  :focus-visible {
+    outline: 2px solid rgb(var(--color-accent));
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
   /* Display grotesque for headings; the body stack is set on <body> below. */
   h1, h2, h3, h4 {
     @apply font-display;
@@ -59,26 +70,38 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/*
+ * Honour a reduced-motion preference globally: collapse every animation and
+ * transition (the decorative pulses use motion-safe: utilities and are simply
+ * absent; this also neutralises any incidental transition). The chart's
+ * one-shot load sweep is skipped in JS via the same media query.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 @layer components {
   /*
-   * Base panel: a single coherent instrument surface. Solid (no glass blur),
-   * one hairline border, tight radius, no lifted shadow. Panel tiers come later.
+   * Base instrument surface: solid (no glass blur), one hairline border, tight
+   * radius, no lifted shadow. Padding and heading scale are layered on per tier
+   * by the Panel component, so hierarchy reads through size and density alone.
    */
-  .card {
-    @apply rounded-md p-4;
+  .panel {
+    @apply rounded-md;
     border: 1px solid rgb(var(--color-border));
     background: rgb(var(--color-surface));
   }
 
-  .card h3 {
-    color: rgb(var(--color-text));
-  }
-
   .btn-primary {
-    @apply rounded-md px-4 py-2 text-sm font-medium text-white transition-colors
-           focus:outline-none focus:ring-2;
+    @apply rounded-md px-4 py-2 text-sm font-medium text-white transition-colors;
     background: rgb(var(--color-accent));
-    --tw-ring-color: rgb(var(--color-accent) / 0.4);
   }
 
   .btn-primary:hover {
@@ -101,12 +124,10 @@ body {
 
   /* Inputs read recessed: page-ink background inside a lifted panel. */
   .input {
-    @apply rounded-md px-3 py-2 text-sm transition-colors
-           focus:outline-none focus:ring-1;
+    @apply rounded-md px-3 py-2 text-sm transition-colors;
     border: 1px solid rgb(var(--color-border));
     background: rgb(var(--color-bg));
     color: rgb(var(--color-text));
-    --tw-ring-color: rgb(var(--color-accent) / 0.35);
   }
 
   .input::placeholder {

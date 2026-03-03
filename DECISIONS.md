@@ -401,8 +401,63 @@ AI-default looks as well (near-black + acid accent; cream + serif + terracotta).
 light: fonts load over the network (woff2 under `/assets`) and the canvas shares
 the DOM family; there is no Mantine indigo, no glow, and no glassmorphism;
 numerics are tabular mono and aligned. This ADR supersedes the decorative choices
-of ADR-009 (canvas rendering stays; its "glow effects" do not). Deferred to
-follow-up work: the signature instrument chart (graticule + crosshair live
-readout), panel tiers / hierarchy, unified empty/loading/error states, the logo
-mark redesign and node iconography, and the accessibility pass (focus rings,
-keyboard navigation, reduced-motion).
+of ADR-009 (canvas rendering stays; its "glow effects" do not). The follow-up work
+it deferred — the signature instrument chart, panel tiers / hierarchy, unified
+empty/loading/error states, the logo and node iconography, and the accessibility
+pass — is delivered in **ADR-021**.
+
+## ADR-021: Visual Hierarchy, the Signature Instrument Chart, and the A11y Floor
+
+**Status**: Accepted
+**Context**: ADR-020 committed the "Precision Instrument" language but left the
+identity work for a follow-up: every panel was a uniform `.card` in a flat grid
+(the primary query action and a tertiary stat tile carried identical weight),
+heights were eyeballed magic pixels (`h-[294px]`, canvases pinned to 140/160/180),
+there was no memorable element, the four empty states were worded four different
+ways and drawn at canvas center, the logo was a generic circle-and-rising-line,
+cluster nodes were two-letter codes, and there was no keyboard/focus/reduced-motion
+story. A consistent instrument *needs* a hierarchy and one bold focal point.
+**Decision**:
+- **Hierarchy through size, not decoration.** A `Panel` component renders one
+  surface in three tiers — `primary` (the query bar and result), `secondary`
+  (live monitors), `tertiary` (dense readouts) — differentiated only by padding,
+  heading scale, and an accent eyebrow on the primary. No tier adds shadow or
+  glow. A single `PANEL_BODY` scale on an 8px module replaces the per-panel magic
+  heights; charts and lists size intrinsically (`flex-1`) inside a fixed body, so
+  panels in a row align without anyone hard-coding a height.
+- **One signature, the chart.** An `instrument` variant of `TimeSeriesChart` is
+  used by the *single* primary chart and nowhere else (boldness spent once). It
+  draws a fine graticule (faint minor subdivisions under major lines), instrument
+  tick marks with tabular-mono labels, and a calm trace (only the primary accent
+  series is area-filled, so multi-series stays legible). A cursor crosshair snaps
+  a vertical guide to the nearest sample of the primary series — an O(log n)
+  binary search (`utils/nearestSample`, unit-tested) — marks each series' nearest
+  sample, and shows a corner tabular-mono readout of the timestamp and every
+  series' value under the cursor. The hover pass is coalesced to one frame and the
+  load sweep is skipped under `prefers-reduced-motion`, so an idle chart schedules
+  no work.
+- **One voice for empty/loading/error.** A shared `Placeholder` (a flat
+  instrument-baseline mark plus plain, active copy) replaces the four canvas
+  captions. The primary result surface is always present and resolves to
+  loading / error / no-match / no-query states; a good chart is never blanked on a
+  later failure — the last result stays with a small "running" chip — and a
+  dropped stream surfaces as a reconnect banner driven by `connectionStatus`.
+- **A subject-grounded mark.** The logo is a transit reticle — a graduated setting
+  circle, the meridian line running clear through it, an inset horizon chord, and
+  a star fixed on the meridian — deliberately echoing the chart's crosshair and
+  sample dot; the favicon matches. Cluster nodes read as distinct shapes (gateway
+  diamond, ingestor down-triangle, storage square, querier circle, compactor
+  hexagon) instead of two-letter codes, mirrored in the legend.
+- **Accessibility as a floor, not a polish.** Query suggestions are a real
+  combobox/listbox (`aria-expanded`/`controls`/`activedescendant`, arrow/Enter/
+  Escape, type-to-filter); icon-only controls carry `aria-label`, the theme
+  control `aria-pressed`, Execute `aria-busy`; the connection state is conveyed by
+  text, not colour alone. One global `:focus-visible` accent ring replaces the
+  per-component focus styles, a global `prefers-reduced-motion` reset backs the
+  `motion-safe:` utilities, and the layout is responsive to a phone width (header
+  wraps, grids stack, stat tiles reflow).
+**Consequences**: One coherent, hierarchical identity per theme, verified in dark,
+light, and at a 390px width by driving the live dashboard in a headless browser:
+the crosshair readout tracks the cursor, the empty/loading/error/reconnect states
+render in one voice, and there are no console errors. The boldness lives in exactly
+one place; everything else stays quiet, which is what makes it land.

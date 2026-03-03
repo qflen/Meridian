@@ -9,6 +9,8 @@ export interface CanvasColors {
   text: string;
   textMuted: string;
   border: string;
+  /** Panel surface — used to ring markers so they read on top of a trace. */
+  surface: string;
   accent: string;
   success: string;
   warning: string;
@@ -17,6 +19,8 @@ export interface CanvasColors {
   gridColor: string;
   /** Plot frame / stronger ticks. */
   gridStrong: string;
+  /** Minor graticule subdivisions — fainter than gridColor. */
+  gridFaint: string;
 }
 
 export function getCanvasColors(el: HTMLElement): CanvasColors {
@@ -37,11 +41,13 @@ export function getCanvasColors(el: HTMLElement): CanvasColors {
     text: rgb('--color-text'),
     textMuted: rgb('--color-text-muted'),
     border: rgb('--color-border'),
+    surface: rgb('--color-surface'),
     accent: rgb('--color-accent'),
     success: rgb('--color-success'),
     warning: rgb('--color-warning'),
     danger: rgb('--color-danger'),
     gridColor: rgba('--color-border', 0.5),
     gridStrong: rgba('--color-border', 0.9),
+    gridFaint: rgba('--color-border', 0.22),
   };
 }

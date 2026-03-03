@@ -6,7 +6,7 @@ Meridian implements Facebook's Gorilla compression, a PromQL-subset query engine
 consistent-hash clustering, automatic downsampling, and a canvas-rendered
 monitoring dashboard. It ships as a single binary with minimal dependencies.
 
-![Meridian dashboard demo](docs/demo.gif)
+![Meridian dashboard](docs/dashboard.png)
 
 ## Quick Start
 
@@ -87,7 +87,9 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
 - **10 components**: query editor, time-series chart, metric explorer, cluster topology, ingestion monitor, compression gauge, latency histogram, retention timeline, live stream, theme toggle
 - **Real-time**: WebSocket streaming batched through `requestAnimationFrame`
 - **Themes**: dark and light, sharing one semantic token system
-- **Design**: a calm "precision instrument" visual language — one accent, tabular-mono figures, self-hosted Inter Tight / Inter / IBM Plex Mono (see ADR-020)
+- **Design**: a calm "precision instrument" visual language — three panel tiers, one accent, tabular-mono figures, self-hosted Inter Tight / Inter / IBM Plex Mono (ADR-020, ADR-021)
+- **Signature chart**: the query result is a strip-chart instrument — a fine graticule, instrument tick marks, and a cursor crosshair with a live tabular-mono readout of the value under the cursor on every series
+- **States & accessibility**: one shared empty / loading / error voice plus a reconnect banner; keyboard-navigable query suggestions (combobox/listbox), visible accent focus rings, and `prefers-reduced-motion` honored throughout
 
 ### Observability
 - **`/metrics`**: Prometheus exposition on **every** node — the monolith and each

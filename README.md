@@ -3,7 +3,7 @@
 A distributed time-series database written in Go with a real-time React dashboard.
 
 Meridian implements Facebook's Gorilla compression, a PromQL-subset query engine,
-consistent-hash clustering, automatic downsampling, and a canvas-rendered 60 fps
+consistent-hash clustering, automatic downsampling, and a canvas-rendered
 monitoring dashboard. It ships as a single binary with minimal dependencies.
 
 ![Meridian dashboard demo](docs/demo.gif)
@@ -83,10 +83,11 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
 - **Node lifecycle**: joining → active → leaving → dead
 
 ### Dashboard
-- **Canvas-rendered**: 60 fps charts, no chart library
+- **Canvas-rendered**: charts drawn directly on the Canvas 2D API, no chart library
 - **10 components**: query editor, time-series chart, metric explorer, cluster topology, ingestion monitor, compression gauge, latency histogram, retention timeline, live stream, theme toggle
 - **Real-time**: WebSocket streaming batched through `requestAnimationFrame`
-- **Themes**: dark, light, high-contrast
+- **Themes**: dark and light, sharing one semantic token system
+- **Design**: a calm "precision instrument" visual language — one accent, tabular-mono figures, self-hosted Inter Tight / Inter / IBM Plex Mono (see ADR-020)
 
 ### Observability
 - **`/metrics`**: Prometheus exposition on **every** node — the monolith and each

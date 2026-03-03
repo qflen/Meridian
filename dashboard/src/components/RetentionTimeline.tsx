@@ -1,6 +1,9 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
+import { canvasFont } from '../utils/canvasFont';
+import { formatTime } from '../utils/format';
+import { CATEGORICAL } from '../utils/chartPalette';
 import { BlockInfo } from '../types';
 
 export function RetentionTimeline() {
@@ -95,22 +98,18 @@ export function RetentionTimeline() {
     const laneCount = Math.max(nodeIds.length, 1);
     const laneH = plotH / laneCount;
 
-    const nodeColors = ['#5c7cfa', '#22c55e', '#f59e0b', '#a855f7', '#f97316'];
+    const laneColors = [colors.accent, ...CATEGORICAL];
 
     nodeIds.forEach((nodeId, lane) => {
       const y = pad.top + lane * laneH;
-      const color = nodeColors[lane % nodeColors.length];
+      const color = laneColors[lane % laneColors.length];
 
       // Lane label
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '9px Inter, sans-serif';
+      ctx.font = canvasFont(9, { family: 'sans' });
       ctx.textAlign = 'right';
       const label = nodeId === 'all' ? 'head' : nodeId.replace('storage-', 'S');
       ctx.fillText(label, pad.left - 8, y + laneH / 2 + 3);
-
-      // Lane background
-      ctx.fillStyle = lane % 2 === 0 ? 'rgba(255,255,255,0.02)' : 'transparent';
-      ctx.fillRect(pad.left, y, plotW, laneH);
 
       // Blocks in this lane
       displayBlocks
@@ -132,7 +131,7 @@ export function RetentionTimeline() {
           // Block id
           if (bw > 40) {
             ctx.fillStyle = colors.textMuted;
-            ctx.font = '8px Inter, sans-serif';
+            ctx.font = canvasFont(8);
             ctx.textAlign = 'center';
             ctx.fillText(b.id, x1 + bw / 2, y + laneH / 2 + 3);
           }
@@ -152,11 +151,10 @@ export function RetentionTimeline() {
     for (let i = 0; i <= ticks; i++) {
       const t = minT + (i / ticks) * tRange;
       const x = pad.left + (i / ticks) * plotW;
-      const d = new Date(t);
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '9px Inter, sans-serif';
+      ctx.font = canvasFont(9);
       ctx.textAlign = 'center';
-      ctx.fillText(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), x, pad.top + plotH + 16);
+      ctx.fillText(formatTime(t, { seconds: false }), x, pad.top + plotH + 16);
     }
   }, [displayBlocks]);
 
@@ -175,8 +173,8 @@ export function RetentionTimeline() {
   return (
     <div className="card">
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Retention Timeline</h3>
-        <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
+        <h3 className="text-sm font-semibold">Retention Timeline</h3>
+        <span className="text-xs text-muted tabular-nums">
           {blocks.length > 0 ? `${blocks.length} blocks` : state.stats ? `${state.stats.blockCount} blocks` : '--'}
         </span>
       </div>

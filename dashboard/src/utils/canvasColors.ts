@@ -1,19 +1,47 @@
 /**
- * Resolve CSS custom properties for use in Canvas 2D context.
- * Canvas does NOT support CSS variables — ctx.fillStyle = 'rgb(var(--x))' silently fails to black.
+ * Resolve CSS custom properties for use in a Canvas 2D context.
+ * Canvas does NOT support CSS variables — `ctx.fillStyle = 'rgb(var(--x))'`
+ * silently fails to black — so we read the computed channel triples and build
+ * concrete color strings. The graticule colors are derived from the single
+ * border token so the canvas grid and the DOM hairlines stay in one system.
  */
-export function getCanvasColors(el: HTMLElement) {
+export interface CanvasColors {
+  text: string;
+  textMuted: string;
+  border: string;
+  accent: string;
+  success: string;
+  warning: string;
+  danger: string;
+  /** Faint graticule lines (border token at reduced alpha). */
+  gridColor: string;
+  /** Plot frame / stronger ticks. */
+  gridStrong: string;
+}
+
+export function getCanvasColors(el: HTMLElement): CanvasColors {
   const style = getComputedStyle(el);
   const get = (name: string) => style.getPropertyValue(name).trim();
+
+  const channels = (name: string) => get(name).split(/\s+/);
+  const rgb = (name: string) => {
+    const [r, g, b] = channels(name);
+    return `rgb(${r} ${g} ${b})`;
+  };
+  const rgba = (name: string, a: number) => {
+    const [r, g, b] = channels(name);
+    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  };
+
   return {
-    text: `rgb(${get('--color-text')})`,
-    textMuted: `rgb(${get('--color-text-muted')})`,
-    border: `rgb(${get('--color-border')})`,
-    accent: `rgb(${get('--color-accent')})`,
-    success: `rgb(${get('--color-success')})`,
-    warning: `rgb(${get('--color-warning')})`,
-    danger: `rgb(${get('--color-danger')})`,
-    gridColor: get('--grid-color') || 'rgba(128,128,128,0.2)',
-    chartGlow: get('--chart-glow') || 'rgba(92,124,250,0.2)',
+    text: rgb('--color-text'),
+    textMuted: rgb('--color-text-muted'),
+    border: rgb('--color-border'),
+    accent: rgb('--color-accent'),
+    success: rgb('--color-success'),
+    warning: rgb('--color-warning'),
+    danger: rgb('--color-danger'),
+    gridColor: rgba('--color-border', 0.5),
+    gridStrong: rgba('--color-border', 0.9),
   };
 }

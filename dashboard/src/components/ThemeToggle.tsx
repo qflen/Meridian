@@ -17,18 +17,17 @@ export function ThemeToggle() {
   };
 
   return (
-    <div className="flex items-center gap-1 rounded-lg p-0.5" style={{ border: '1px solid rgb(var(--color-border))' }}>
+    <div className="flex items-center gap-1 rounded-md p-0.5 border">
       {THEMES.map((t) => (
         <button
           key={t.value}
           onClick={() => setTheme(t.value)}
           title={t.label}
-          className={`rounded-md p-1.5 transition-colors ${
-            state.theme === t.value ? 'bg-meridian-600 text-white' : ''
+          className={`rounded p-1.5 transition-colors ${
+            state.theme === t.value
+              ? 'bg-accent text-white'
+              : 'text-muted hover:text-text'
           }`}
-          style={state.theme !== t.value ? { color: 'rgb(var(--color-text-muted))' } : undefined}
-          onMouseEnter={(e) => { if (state.theme !== t.value) e.currentTarget.style.color = 'rgb(var(--color-text))'; }}
-          onMouseLeave={(e) => { if (state.theme !== t.value) e.currentTarget.style.color = 'rgb(var(--color-text-muted))'; }}
         >
           <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d={t.icon} />

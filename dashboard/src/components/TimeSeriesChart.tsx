@@ -1,12 +1,9 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { Sample } from '../types';
 import { getCanvasColors } from '../utils/canvasColors';
-
-// Palette of visually distinct colors for multi-series
-const COLORS = [
-  '#5c7cfa', '#22c55e', '#f59e0b', '#ef4444', '#a855f7',
-  '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1',
-];
+import { canvasFont } from '../utils/canvasFont';
+import { formatNumber, formatTime } from '../utils/format';
+import { CATEGORICAL } from '../utils/chartPalette';
 
 interface SeriesData {
   label: string;
@@ -23,19 +20,6 @@ interface Props {
   animated?: boolean;
   yLabel?: string;
   title?: string;
-}
-
-function formatValue(v: number): string {
-  if (Math.abs(v) >= 1e9) return (v / 1e9).toFixed(1) + 'G';
-  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
-  if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K';
-  if (Math.abs(v) < 0.01 && v !== 0) return v.toExponential(1);
-  return v.toFixed(v % 1 === 0 ? 0 : 2);
-}
-
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 export function TimeSeriesChart({
@@ -82,6 +66,9 @@ export function TimeSeriesChart({
 
     // Resolve CSS variables for canvas (canvas cannot use var() directly)
     const colors = getCanvasColors(canvas);
+    // The primary/live trace takes the single accent; extra series fall back to
+    // the restrained categorical secondaries.
+    const palette = [colors.accent, ...CATEGORICAL];
 
     // Clear
     ctx.clearRect(0, 0, w, h);
@@ -89,7 +76,7 @@ export function TimeSeriesChart({
     // Title
     if (title) {
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '11px Inter, sans-serif';
+      ctx.font = canvasFont(11, { family: 'sans' });
       ctx.textAlign = 'left';
       ctx.fillText(title, pad.left, 14);
     }
@@ -108,7 +95,7 @@ export function TimeSeriesChart({
     if (!isFinite(minT)) {
       // No data - draw empty state
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '13px Inter, sans-serif';
+      ctx.font = canvasFont(13, { family: 'sans' });
       ctx.textAlign = 'center';
       ctx.fillText('No data', w / 2, h / 2);
       return;
@@ -139,9 +126,9 @@ export function TimeSeriesChart({
         ctx.stroke();
 
         ctx.fillStyle = colors.textMuted;
-        ctx.font = '10px Inter, sans-serif';
+        ctx.font = canvasFont(10);
         ctx.textAlign = 'right';
-        ctx.fillText(formatValue(v), pad.left - 6, y + 3);
+        ctx.fillText(formatNumber(v), pad.left - 6, y + 3);
       }
 
       // Vertical grid lines
@@ -155,7 +142,7 @@ export function TimeSeriesChart({
         ctx.stroke();
 
         ctx.fillStyle = colors.textMuted;
-        ctx.font = '10px Inter, sans-serif';
+        ctx.font = canvasFont(10);
         ctx.textAlign = 'center';
         ctx.fillText(formatTime(t), x, pad.top + plotH + 16);
       }
@@ -165,7 +152,7 @@ export function TimeSeriesChart({
     if (yLabel) {
       ctx.save();
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '10px Inter, sans-serif';
+      ctx.font = canvasFont(10, { family: 'sans' });
       ctx.translate(12, pad.top + plotH / 2);
       ctx.rotate(-Math.PI / 2);
       ctx.textAlign = 'center';
@@ -184,12 +171,8 @@ export function TimeSeriesChart({
     // Draw series
     series.forEach((s, si) => {
       if (s.samples.length < 2) return;
-      const color = s.color || COLORS[si % COLORS.length];
+      const color = s.color || palette[si % palette.length];
 
-      // Glow effect
-      ctx.save();
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 6;
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.5;
       ctx.lineJoin = 'round';
@@ -205,7 +188,6 @@ export function TimeSeriesChart({
         else ctx.lineTo(x, y);
       }
       ctx.stroke();
-      ctx.restore();
 
       // Area fill
       if (drawCount > 1) {
@@ -226,13 +208,13 @@ export function TimeSeriesChart({
 
     // Legend — render in rows so items never overlap
     if (showLegend && series.length > 0) {
-      ctx.font = '10px Inter, sans-serif';
+      ctx.font = canvasFont(10, { family: 'sans' });
       const legendBaseY = pad.top + plotH + 24;
       let lx = pad.left;
       let row = 0;
 
       for (let i = 0; i < Math.min(series.length, 12); i++) {
-        const color = series[i].color || COLORS[i % COLORS.length];
+        const color = series[i].color || palette[i % palette.length];
         const label = series[i].label.length > 28
           ? series[i].label.slice(0, 26) + '..'
           : series[i].label;

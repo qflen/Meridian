@@ -62,8 +62,8 @@ export function MetricExplorer() {
   return (
     <div className="card">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Metric Explorer</h3>
-        <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>{metrics.length} metrics</span>
+        <h3 className="text-sm font-semibold">Metric Explorer</h3>
+        <span className="text-xs text-muted tabular-nums">{metrics.length} metrics</span>
       </div>
       <input
         type="text"
@@ -75,7 +75,7 @@ export function MetricExplorer() {
       <div className="flex gap-3 h-64">
         <div className="w-1/2 overflow-y-auto space-y-0.5 pr-2">
           {filtered.length === 0 && (
-            <div className="text-xs italic py-4 text-center" style={{ color: 'rgb(var(--color-text-muted))' }}>
+            <div className="text-xs italic py-4 text-center text-muted">
               {metrics.length === 0 ? 'Connect to server to browse metrics' : 'No matching metrics'}
             </div>
           )}
@@ -84,14 +84,11 @@ export function MetricExplorer() {
               key={m.name}
               onClick={() => selectMetric(m.name)}
               className={`w-full text-left px-2 py-1.5 rounded text-xs font-mono transition-colors ${
-                selected === m.name ? 'bg-meridian-600/20 text-meridian-400' : ''
+                selected === m.name ? 'bg-accent/15 text-accent' : 'text-text hover:bg-text/5'
               }`}
-              style={selected !== m.name ? { color: 'rgb(var(--color-text))' } : undefined}
-              onMouseEnter={(e) => { if (selected !== m.name) e.currentTarget.style.background = 'rgb(var(--color-text) / 0.08)'; }}
-              onMouseLeave={(e) => { if (selected !== m.name) e.currentTarget.style.background = 'transparent'; }}
             >
               <span>{m.name}</span>
-              <span className="ml-2" style={{ color: 'rgb(var(--color-text-muted))' }}>
+              <span className="ml-2 text-muted">
                 {m.type === 'counter' ? 'CNT' : 'GAU'}
               </span>
             </button>
@@ -101,7 +98,7 @@ export function MetricExplorer() {
           {selected && liveData.length > 0 ? (
             <TimeSeriesChart series={liveData} height={240} showLegend={false} />
           ) : (
-            <div className="text-xs italic" style={{ color: 'rgb(var(--color-text-muted))' }}>
+            <div className="text-xs italic text-muted">
               {selected ? 'Waiting for data...' : 'Select a metric'}
             </div>
           )}

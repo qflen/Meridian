@@ -1,12 +1,13 @@
 import { useRef, useEffect } from 'react';
 import { useDashboard } from '../state/DashboardContext';
+import { LiveEntry, liveRowKey } from '../utils/liveStream';
 
 export function LiveStream() {
   const { state } = useDashboard();
   const listRef = useRef<HTMLDivElement>(null);
 
   // Collect recent samples from all live metrics
-  const entries: { key: string; ts: number; value: number }[] = [];
+  const entries: LiveEntry[] = [];
   state.liveMetrics.forEach((samples, key) => {
     const recent = samples.slice(-3);
     for (const s of recent) {
@@ -38,7 +39,7 @@ export function LiveStream() {
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Live Stream</h3>
         <div className="flex items-center gap-2">
-          {state.connected ? (
+          {state.connectionStatus === 'connected' ? (
             <span className="flex items-center gap-1.5 text-xs" style={{ color: 'rgb(var(--color-success))' }}>
               <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: 'rgb(var(--color-success))' }} />
               Connected
@@ -46,7 +47,7 @@ export function LiveStream() {
           ) : (
             <span className="flex items-center gap-1.5 text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
               <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'rgb(var(--color-text-muted))' }} />
-              Disconnected
+              {state.connectionStatus === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}
             </span>
           )}
         </div>
@@ -57,9 +58,9 @@ export function LiveStream() {
             Waiting for live data...
           </div>
         )}
-        {display.map((e, i) => (
+        {display.map((e) => (
           <div
-            key={`${e.key}-${e.ts}-${i}`}
+            key={liveRowKey(e)}
             className="flex items-center gap-2 px-2 py-1 rounded transition-colors"
             style={{ cursor: 'default' }}
             onMouseEnter={(el) => el.currentTarget.style.background = 'rgb(var(--color-text) / 0.06)'}

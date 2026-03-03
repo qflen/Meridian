@@ -74,17 +74,18 @@ export interface BlockInfo {
 
 // ── Dashboard state ─────────────────────────────────────────────────
 
-export type Theme = 'dark' | 'light' | 'high-contrast';
+export type Theme = 'dark' | 'light';
 
-export interface TimeRange {
-  start: number;
-  end: number;
-}
+/**
+ * Live connection state surfaced by the header indicator:
+ *  - `connecting`    — initial attempt, before the first open
+ *  - `connected`     — socket is open and streaming
+ *  - `reconnecting`  — dropped, retrying with exponential backoff
+ */
+export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting';
 
 export interface DashboardState {
   theme: Theme;
-  timeRange: TimeRange;
-  refreshInterval: number;
   query: string;
   queryResult: QueryResult | null;
   queryError: string | null;
@@ -92,13 +93,11 @@ export interface DashboardState {
   stats: WSStatsMessage | null;
   liveMetrics: Map<string, Sample[]>;
   clusterNodes: ClusterNode[];
-  connected: boolean;
+  connectionStatus: ConnectionStatus;
 }
 
 export type DashboardAction =
   | { type: 'SET_THEME'; theme: Theme }
-  | { type: 'SET_TIME_RANGE'; range: TimeRange }
-  | { type: 'SET_REFRESH_INTERVAL'; interval: number }
   | { type: 'SET_QUERY'; query: string }
   | { type: 'QUERY_START' }
   | { type: 'QUERY_SUCCESS'; result: QueryResult }
@@ -106,4 +105,4 @@ export type DashboardAction =
   | { type: 'SET_STATS'; stats: WSStatsMessage }
   | { type: 'ADD_LIVE_METRIC'; key: string; sample: Sample }
   | { type: 'SET_CLUSTER_NODES'; nodes: ClusterNode[] }
-  | { type: 'SET_CONNECTED'; connected: boolean };
+  | { type: 'SET_CONNECTION_STATUS'; status: ConnectionStatus };

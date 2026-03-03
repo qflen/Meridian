@@ -1,4 +1,8 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
+import {
+  droppedFramesForDelta,
+  MAX_PLAUSIBLE_FRAME_MS,
+} from '../utils/frameMetrics';
 
 interface FrameMetrics {
   fps: number;
@@ -22,15 +26,18 @@ export function useFrameMetrics(): FrameMetrics {
     const now = performance.now();
     const delta = now - lastFrameRef.current;
     lastFrameRef.current = now;
+    rafRef.current = requestAnimationFrame(measure);
+
+    // Skip implausibly large gaps entirely (tab was hidden/backgrounded) so
+    // they skew neither the dropped-frame count nor the average frame time.
+    if (delta > MAX_PLAUSIBLE_FRAME_MS) return;
 
     const times = frameTimesRef.current;
     times.push(delta);
+    droppedRef.current += droppedFramesForDelta(delta);
 
-    if (delta > 33.33) {
-      droppedRef.current += Math.floor(delta / 16.67) - 1;
-    }
-
-    // Update every 30 frames
+    // Publish a rolling window every 30 frames, then reset the counters so a
+    // brief hiccup ages out instead of sticking on screen forever.
     if (times.length >= 30) {
       const avg = times.reduce((a, b) => a + b, 0) / times.length;
       setMetrics({
@@ -39,9 +46,8 @@ export function useFrameMetrics(): FrameMetrics {
         droppedFrames: droppedRef.current,
       });
       frameTimesRef.current = [];
+      droppedRef.current = 0;
     }
-
-    rafRef.current = requestAnimationFrame(measure);
   }, []);
 
   useEffect(() => {

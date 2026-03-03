@@ -52,7 +52,7 @@ export function TimeSeriesChart({
   const containerRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef(0);
   const progressRef = useRef(0);
-  const prevSeriesRef = useRef<SeriesData[]>([]);
+  const hasAnimatedRef = useRef(false);
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
@@ -63,9 +63,17 @@ export function TimeSeriesChart({
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth;
     const h = canvas.clientHeight;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    ctx.scale(dpr, dpr);
+    const pxW = Math.round(w * dpr);
+    const pxH = Math.round(h * dpr);
+    // Only resize the backing store when the device-pixel dimensions actually
+    // change — assigning canvas.width every frame reallocates the backing store.
+    if (canvas.width !== pxW || canvas.height !== pxH) {
+      canvas.width = pxW;
+      canvas.height = pxH;
+    }
+    // Absolute transform (not the cumulative ctx.scale): since the backing store
+    // is no longer cleared each frame, a cumulative scale would compound.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const legendRows = showLegend && series.length > 0 ? Math.ceil(series.length / 3) : 0;
     const pad = { top: title ? 32 : 16, right: 16, bottom: 28 + legendRows * 16, left: 56 };
@@ -247,10 +255,13 @@ export function TimeSeriesChart({
   }, [series, showGrid, showLegend, animated, yLabel, title]);
 
   useEffect(() => {
-    const isFirstData = prevSeriesRef.current.length === 0 && series.length > 0;
+    const hasData = series.some((s) => s.samples.length > 0);
 
-    if (animated && isFirstData) {
-      // Animate only on first data load
+    // Sweep in once, the first time real data arrives. Inferring "first data"
+    // from the previous series length re-ran the 600ms sweep every time a chart
+    // emptied and refilled; a one-shot latch animates exactly once.
+    if (animated && hasData && !hasAnimatedRef.current) {
+      hasAnimatedRef.current = true;
       progressRef.current = 0;
       const start = performance.now();
       const duration = 600;
@@ -268,8 +279,6 @@ export function TimeSeriesChart({
       progressRef.current = 1;
       render();
     }
-
-    prevSeriesRef.current = series;
 
     return () => cancelAnimationFrame(rafRef.current);
   }, [series, render, animated]);

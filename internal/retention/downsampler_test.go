@@ -138,3 +138,117 @@ func TestRollup1mTo1h(t *testing.T) {
 		t.Fatalf("window 0 count: %d", results[0].Count)
 	}
 }
+
+// makeUnevenRaw builds raw points spanning `hours` whole hours where each minute
+// holds a DIFFERENT number of samples, so 1-minute windows have unequal counts. That
+// inequality is exactly what makes a count-weighted hourly average diverge from a
+// plain mean of the minute-averages — it is what the weighted cascade must get right.
+func makeUnevenRaw(hours int) []storage.Point {
+	var points []storage.Point
+	for h := 0; h < hours; h++ {
+		for m := 0; m < 60; m++ {
+			minuteStart := int64(h)*3600000 + int64(m)*60000
+			samplesThisMinute := (m%7 + 1) + (h % 3) // 1..9, varies by minute and hour
+			for j := 0; j < samplesThisMinute; j++ {
+				points = append(points, storage.Point{
+					Timestamp: minuteStart + int64(j)*1000, // within the minute
+					Value:     float64(h*1000+m*10) + float64(j)*0.5,
+				})
+			}
+		}
+	}
+	return points
+}
+
+func rollupsEqual(t *testing.T, label string, a, b RollupResult) {
+	t.Helper()
+	if a.Timestamp != b.Timestamp {
+		t.Fatalf("%s: timestamp %d != %d", label, a.Timestamp, b.Timestamp)
+	}
+	if a.Min != b.Min {
+		t.Fatalf("%s: min %v != %v", label, a.Min, b.Min)
+	}
+	if a.Max != b.Max {
+		t.Fatalf("%s: max %v != %v", label, a.Max, b.Max)
+	}
+	if a.Count != b.Count {
+		t.Fatalf("%s: count %d != %d", label, a.Count, b.Count)
+	}
+	if math.Abs(a.Sum-b.Sum) > 1e-6 {
+		t.Fatalf("%s: sum %v != %v", label, a.Sum, b.Sum)
+	}
+	if math.Abs(a.Avg-b.Avg) > 1e-9 {
+		t.Fatalf("%s: avg %v != %v", label, a.Avg, b.Avg)
+	}
+}
+
+// TestWeightedCascadeEquivalence is the core A16 proof: a 1h tier built by chaining
+// the 1m tier must equal — for ALL five aggregates — the 1h tier built directly from
+// raw. It uses uneven per-minute counts so a naive (unweighted) average would fail.
+func TestWeightedCascadeEquivalence(t *testing.T) {
+	raw := makeUnevenRaw(3) // 3 whole hours
+
+	direct1h := Rollup(raw, 3600000)
+	via1m := Rollup(raw, 60000)
+	chained1h := ChainRollups(via1m, 3600000)
+
+	if len(direct1h) != 3 {
+		t.Fatalf("expected 3 hourly windows, got %d", len(direct1h))
+	}
+	if len(chained1h) != len(direct1h) {
+		t.Fatalf("chained produced %d windows, direct %d", len(chained1h), len(direct1h))
+	}
+	if len(via1m) != 3*60 {
+		t.Fatalf("expected %d minute windows, got %d", 3*60, len(via1m))
+	}
+
+	for i := range direct1h {
+		rollupsEqual(t, "hour", chained1h[i], direct1h[i])
+	}
+
+	// Guard the guard: confirm the data really is uneven, so a naive mean-of-minute-
+	// averages would have produced a different hourly average than the weighted one.
+	for i, hour := range direct1h {
+		lo, hi := i*60, i*60+60
+		var naive float64
+		for _, m := range via1m[lo:hi] {
+			naive += m.Avg
+		}
+		naive /= 60
+		if math.Abs(naive-hour.Avg) < 1e-9 {
+			t.Fatalf("hour %d: counts not uneven enough — naive avg %v == weighted %v; test cannot catch the bug",
+				i, naive, hour.Avg)
+		}
+	}
+}
+
+// TestWindowAggregatesKnownValues checks every aggregate against hand-computed values
+// for a single known window.
+func TestWindowAggregatesKnownValues(t *testing.T) {
+	// One 1-minute window holding values 10, 4, 7, 20, 9 at distinct timestamps.
+	vals := []float64{10, 4, 7, 20, 9}
+	points := make([]storage.Point, len(vals))
+	for i, v := range vals {
+		points[i] = storage.Point{Timestamp: int64(i) * 1000, Value: v}
+	}
+	r := Rollup(points, 60000)
+	if len(r) != 1 {
+		t.Fatalf("expected 1 window, got %d", len(r))
+	}
+	w := r[0]
+	if w.Min != 4 || w.Max != 20 {
+		t.Fatalf("min/max: %v/%v want 4/20", w.Min, w.Max)
+	}
+	if w.Count != 5 {
+		t.Fatalf("count: %d want 5", w.Count)
+	}
+	if w.Sum != 50 {
+		t.Fatalf("sum: %v want 50", w.Sum)
+	}
+	if w.Avg != 10 {
+		t.Fatalf("avg: %v want 10", w.Avg)
+	}
+	if w.Timestamp != 30000 {
+		t.Fatalf("centre: %d want 30000", w.Timestamp)
+	}
+}

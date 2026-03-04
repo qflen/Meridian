@@ -306,7 +306,7 @@ func (s *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	startExec := time.Now()
-	results, err := s.engine.Execute(ctx, q, start, end, step)
+	results, meta, err := s.engine.ExecuteWithMeta(ctx, q, start, end, step)
 	execTime := time.Since(startExec)
 	s.latency.record(execTime)
 
@@ -338,6 +338,11 @@ func (s *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"status":    "success",
 		"exec_time": execTime.String(),
+		// Resolution selection is transparent, but reported so callers can see a wide
+		// span was served from a coarse rollup tier (resolution_ms>0) reading far fewer
+		// points. resolution_ms is 0 when the query read raw. See ADR-011.
+		"resolution_ms": meta.ResolutionMs,
+		"points_read":   meta.PointsRead,
 		"data": map[string]interface{}{
 			"resultType": "matrix",
 			"result":     data,
@@ -414,24 +419,56 @@ func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		out["anomalies_total"] = s.anomalyDet.Total()
 		out["active_anomalies"] = s.anomalyDet.Active()
 	}
+	// Downsampling cascade (ADR-011): per-resolution rollup footprint and the savings
+	// figure (raw samples represented per stored rollup window).
+	if rollups := s.db.RollupStats(); len(rollups) > 0 {
+		tiers := make([]map[string]interface{}, 0, len(rollups))
+		for _, st := range rollups {
+			var reduction float64
+			if st.NumWindows > 0 {
+				reduction = float64(st.RawSamples) / float64(st.NumWindows)
+			}
+			tiers = append(tiers, map[string]interface{}{
+				"resolution_ms":   st.Resolution,
+				"resolution":      storage.ResolutionLabel(st.Resolution),
+				"blocks":          st.BlockCount,
+				"windows":         st.NumWindows,
+				"bytes":           st.ChunkBytes,
+				"raw_samples":     st.RawSamples,
+				"point_reduction": reduction,
+			})
+		}
+		// Headline savings: the coarsest tier's point reduction (RollupStats is
+		// ascending by resolution).
+		coarsest := rollups[len(rollups)-1]
+		var headline float64
+		if coarsest.NumWindows > 0 {
+			headline = float64(coarsest.RawSamples) / float64(coarsest.NumWindows)
+		}
+		out["downsampling"] = map[string]interface{}{
+			"resolutions":     tiers,
+			"point_reduction": headline,
+		}
+	}
 	writeJSON(w, out)
 }
 
 func (s *HTTPServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
-	blocks := s.db.Blocks()
 	type blockInfo struct {
-		ULID       string `json:"ulid"`
-		NodeID     string `json:"node_id"`
-		MinTime    int64  `json:"min_time"`
-		MaxTime    int64  `json:"max_time"`
-		NumSamples int64  `json:"num_samples"`
-		NumSeries  int    `json:"num_series"`
-		Level      int    `json:"level"`
+		ULID         string `json:"ulid"`
+		NodeID       string `json:"node_id"`
+		MinTime      int64  `json:"min_time"`
+		MaxTime      int64  `json:"max_time"`
+		NumSamples   int64  `json:"num_samples"`
+		NumSeries    int    `json:"num_series"`
+		Level        int    `json:"level"`
+		ResolutionMs int64  `json:"resolution_ms"` // 0 for raw, rollup window otherwise
+		Resolution   string `json:"resolution"`    // "raw", "1m", "1h", …
 	}
-	infos := make([]blockInfo, len(blocks))
-	for i, b := range blocks {
+	var infos []blockInfo
+	for _, b := range s.db.Blocks() {
 		meta := b.Meta()
-		infos[i] = blockInfo{
+		infos = append(infos, blockInfo{
 			ULID:       meta.ULID,
 			NodeID:     s.nodeID,
 			MinTime:    meta.MinTime,
@@ -439,6 +476,23 @@ func (s *HTTPServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
 			NumSamples: meta.Stats.NumSamples,
 			NumSeries:  meta.Stats.NumSeries,
 			Level:      meta.Compaction.Level,
+			Resolution: storage.ResolutionLabel(0),
+		})
+	}
+	// Rollup blocks, tagged by resolution, so the timeline can show the cascade tiers.
+	for _, res := range s.db.RollupResolutions() {
+		for _, b := range s.db.RollupBlocks(res) {
+			meta := b.Meta()
+			infos = append(infos, blockInfo{
+				ULID:         meta.ULID,
+				NodeID:       s.nodeID,
+				MinTime:      meta.MinTime,
+				MaxTime:      meta.MaxTime,
+				NumSamples:   meta.Stats.NumWindows,
+				NumSeries:    meta.Stats.NumSeries,
+				ResolutionMs: meta.Resolution,
+				Resolution:   storage.ResolutionLabel(meta.Resolution),
+			})
 		}
 	}
 	writeJSON(w, map[string]interface{}{"blocks": infos})
@@ -481,6 +535,9 @@ func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// Storage-engine metrics, shared verbatim with the storage microservice.
 	WriteStorageMetrics(w, s.db, node)
+
+	// Downsampling cascade: per-resolution rollup footprint and savings (ADR-011).
+	WriteRollupMetrics(w, s.db, node)
 
 	// Write-path flow-control metrics from the bounded ingest queue, when wired.
 	if s.ingestStats != nil {

@@ -1,10 +1,16 @@
 package query
 
 import (
+	"sort"
 	"time"
 
 	"github.com/meridiandb/meridian/internal/storage"
 )
+
+// minCoarsePoints is the minimum number of windows a coarse resolution must yield over
+// the query span before it is chosen. It keeps a short span (or an over-large explicit
+// step) on raw data rather than collapsing it to a handful of rollup points.
+const minCoarsePoints = 4
 
 // QueryPlan describes how to execute a query.
 type QueryPlan struct {
@@ -14,10 +20,16 @@ type QueryPlan struct {
 	Step      time.Duration
 	Matchers  []storage.LabelMatcher
 	TimeRange [2]int64 // [minTime, maxTime] for block pruning
+	// Resolution is the rollup window (ms) the executor should read from; 0 means raw.
+	// It is chosen from the query span and step against the resolutions that actually
+	// have data, and forced to raw for range selectors / rate().
+	Resolution int64
 }
 
-// Plan creates a query plan from an AST expression and time parameters.
-func Plan(expr Expr, start, end int64, step time.Duration) *QueryPlan {
+// Plan creates a query plan from an AST expression and time parameters. available is
+// the set of rollup resolutions (ms) that currently have data; an empty set (or a
+// short span, or a range query) leaves Resolution at 0 (raw).
+func Plan(expr Expr, start, end int64, step time.Duration, available []int64) *QueryPlan {
 	plan := &QueryPlan{
 		Expr:      expr,
 		Start:     start,
@@ -35,7 +47,38 @@ func Plan(expr Expr, start, end int64, step time.Duration) *QueryPlan {
 		plan.TimeRange[0] = start - rangeDur.Milliseconds()
 	}
 
+	plan.Resolution = selectResolution(start, end, step.Milliseconds(), rangeDur.Milliseconds(), available)
+
 	return plan
+}
+
+// selectResolution picks the coarsest available rollup resolution that still fits the
+// query: it must not be coarser than the step (no upsampling), and must yield at least
+// minCoarsePoints windows over the span. Range selectors / rate() force raw, because a
+// rate over a downsampled counter is not generally correct (function-aware aggregate
+// selection and rate-on-rollup are future work — see ADR-011). A span/step that does
+// not justify a coarse tier falls back to raw (0).
+func selectResolution(start, end, stepMs, rangeMs int64, available []int64) int64 {
+	if rangeMs > 0 || stepMs <= 0 {
+		return 0
+	}
+	span := end - start
+	if span <= 0 || len(available) == 0 {
+		return 0
+	}
+	res := append([]int64(nil), available...)
+	sort.Slice(res, func(i, j int) bool { return res[i] < res[j] })
+
+	best := int64(0)
+	for _, r := range res {
+		if r <= 0 {
+			continue
+		}
+		if r <= stepMs && span/r >= minCoarsePoints {
+			best = r // ascending scan keeps the coarsest qualifying resolution
+		}
+	}
+	return best
 }
 
 func extractMatchers(expr Expr) []storage.LabelMatcher {

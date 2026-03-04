@@ -18,6 +18,11 @@ import (
 type TSDBOptions struct {
 	WALDir          string
 	BlockDir        string
+	// RollupDir holds resolution-tagged rollup blocks (one subdirectory per
+	// resolution). Defaults to "<dataDir>/rollups". Rollup blocks are derived data,
+	// kept separate from raw blocks so each tier is loaded, queried, and expired
+	// independently.
+	RollupDir       string
 	BlockDuration   time.Duration
 	RetentionPeriod time.Duration
 	FlushInterval   time.Duration
@@ -100,6 +105,12 @@ type TSDB struct {
 	flushMu     sync.Mutex
 	flushFailed atomic.Bool
 
+	// rollupMu guards the rollup-block index, keyed by resolution (ms). It is held
+	// independently of mu so the background downsampler and per-resolution retention
+	// do not contend with the ingest path.
+	rollupMu     sync.RWMutex
+	rollupBlocks map[int64][]*RollupBlock
+
 	ingested    atomic.Int64
 	outOfOrder  atomic.Int64
 	rate        *rateMeter
@@ -115,6 +126,9 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 	}
 	if opts.BlockDir == "" {
 		opts.BlockDir = filepath.Join(dataDir, "blocks")
+	}
+	if opts.RollupDir == "" {
+		opts.RollupDir = filepath.Join(dataDir, "rollups")
 	}
 	if opts.BlockDuration == 0 {
 		opts.BlockDuration = 15 * time.Minute
@@ -141,18 +155,26 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 	head := NewHeadBlock()
 
 	db := &TSDB{
-		opts:      opts,
-		wal:       wal,
-		head:      head,
-		rate:      newRateMeter(opts.RateWindow),
-		startTime: time.Now(),
-		done:      make(chan struct{}),
+		opts:         opts,
+		wal:          wal,
+		head:         head,
+		rate:         newRateMeter(opts.RateWindow),
+		startTime:    time.Now(),
+		done:         make(chan struct{}),
+		rollupBlocks: make(map[int64][]*RollupBlock),
 	}
 
 	// Load existing blocks from disk
 	if err := db.loadBlocks(); err != nil {
 		wal.Close()
 		return nil, fmt.Errorf("load blocks: %w", err)
+	}
+
+	// Load existing rollup blocks (derived data; best-effort — a corrupt rollup is
+	// skipped and regenerated from raw on the next downsampling pass).
+	if err := db.loadRollupBlocks(); err != nil {
+		wal.Close()
+		return nil, fmt.Errorf("load rollup blocks: %w", err)
 	}
 
 	// Replay only the WAL beyond what persisted blocks already cover. A crash that

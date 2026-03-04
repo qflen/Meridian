@@ -104,6 +104,10 @@ export interface BlockInfo {
   num_samples: number;
   num_series: number;
   level: number;
+  // Downsampling tier (ADR-011): 0 / "raw" for raw blocks, the rollup window
+  // otherwise. Optional so older payloads still parse.
+  resolution_ms?: number;
+  resolution?: string;
 }
 
 // ── Dashboard state ─────────────────────────────────────────────────

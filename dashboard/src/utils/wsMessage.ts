@@ -59,7 +59,7 @@ export function parseWSMessage(raw: unknown): WSMessage | null {
         memoryBytes: num(obj.memoryBytes),
         compressedBytes: num(obj.compressedBytes),
         rawBytes: num(obj.rawBytes),
-        walSegments: num(obj.walSegments),
+        walBytes: num(obj.walBytes),
         blockCount: num(obj.blockCount),
         uptimeSeconds: num(obj.uptimeSeconds),
         ingestQueueDepth: num(obj.ingestQueueDepth),

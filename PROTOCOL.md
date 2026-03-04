@@ -62,12 +62,14 @@ GET /api/query?q=<promql>&start=<ms>&end=<ms>&format=<json|csv|table>
 }
 ```
 
-**Resolution selection** (ADR-011): the planner transparently serves wide spans from
-a coarse rollup tier instead of raw, picking the resolution from the query span and
-step. The response carries `resolution_ms` (the rollup window served, in ms; `0` =
-raw) and `points_read` (points fetched from storage) so a caller can see that a wide
-query read far fewer points from a coarse tier. `rate()` and range selectors always
-read raw.
+**Resolution selection** (ADR-011): in the single-binary `serve`, the planner
+transparently serves wide spans from a coarse rollup tier instead of raw, picking the
+resolution from the query span and step. The response carries `resolution_ms` (the
+rollup window served, in ms; `0` = raw) and `points_read` (points fetched from storage)
+so a caller can see that a wide query read far fewer points from a coarse tier.
+`rate()` and range selectors always read raw. In the docker-compose cluster the querier
+currently reads raw (so `resolution_ms` is `0`); pushing the chosen resolution to the
+storage nodes — which do generate rollups — is documented future work (ADR-011).
 
 ### Labels
 
@@ -115,7 +117,7 @@ Server sends JSON messages of type:
   "memoryBytes": 52428800,
   "compressedBytes": 1048576,
   "rawBytes": 31457280,
-  "walSegments": 1,
+  "walBytes": 262144,
   "blockCount": 4,
   "uptimeSeconds": 3600
 }

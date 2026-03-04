@@ -381,7 +381,7 @@ func (gw *gatewayServer) broadcastLoop() {
 			"memoryBytes":     agg.HeadSamples * 16,
 			"compressedBytes": agg.StorageBytesDisk,
 			"rawBytes":        agg.StorageBytesRaw,
-			"walSegments":     agg.WALSize,
+			"walBytes":        agg.WALSize,
 			"blockCount":      agg.BlockCount,
 			"uptimeSeconds":   int(time.Since(gw.startTime).Seconds()),
 			// Write-path backpressure (ADR-023), summed across ingestors.

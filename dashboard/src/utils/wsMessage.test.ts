@@ -10,7 +10,7 @@ describe('parseWSMessage', () => {
       memoryBytes: 1,
       compressedBytes: 2,
       rawBytes: 3,
-      walSegments: 1,
+      walBytes: 41864,
       blockCount: 0,
       uptimeSeconds: 42,
       ingestQueueDepth: 120,

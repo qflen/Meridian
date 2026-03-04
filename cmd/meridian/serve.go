@@ -201,7 +201,7 @@ func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingSer
 			"memoryBytes":     stats.HeadSamples * 16, // approximate
 			"compressedBytes": stats.ChunkBytes,
 			"rawBytes":        stats.StorageBytesRaw,
-			"walSegments":     stats.WALSize,
+			"walBytes":        stats.WALSize,
 			"blockCount":      stats.BlockCount,
 			"uptimeSeconds":   int(time.Since(db.StartTime()).Seconds()),
 			// Write-path backpressure (ADR-023): bounded queue depth/capacity and the
@@ -259,4 +259,3 @@ func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingSer
 		}
 	}
 }
-

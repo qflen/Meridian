@@ -8,6 +8,11 @@ monitoring dashboard. It ships as a single binary with minimal dependencies.
 
 ![Meridian dashboard](docs/dashboard.png)
 
+The query result is a strip-chart instrument: a cursor crosshair sweeps a live,
+tabular-mono readout of every series' value across a fine graticule.
+
+![Meridian instrument chart — crosshair readout](docs/demo.gif)
+
 ## Quick Start
 
 ```bash
@@ -31,19 +36,26 @@ open http://localhost:8080
 
 ## Measured Performance
 
-Apple M5, Go 1.22, `./bin/meridian bench` (1 M samples, regular-interval):
+Apple M5 (10-core), Go 1.25.6, single core, `./bin/meridian bench`
+(1 M samples, regular-interval, integer-like values):
 
-| Metric              | Value           |
-| ------------------- | --------------- |
-| Compression ratio   | **28.3×**       |
-| Space savings       | 96.5%           |
-| Encode throughput   | 45.2 M points/s |
-| Decode throughput   | 66.0 M points/s |
-| Encode latency      | 22 ns/point     |
-| Decode latency      | 15 ns/point     |
+| Metric              | Value            |
+| ------------------- | ---------------- |
+| Compression ratio   | **28.3×**        |
+| Space savings       | 96.5%            |
+| Bits per sample     | 4.5              |
+| Encode throughput   | ~88 M points/s   |
+| Decode throughput   | ~132 M points/s  |
+| Encode latency      | ~11 ns/point     |
+| Decode latency      | ~8 ns/point      |
 
-Live compression figures (blocks + in-memory head) are exposed on `/api/v1/stats`,
-`/metrics`, and the dashboard's compression gauge.
+Ratio, savings, and bits/sample are deterministic (the benchmark uses a fixed seed).
+Encode/decode throughput is a warm single-core figure that varies with thermal state —
+roughly 45–90 M points/s (encode) and 65–135 M points/s (decode) across runs. The
+28.3× ratio is best-case for regular, integer-like gauges; continuously varying float
+series compress closer to ~2× (see [PERFORMANCE.md](PERFORMANCE.md)). Live compression
+figures (blocks + in-memory head) are exposed on `/api/v1/stats`, `/metrics`, and the
+dashboard's compression gauge.
 
 ## Features
 
@@ -170,11 +182,16 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
 - **Downsampling cascade**: a live raw → 1m → 1h rollup cascade (ADR-011). On each
   background pass, sealed raw blocks are rolled up to resolution-tagged 1m blocks and
   the 1m tier is chained — count-weighted, so a 1h average equals one built directly
-  from raw — into 1h blocks. Every window stores min/max/sum/count/avg. The query
-  planner picks a resolution from the query span and step, so a wide view reads coarse
-  rollup points instead of millions of raw samples (a verified 8h span read 36 points
-  from the 1h tier versus 3844 raw), transparently to the caller. `rate()` and range
-  selectors force raw.
+  from raw — into 1h blocks. Every window stores min/max/sum/count/avg. In the
+  single-binary `serve`, the query planner picks a resolution from the query span and
+  step, so a wide view reads coarse rollup points instead of thousands of raw samples
+  (the resolution test serves an 8h span at a 1h step from the 1h tier reading 16
+  points versus 3840 raw over the span — a 240× reduction), transparently to the
+  caller; the HTTP API reports the chosen `resolution_ms`/`points_read`, and `rate()`
+  and range selectors force raw. **Cluster caveat:** in the docker-compose tier the
+  storage nodes generate the same rollups, but the querier still reads raw — pushing
+  the chosen resolution across the remote storage client is not yet wired, so cluster
+  resolution selection is documented future work (ADR-011).
 - **Per-resolution retention**: each tier has its own TTL — raw expires first while
   the longer-lived 1m/1h tiers keep answering long-range queries (default raw 15d →
   1m 30d → 1h 365d). Raw is never dropped before the finest rollup tier has captured it.
@@ -277,7 +294,9 @@ The microservice binaries read the same knobs from the environment: replication
 the live node count so a cluster smaller than N still works — backpressure
 (`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
 `MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents) — and the
-gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`).
+gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`). The storage node also reads its
+local TSDB timings from `STORAGE_BLOCK_DURATION`, `STORAGE_FLUSH_INTERVAL`, and
+`STORAGE_RETENTION` (and `STORAGE_DOWNSAMPLE_INTERVAL` for the rollup cascade pass).
 
 ## Docker
 

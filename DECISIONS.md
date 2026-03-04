@@ -122,8 +122,9 @@ and per-resolution retention.
 
 - **Rollup blocks** (`storage.RollupBlock`). Rollups are stored separately from raw
   blocks, one directory per resolution (`<dataDir>/rollups/<label>/<ulid>`). Each
-  series carries **five aggregate columns** — min, max, sum, count, and the
-  count-weighted avg — each a Gorilla-compressed stream over the shared window-centre
+  series carries **six aggregate columns** — min, max, sum, count, the count-weighted
+  avg, and a reset-aware counter increase (the increase column was added in block
+  format v2; ADR-025) — each a Gorilla-compressed stream over the shared window-centre
   timestamps (the Gorilla codec is reused unchanged). Writing reuses the raw block's
   crash-safe path (temp dir → fsync files+dir → atomic rename → fsync parent). A
   rollup is **derived data**, so it carries no WAL low-water-mark; a block instead
@@ -152,9 +153,10 @@ and per-resolution retention.
 - **Query-time selection** (`query.Plan`/`executor`). The planner chooses the
   coarsest resolution that (a) is no coarser than the step (no upsampling) and (b)
   yields enough windows over the span, considering only resolutions that actually
-  have data. The executor reads the chosen tier's **avg** column as the series value
-  (min/max/sum/count are kept for future function-aware selection), widening the
-  staleness window to one rollup interval so coarse points are not dropped as gaps.
+  have data. The executor reads the column that matches the operation — **avg** for a
+  bare selector, and the matching aggregate for a range function (function-aware
+  selection, ADR-025) — widening the staleness window to one rollup interval so coarse
+  points are not dropped as gaps.
   `TSDB.QueryResolution` serves persisted rollups for the range and rolls up the
   freshest, not-yet-closed tail on the fly (seamed at the window-aligned
   `covered_through`), so the coarse series stays complete to *now*. Selection is
@@ -168,14 +170,15 @@ and per-resolution retention.
   for space without losing history. In the cluster the compactor enforces the same
   per-resolution TTLs, keyed by the resolution now carried on each block's metadata.
 
-**Forced raw / future work**: range selectors and `rate()` force raw, because a rate
-over a downsampled counter is not generally correct. Two follow-ups are deliberately
-out of scope here and documented as future work: **function-aware aggregate
-selection** (e.g. serving `max_over_time` from the stored max column rather than avg)
-and **rate-on-rollup**. In the **cluster**, rollups are generated on each storage
-node but the querier still reads raw (the remote client does not yet push a
-resolution to storage); cluster query-time selection is the remaining piece, so
-cluster raw retention should stay ≥ the longest query span until it lands.
+**Range functions over rollups**: the two follow-ups this ADR originally deferred —
+**function-aware aggregate selection** (serving `max_over_time` from the stored max
+column rather than avg) and **rate-on-rollup** — are now implemented in **ADR-025**,
+which adds the `*_over_time` functions, per-function column selection, and the
+counter-increase column that lets `rate()` be served from a coarse tier. In the
+**cluster**, rollups are generated on each storage node but the querier still reads
+raw (the remote client does not yet push a resolution to storage); cluster query-time
+selection is the remaining piece, so cluster raw retention should stay ≥ the longest
+query span until it lands.
 
 **Consequences**: Verified by `TestEngineResolutionWideVsNarrow` (internal/query) on a
 2-series, 8-hour backfill at 15s raw resolution: a wide query (8h span, 1h step) is
@@ -803,3 +806,92 @@ ops per series per tick, with bounded memory.
 - **No alert persistence or routing.** Alerts live in a bounded in-memory ring and
   on the WebSocket; they are not persisted, deduplicated across restarts, or routed
   to an external alertmanager.
+
+## ADR-025: Function-Aware Rollup Aggregates and Rate-on-Rollup
+
+**Status**: Accepted (implemented)
+
+**Context**: ADR-011 stored five aggregates per rollup window (min/max/sum/count/avg)
+but the query path only ever read the **avg** column, and the engine had no
+range-aggregation functions to use the others. There was also no way to evaluate a
+counter `rate()` from a coarse tier, so any range selector forced raw — which meant a
+30-day `rate()` or `max_over_time` could not benefit from downsampling at all and, once
+raw aged out, could not be answered. The five stored columns were, in effect, written
+but never read. This ADR makes them usable.
+
+**Decision**: three changes that compose with the existing cascade and query-time
+resolution selection (ADR-011), not a rewrite of them.
+
+- **`*_over_time` range functions** (`query` parser + executor). Add `avg_over_time`,
+  `min_over_time`, `max_over_time`, `sum_over_time`, `count_over_time`, and
+  `last_over_time`. Each takes a range vector `x[d]` and, per evaluation step, reduces
+  the half-open window `(t-d, t]` to one value per series, consistent with the existing
+  stepped/matrix evaluation — an empty window stays a gap, never a zero. The reduction
+  (`reduceOverTime`) is written to be resolution-agnostic so the same code reduces raw
+  samples or a rollup column.
+
+- **Function-aware column selection** (`query.Plan`/`executor`,
+  `storage.QueryResolution`). When a query is served from a coarse tier, each leaf
+  selector reads the column that matches its wrapping function instead of always avg:
+  `max_over_time`→max, `min_over_time`→min, `sum_over_time`→sum, `count_over_time`→count,
+  `avg_over_time` and a bare instant value→avg, `rate`→increase. The planner annotates
+  every selector with the aggregate it needs (`selectorAggregates`) and threads it into
+  `QueryResolution`; because the parser creates a distinct selector node per occurrence,
+  one column per node is unambiguous even when a query mixes functions. A range query is
+  served coarse only when *every* range selector is wrapped by a coarse-eligible function
+  (the `*_over_time` family, or `rate`); a bare range selector, `last_over_time` (no
+  stored "last" column), or an unknown function keeps the whole query on raw. The chosen
+  resolution is additionally capped at the range duration, so each step's window holds at
+  least one rollup window.
+
+  `max/min/sum/count_over_time` are *exact* at coarse resolution — max-of-maxes is the
+  max, Σ of the per-window count column is the sample count, and so on. `avg_over_time`
+  reads the avg column and means it: that equals the raw average exactly when the windows
+  in range are equally populated (regular sampling) and is a close, count-blind
+  approximation otherwise. `count_over_time` is the one function whose reduction differs
+  by source — it counts raw samples but **sums** the per-window count column.
+
+- **Counter-increase column + rate-on-rollup** (`storage` format v2, `query` executor).
+  Add a sixth rollup column: each window's reset-aware counter **increase**. It is the
+  sum of the per-step deltas whose later sample falls in the window, a decrease counted
+  as a reset (the post-reset value is the increase) — the same reset handling `rate()`
+  applies to raw. Attributing each delta to the *later* sample's window makes the increase
+  **additive**: ΣIncrease over contiguous windows telescopes to the counter's growth
+  across them, so `ChainRollups` builds a coarse increase by summing finer ones and a
+  direct raw→coarse rollup yields the identical value. `rate()` at a coarse resolution is
+  then `Σincrease / range` — a **window-averaged** rate. It loses the sub-window edge
+  extrapolation the raw `rate()` applies, so over a wide range it matches raw `rate()`
+  within a few percent (measured ~1% over a linear counter) but is not identical near the
+  window edges; short ranges (below the finest resolution) still read raw.
+
+- **Block format v2 and backward compatibility.** The increase column bumps the rollup
+  block format to v2 (`format_version` in the block meta). Older v1 blocks carry only the
+  first five columns and no version field (unmarshals to 0); they load gracefully — the
+  index decodes the column count the version declares, and the increase column reads as
+  absent. Because rollups beyond raw retention cannot be regenerated (the raw is gone),
+  v1 blocks are **kept and used** for their five columns rather than discarded. A tier is
+  reported *increase-capable* only when every block in it carries the column, so a span
+  partly covered by v1 blocks makes `rate()` fall back to raw rather than silently
+  under-count; the set fills in as new v2 blocks are written and old ones age out. On a
+  fresh store every tier is increase-capable from the first pass.
+
+**What each resolution serves** (single-binary `serve`):
+
+| Query shape | Served from | Column(s) |
+| --- | --- | --- |
+| bare selector, wide span | coarse tier | avg |
+| `max/min/sum/count_over_time(x[d])`, wide span | coarse tier (≤ d) | max/min/sum/count |
+| `avg_over_time(x[d])`, wide span | coarse tier (≤ d) | avg (count-blind mean) |
+| `rate(x[d])`, wide span, increase-capable tier | coarse tier (≤ d) | increase (`Σ/range`) |
+| `last_over_time`, bare `x[d]`, short range, or no rollup column | raw | — |
+
+**Consequences / limitations**:
+- The window-averaged coarse `rate()` is intentionally an approximation of Prometheus's
+  edge-extrapolated raw `rate()`; the docs say so, and short spans stay raw for fidelity.
+- `avg_over_time` from rollups is count-blind (reads avg, not sum/count); it is exact for
+  regularly-sampled data and otherwise approximate.
+- The increase attribution leaves at most one inter-sample delta unattributed at a
+  generation batch's leading edge (the batch's first sample is the increase baseline) and
+  one at the on-the-fly tail seam — negligible over many windows.
+- As in ADR-011, the **cluster** querier still reads raw; pushing a resolution and an
+  aggregate across the remote storage client is the remaining piece.

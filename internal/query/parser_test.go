@@ -18,6 +18,28 @@ func TestParserVectorSelector(t *testing.T) {
 	}
 }
 
+func TestParserOverTimeFunctions(t *testing.T) {
+	for _, name := range []string{
+		"avg_over_time", "min_over_time", "max_over_time",
+		"sum_over_time", "count_over_time", "last_over_time",
+	} {
+		expr, err := Parse(name + `(cpu[5m])`)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		fc, ok := expr.(*FunctionCall)
+		if !ok {
+			t.Fatalf("%s: expected FunctionCall, got %T", name, expr)
+		}
+		if fc.Name != name || len(fc.Args) != 1 {
+			t.Fatalf("%s: parsed as %+v", name, fc)
+		}
+		if _, ok := fc.Args[0].(*RangeSelector); !ok {
+			t.Fatalf("%s: argument is %T, want *RangeSelector", name, fc.Args[0])
+		}
+	}
+}
+
 func TestParserVectorWithLabels(t *testing.T) {
 	expr, err := Parse(`cpu_usage{host="web-01", region!="eu"}`)
 	if err != nil {

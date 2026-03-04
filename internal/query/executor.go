@@ -24,11 +24,15 @@ type DataSource interface {
 // path reads raw — see ADR-011).
 type ResolutionDataSource interface {
 	DataSource
-	// QueryResolution serves [start,end] from the given rollup resolution (ms); a
-	// resolution of 0 is equivalent to Query (raw).
-	QueryResolution(ctx context.Context, matchers []storage.LabelMatcher, start, end, resolution int64) (storage.SeriesSet, error)
+	// QueryResolution serves [start,end] from the given rollup resolution (ms), reading
+	// the aggregate column selected by agg (AggAvg for a bare selector / avg_over_time,
+	// AggMax for max_over_time, and so on). A resolution of 0 is equivalent to Query (raw).
+	QueryResolution(ctx context.Context, matchers []storage.LabelMatcher, start, end, resolution int64, agg storage.RollupAggregate) (storage.SeriesSet, error)
 	// RollupResolutions returns the resolutions (ms) that currently have rollup data.
 	RollupResolutions() []int64
+	// RollupIncreaseResolutions returns the subset of resolutions whose counter-increase
+	// column is complete, i.e. the tiers from which rate() can be served.
+	RollupIncreaseResolutions() []int64
 }
 
 // QueryMeta reports how a query was served: the resolution chosen (0 = raw) and the
@@ -172,11 +176,12 @@ func (e *Engine) newEvalContext(ctx context.Context, expr Expr, start, end, step
 	// Resolution selection is transparent: if the store can serve rollups, plan the
 	// resolution from the span/step against the resolutions that have data.
 	rds, hasResolution := e.ds.(ResolutionDataSource)
-	var available []int64
+	var available, increaseAvailable []int64
 	if hasResolution {
 		available = rds.RollupResolutions()
+		increaseAvailable = rds.RollupIncreaseResolutions()
 	}
-	plan := Plan(expr, start, end, time.Duration(stepMs)*time.Millisecond, available)
+	plan := Plan(expr, start, end, time.Duration(stepMs)*time.Millisecond, available, increaseAvailable)
 
 	// At a coarse resolution, rollup points are one window apart, so the staleness
 	// window must be at least one window wide or most steps would fall in a gap.
@@ -192,6 +197,10 @@ func (e *Engine) newEvalContext(ctx context.Context, expr Expr, start, end, step
 		resolution: plan.Resolution,
 	}
 
+	// At a coarse resolution each selector reads the aggregate column its wrapping
+	// function needs (max_over_time→max, count_over_time→count, …; AggAvg by default).
+	aggOf := selectorAggregates(expr)
+
 	fetchStart := plan.TimeRange[0] - lookback
 	fetchEnd := plan.TimeRange[1]
 	for _, vs := range collectSelectors(expr) {
@@ -203,7 +212,7 @@ func (e *Engine) newEvalContext(ctx context.Context, expr Expr, start, end, step
 			err error
 		)
 		if plan.Resolution > 0 && hasResolution {
-			ss, err = rds.QueryResolution(ctx, convertMatchers(vs.Name, vs.Matchers), fetchStart, fetchEnd, plan.Resolution)
+			ss, err = rds.QueryResolution(ctx, convertMatchers(vs.Name, vs.Matchers), fetchStart, fetchEnd, plan.Resolution, aggOf[vs])
 		} else {
 			ss, err = e.ds.Query(ctx, convertMatchers(vs.Name, vs.Matchers), fetchStart, fetchEnd)
 		}
@@ -343,9 +352,21 @@ func (e *Engine) evalFunctionInstant(ec *evalContext, fc *FunctionCall, t int64)
 			return nil, err
 		}
 		rangeMs := rs.Duration.Milliseconds()
+		// At a coarse resolution the windowed samples are per-window counter increases
+		// (the increase column), so rate is Σincrease / range — window-averaged. At raw
+		// resolution it is the reset-corrected, edge-extrapolated rate. See ADR-025.
+		coarse := ec.resolution > 0
 		var results []ResultSeries
 		for _, s := range series {
-			v, ok := rate(s.Points, rangeMs, t)
+			var (
+				v  float64
+				ok bool
+			)
+			if coarse {
+				v, ok = rateFromIncrease(s.Points, rangeMs)
+			} else {
+				v, ok = rate(s.Points, rangeMs, t)
+			}
 			if !ok {
 				continue
 			}
@@ -370,6 +391,37 @@ func (e *Engine) evalFunctionInstant(ec *evalContext, fc *FunctionCall, t int64)
 			return nil, err
 		}
 		return histogramQuantile(phiExpr.Value, series), nil
+
+	case "avg_over_time", "min_over_time", "max_over_time", "sum_over_time", "count_over_time", "last_over_time":
+		// Each reduces a range vector to one value per series per step. The argument is
+		// the windowed sample set (raw points, or — at a coarse resolution — the matching
+		// rollup aggregate column; see selectorAgg). reduceOverTime applies the function's
+		// reduction, which is identical for raw and coarse except count_over_time (raw
+		// counts samples; coarse sums the per-window count column). See ADR-025.
+		if len(fc.Args) != 1 {
+			return nil, fmt.Errorf("%s() requires exactly 1 argument", fc.Name)
+		}
+		if _, ok := fc.Args[0].(*RangeSelector); !ok {
+			return nil, fmt.Errorf("%s() requires a range vector argument, e.g. %s(metric[5m])", fc.Name, fc.Name)
+		}
+		windowed, err := e.evalInstant(ec, fc.Args[0], t)
+		if err != nil {
+			return nil, err
+		}
+		coarse := ec.resolution > 0
+		var results []ResultSeries
+		for _, s := range windowed {
+			v, ok := reduceOverTime(fc.Name, s.Points, coarse)
+			if !ok {
+				continue
+			}
+			results = append(results, ResultSeries{
+				Name:   s.Name,
+				Labels: s.Labels,
+				Points: []storage.Point{{Timestamp: t, Value: v}},
+			})
+		}
+		return results, nil
 
 	default:
 		// Treat an unknown single-argument function name as an aggregate op.

@@ -87,10 +87,14 @@ AST. Supports vector selectors, range selectors, function calls, aggregations
 sub-expressions.
 
 **Planner** (`internal/query/planner.go`): Extracts label matchers for predicate
-pushdown and adjusts time ranges for range selectors.
+pushdown, adjusts time ranges for range selectors, selects a rollup resolution from the
+span/step, and annotates each selector with the rollup aggregate its wrapping function
+needs for function-aware coarse reads (ADR-025).
 
 **Executor** (`internal/query/executor.go`): Evaluates the AST against the TSDB.
-Implements rate(), histogram_quantile(), and all aggregation functions.
+Implements rate(), the `*_over_time` range-aggregation functions, histogram_quantile(),
+and all aggregation functions. At a coarse resolution it reads the column that matches
+the operation and serves rate() from the stored counter-increase column.
 
 ### Ingestion
 
@@ -204,18 +208,22 @@ single-node and does not use the ring.
 **Downsampler** (`internal/retention/downsampler.go`): Runs the live raw → 1m → 1h
 cascade (ADR-011). Each background pass advances a tier as far as its source is
 durably closed, rolling sealed raw blocks into resolution-tagged **rollup blocks**
-(`storage.RollupBlock`) that store five Gorilla-compressed aggregate columns
-(min/max/sum/count/avg) per series under `<dataDir>/rollups/<resolution>/`. The 1h
-tier is *chained* from the 1m tier with a count-weighted average, so it equals a 1h
-rollup built directly from raw. A per-resolution `covered_through` watermark makes
-passes idempotent and crash-recoverable (rollups are regenerable). At query time the
-planner (`internal/query`) selects a resolution from the span and step and the
-executor reads the chosen tier's avg column (`TSDB.QueryResolution`), rolling up the
-freshest not-yet-closed tail on the fly so the coarse series stays current. This
-query-time selection runs in the single-binary `serve`, whose TSDB implements the
-`ResolutionDataSource` capability; in the cluster the storage nodes still generate
-rollups, but the querier's `StorageClient` does not yet implement that capability and
-so reads raw (ADR-011, "Forced raw / future work").
+(`storage.RollupBlock`, format v2) that store six Gorilla-compressed aggregate columns
+(min/max/sum/count/avg + a reset-aware counter increase) per series under
+`<dataDir>/rollups/<resolution>/`. The 1h tier is *chained* from the 1m tier — a
+count-weighted average and an additive increase — so it equals a 1h rollup built
+directly from raw. A per-resolution `covered_through` watermark makes passes idempotent
+and crash-recoverable (rollups are regenerable). At query time the planner
+(`internal/query`) selects a resolution from the span and step and the executor reads
+the column that matches the operation (`TSDB.QueryResolution` with a `RollupAggregate`):
+avg for a bare value, max/min/sum/count for the matching `*_over_time` function, and the
+increase column for `rate()` (ADR-025) — rolling up the freshest not-yet-closed tail on
+the fly so the coarse series stays current. This query-time selection runs in the
+single-binary `serve`, whose TSDB implements the `ResolutionDataSource` capability; in
+the cluster the storage nodes still generate rollups, but the querier's `StorageClient`
+does not yet implement that capability and so reads raw (ADR-011). Older v1 blocks (no
+increase column) load and serve their five columns, with `rate()` falling back to raw
+for the spans they cover.
 
 **Enforcer** (`internal/retention/enforcer.go`): Per-resolution TTL cleanup. Raw
 blocks expire first (and only once the finest rollup tier has captured them); each

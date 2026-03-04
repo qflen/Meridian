@@ -13,18 +13,77 @@ import (
 	"github.com/meridiandb/meridian/internal/compress"
 )
 
-// Rollup column order. A rollup block stores, per series, five independent
-// Gorilla-compressed columns over the same window-centre timestamps. Keeping every
-// aggregate lets the query path serve avg today and min/max/sum/count later (function-
-// aware selection), and lets a coarser tier be chained from this one without raw data.
+// Rollup column order. A rollup block stores, per series, independent Gorilla-compressed
+// columns over the same window-centre timestamps. Keeping every aggregate lets the query
+// path serve the column that matches a function (function-aware selection) and lets a
+// coarser tier be chained from this one without raw data. The increase column (the sixth)
+// was added in format v2; v1 blocks carry only the first five — see numRollupColsForVersion.
 const (
 	rollupColMin = iota
 	rollupColMax
 	rollupColSum
 	rollupColCount
 	rollupColAvg
+	rollupColIncrease
 	numRollupCols
 )
+
+// numRollupColsV1 is the column count of a format-v1 block (before the increase column).
+const numRollupColsV1 = 5
+
+// Rollup block format versions. v1 is implicit (older blocks carry no format_version, so
+// it unmarshals to 0); v2 adds the counter-increase column.
+const (
+	rollupFormatV1 = 1
+	rollupFormatV2 = 2
+	// rollupFormatVersion is the version every newly written block carries.
+	rollupFormatVersion = rollupFormatV2
+)
+
+// numRollupColsForVersion returns how many aggregate columns a block of the given format
+// version carries. A zero/absent version is the implicit v1 (five columns).
+func numRollupColsForVersion(version int) int {
+	if version >= rollupFormatV2 {
+		return numRollupCols
+	}
+	return numRollupColsV1
+}
+
+// RollupAggregate selects which stored aggregate a resolution-aware query returns as a
+// series' value — the function-aware column selector. A bare instant selector and
+// avg_over_time read AggAvg; max_over_time reads AggMax; min/sum/count likewise; rate
+// reads AggIncrease. The mapping to the physical block column is columnForAggregate. See
+// ADR-025.
+type RollupAggregate int
+
+const (
+	// AggAvg is the count-weighted window mean and the default for a bare selector.
+	AggAvg RollupAggregate = iota
+	AggMin
+	AggMax
+	AggSum
+	AggCount
+	AggIncrease
+)
+
+// columnForAggregate maps a query-level aggregate to a rollup block column index. An
+// unknown aggregate falls back to the avg column.
+func columnForAggregate(agg RollupAggregate) int {
+	switch agg {
+	case AggMin:
+		return rollupColMin
+	case AggMax:
+		return rollupColMax
+	case AggSum:
+		return rollupColSum
+	case AggCount:
+		return rollupColCount
+	case AggIncrease:
+		return rollupColIncrease
+	default:
+		return rollupColAvg
+	}
+}
 
 // RollupBlockMeta describes a persistent rollup block. A rollup block is derived data
 // (regenerable from raw), so it carries no WAL low-water-mark; a crash mid-rollup is
@@ -33,6 +92,9 @@ type RollupBlockMeta struct {
 	ULID    string `json:"ulid"`
 	MinTime int64  `json:"min_time"` // earliest window centre
 	MaxTime int64  `json:"max_time"` // latest window centre
+	// Version is the on-disk block format version. It is absent (0) on pre-v2 blocks,
+	// which carry only the first five aggregate columns; v2 adds the increase column.
+	Version int `json:"format_version"`
 	// Resolution is the rollup window size in milliseconds (e.g. 60000 for 1m).
 	Resolution int64 `json:"resolution_ms"`
 	// CoveredThrough is the exclusive upper bound, in source time, that this block's
@@ -193,6 +255,7 @@ func WriteRollupBlock(resDir string, resolution, coveredThrough, sourceResolutio
 		ULID:           id,
 		MinTime:        minTime,
 		MaxTime:        maxTime,
+		Version:        rollupFormatVersion,
 		Resolution:     resolution,
 		CoveredThrough: coveredThrough,
 		Stats: RollupStats{
@@ -237,6 +300,8 @@ func rollupColumnValue(w RollupSample, col int) float64 {
 		return w.Sum
 	case rollupColCount:
 		return float64(w.Count)
+	case rollupColIncrease:
+		return w.Increase
 	default:
 		return w.Avg
 	}
@@ -260,7 +325,9 @@ func OpenRollupBlock(dir string) (*RollupBlock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read rollup index: %w", err)
 	}
-	series, err := decodeRollupIndex(indexData)
+	// The number of per-series column refs in the index depends on the block's format
+	// version, so older (v1, five-column) blocks decode without the increase column.
+	series, err := decodeRollupIndex(indexData, numRollupColsForVersion(meta.Version))
 	if err != nil {
 		return nil, fmt.Errorf("decode rollup index: %w", err)
 	}
@@ -297,6 +364,13 @@ func (b *RollupBlock) Dir() string { return b.dir }
 // Resolution returns the block's rollup window size in milliseconds.
 func (b *RollupBlock) Resolution() int64 { return b.meta.Resolution }
 
+// hasIncrease reports whether this block carries the counter-increase column (format v2+).
+// A v1 block predates it, so rate-on-rollup falls back to raw for the span it covers.
+func (b *RollupBlock) hasIncrease() bool { return b.meta.Version >= rollupFormatV2 }
+
+// numCols is how many aggregate columns this block stores.
+func (b *RollupBlock) numCols() int { return numRollupColsForVersion(b.meta.Version) }
+
 // ChunkBytes returns the compressed size of the block's aggregate columns on disk.
 func (b *RollupBlock) ChunkBytes() int64 { return int64(len(b.chunks)) }
 
@@ -315,6 +389,11 @@ func (b *RollupBlock) Query(matchers []LabelMatcher, minTime, maxTime int64, col
 	}
 	if col < 0 || col >= numRollupCols {
 		col = rollupColAvg
+	}
+	if col >= b.numCols() {
+		// Column absent in this (older) block — e.g. the increase column on a v1 block.
+		// Returning nothing lets the caller fall back (rate-on-rollup reverts to raw).
+		return nil
 	}
 
 	b.mu.RLock()
@@ -382,6 +461,10 @@ func (b *RollupBlock) SeriesInRange(minTime, maxTime int64) []RollupSeriesData {
 			if ts < minTime || ts > maxTime {
 				continue
 			}
+			inc := 0.0
+			if b.hasIncrease() {
+				inc = cols[rollupColIncrease][i].Value
+			}
 			windows = append(windows, RollupSample{
 				Timestamp: ts,
 				Min:       cols[rollupColMin][i].Value,
@@ -389,6 +472,7 @@ func (b *RollupBlock) SeriesInRange(minTime, maxTime int64) []RollupSeriesData {
 				Sum:       cols[rollupColSum][i].Value,
 				Count:     int(cols[rollupColCount][i].Value),
 				Avg:       cols[rollupColAvg][i].Value,
+				Increase:  inc,
 			})
 		}
 		if len(windows) > 0 {
@@ -402,11 +486,12 @@ func (b *RollupBlock) SeriesInRange(minTime, maxTime int64) []RollupSeriesData {
 	return out
 }
 
-// decodeColumns decodes all five aggregate streams for a series. They share the same
-// window-centre timestamps and length by construction.
+// decodeColumns decodes the aggregate streams a series carries (five on a v1 block, six
+// on v2). They share the same window-centre timestamps and length by construction; an
+// absent column (the increase column on a v1 block) is left nil.
 func (b *RollupBlock) decodeColumns(s rollupBlockSeries) ([numRollupCols][]Point, bool) {
 	var cols [numRollupCols][]Point
-	for col := 0; col < numRollupCols; col++ {
+	for col := 0; col < b.numCols(); col++ {
 		ref := s.cols[col]
 		if int(ref.offset)+int(ref.length) > len(b.chunks) {
 			return cols, false
@@ -500,7 +585,9 @@ func (b *RollupBlock) resolveMatchers(matchers []LabelMatcher) []int {
 
 // Binary index encoding for rollup series. Layout per entry:
 // SeriesID(8) + NameLen(2)+Name + NumLabels(2)+[KeyLen(2)+Key+ValLen(2)+Val]... +
-// 5×(ChunkOffset(8)+ChunkLen(4)) + MinTime(8) + MaxTime(8) + NumWindows(4)
+// numRollupCols×(ChunkOffset(8)+ChunkLen(4)) + MinTime(8) + MaxTime(8) + NumWindows(4).
+// Newly written blocks carry numRollupCols (6) column refs; decodeRollupIndex is told how
+// many a given block has from its format version, so v1 (5-column) blocks still decode.
 func encodeRollupIndexEntry(s rollupBlockSeries) []byte {
 	size := 8 + 2 + len(s.name) + 2
 	for k, v := range s.labels {
@@ -549,7 +636,7 @@ func encodeRollupIndexEntry(s rollupBlockSeries) []byte {
 	return buf
 }
 
-func decodeRollupIndex(data []byte) ([]rollupBlockSeries, error) {
+func decodeRollupIndex(data []byte, numCols int) ([]rollupBlockSeries, error) {
 	var series []rollupBlockSeries
 	off := 0
 	for off < len(data) {
@@ -597,11 +684,11 @@ func decodeRollupIndex(data []byte) ([]rollupBlockSeries, error) {
 			s.labels[k] = v
 		}
 
-		colBytes := numRollupCols * (8 + 4)
+		colBytes := numCols * (8 + 4)
 		if off+colBytes+20 > len(data) {
 			return nil, fmt.Errorf("rollup chunk metadata truncated")
 		}
-		for col := 0; col < numRollupCols; col++ {
+		for col := 0; col < numCols; col++ {
 			s.cols[col].offset = binary.BigEndian.Uint64(data[off:])
 			off += 8
 			s.cols[col].length = binary.BigEndian.Uint32(data[off:])

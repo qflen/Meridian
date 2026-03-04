@@ -19,18 +19,24 @@ func TestSelectResolution(t *testing.T) {
 	cases := []struct {
 		name              string
 		span, stepMs, rng int64
+		coarse            bool // rangeCoarse: every range selector maps to a stored column
 		avail             []int64
 		want              int64
 	}{
-		{"wide span, big step -> 1h", span30d, ms(3 * time.Hour), 0, avail, ms(time.Hour)},
-		{"medium span, 5m step -> 1m", ms(2 * time.Hour), ms(5 * time.Minute), 0, avail, ms(time.Minute)},
-		{"narrow span, small step -> raw", ms(10 * time.Minute), ms(15 * time.Second), 0, avail, 0},
-		{"range selector / rate -> raw", span30d, ms(3 * time.Hour), ms(5 * time.Minute), avail, 0},
-		{"no rollups available -> raw", span30d, ms(3 * time.Hour), 0, nil, 0},
-		{"step below finest resolution -> raw", ms(time.Hour), ms(30 * time.Second), 0, avail, 0},
+		{"wide span, big step -> 1h", span30d, ms(3 * time.Hour), 0, false, avail, ms(time.Hour)},
+		{"medium span, 5m step -> 1m", ms(2 * time.Hour), ms(5 * time.Minute), 0, false, avail, ms(time.Minute)},
+		{"narrow span, small step -> raw", ms(10 * time.Minute), ms(15 * time.Second), 0, false, avail, 0},
+		{"raw-only range selector -> raw", span30d, ms(3 * time.Hour), ms(5 * time.Minute), false, avail, 0},
+		{"no rollups available -> raw", span30d, ms(3 * time.Hour), 0, false, nil, 0},
+		{"step below finest resolution -> raw", ms(time.Hour), ms(30 * time.Second), 0, false, avail, 0},
+		// Coarse-eligible range functions (*_over_time): served from a coarse tier no
+		// coarser than the range window.
+		{"over_time wide, 3h step, 1h range -> 1h", span30d, ms(3 * time.Hour), ms(time.Hour), true, avail, ms(time.Hour)},
+		{"over_time, 5m step, 5m range -> 1m", ms(2 * time.Hour), ms(5 * time.Minute), ms(5 * time.Minute), true, avail, ms(time.Minute)},
+		{"over_time, range below finest resolution -> raw", span30d, ms(3 * time.Hour), ms(30 * time.Second), true, avail, 0},
 	}
 	for _, c := range cases {
-		got := selectResolution(0, c.span, c.stepMs, c.rng, c.avail)
+		got := selectResolution(0, c.span, c.stepMs, c.rng, c.coarse, c.avail)
 		if got != c.want {
 			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
 		}

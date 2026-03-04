@@ -126,6 +126,34 @@ func (db *TSDB) RollupResolutions() []int64 {
 	return out
 }
 
+// RollupIncreaseResolutions returns the resolutions whose every block carries the
+// counter-increase column (format v2+), ascending. rate() is served from a coarse tier
+// only when the whole tier has the column, so a span partly covered by older v1 blocks
+// reverts to raw rather than silently under-counting. After an upgrade the set fills in as
+// new blocks are written and old ones age out; on a fresh store every tier qualifies.
+func (db *TSDB) RollupIncreaseResolutions() []int64 {
+	db.rollupMu.RLock()
+	defer db.rollupMu.RUnlock()
+	out := make([]int64, 0, len(db.rollupBlocks))
+	for res, blocks := range db.rollupBlocks {
+		if len(blocks) == 0 {
+			continue
+		}
+		all := true
+		for _, b := range blocks {
+			if !b.hasIncrease() {
+				all = false
+				break
+			}
+		}
+		if all {
+			out = append(out, res)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 // RollupCoveredThrough returns how far (exclusive source-time bound) the given
 // resolution's tier is complete, i.e. the max CoveredThrough across its blocks. Zero
 // means the tier is empty. The downsampler uses this as its idempotency watermark, so
@@ -186,18 +214,20 @@ func (db *TSDB) DeleteRollupBlock(resolution int64, ulid string) error {
 	return fmt.Errorf("rollup block %s (res=%d) not found", ulid, resolution)
 }
 
-// QueryResolution serves [start, end] from the given rollup resolution, using the avg
-// aggregate as each series' value. A resolution of 0 falls back to the raw Query. For
-// a coarse resolution it returns the persisted rollup windows that overlap the range
-// and, for the most recent span the rollup tier has not closed yet, rolls up raw data
-// (head + sealed blocks) on the fly so the coarse series stays complete to now. The
-// seam between the two is the tier's covered-through bound, which is window-aligned, so
-// the two regions never overlap. Selection is transparent to the caller — the returned
-// shape is identical to Query.
-func (db *TSDB) QueryResolution(ctx context.Context, matchers []LabelMatcher, start, end, resolution int64) (SeriesSet, error) {
+// QueryResolution serves [start, end] from the given rollup resolution, returning the
+// requested aggregate column (agg) as each series' value — AggAvg for a bare selector,
+// AggMax for max_over_time, and so on (function-aware selection, ADR-025). A resolution
+// of 0 falls back to the raw Query. For a coarse resolution it returns the persisted
+// rollup windows that overlap the range and, for the most recent span the rollup tier
+// has not closed yet, rolls up raw data (head + sealed blocks) on the fly so the coarse
+// series stays complete to now. The seam between the two is the tier's covered-through
+// bound, which is window-aligned, so the two regions never overlap. Selection is
+// transparent to the caller — the returned shape is identical to Query.
+func (db *TSDB) QueryResolution(ctx context.Context, matchers []LabelMatcher, start, end, resolution int64, agg RollupAggregate) (SeriesSet, error) {
 	if resolution <= 0 {
 		return db.Query(ctx, matchers, start, end)
 	}
+	col := columnForAggregate(agg)
 
 	type acc struct {
 		name   string
@@ -224,10 +254,10 @@ func (db *TSDB) QueryResolution(ctx context.Context, matchers []LabelMatcher, st
 		a.pts = append(a.pts, pts...)
 	}
 
-	// Persisted rollup windows (avg column) overlapping the range.
+	// Persisted rollup windows (requested aggregate column) overlapping the range.
 	frontier := db.RollupCoveredThrough(resolution)
 	for _, b := range db.RollupBlocks(resolution) {
-		for _, qr := range b.Query(matchers, start, end, rollupColAvg) {
+		for _, qr := range b.Query(matchers, start, end, col) {
 			add(qr.Name, qr.Labels, qr.Points)
 		}
 	}
@@ -250,7 +280,7 @@ func (db *TSDB) QueryResolution(ctx context.Context, matchers []LabelMatcher, st
 				if s.Timestamp < frontier || s.Timestamp < start || s.Timestamp > end {
 					continue
 				}
-				pts = append(pts, Point{Timestamp: s.Timestamp, Value: s.Avg})
+				pts = append(pts, Point{Timestamp: s.Timestamp, Value: rollupColumnValue(s, col)})
 			}
 			add(rs.Name, rs.Labels, pts)
 		}

@@ -8,10 +8,11 @@ import (
 )
 
 // RollupSample is the aggregated value of one fixed downsampling window for a single
-// series. All five aggregates are retained so a coarse resolution can answer a range
-// of functions and so coarser tiers can be derived from finer ones without re-reading
-// raw data (see ChainRollups). Timestamp is the window centre (windowStart+window/2),
-// which keeps a coarse point visually placed inside the interval it summarises.
+// series. All six aggregates are retained so a coarse resolution can answer a range of
+// functions (function-aware selection) and so coarser tiers can be derived from finer
+// ones without re-reading raw data (see ChainRollups). Timestamp is the window centre
+// (windowStart+window/2), which keeps a coarse point visually placed inside the interval
+// it summarises.
 type RollupSample struct {
 	Timestamp int64   // window centre, ms
 	Min       float64 // smallest raw value in the window
@@ -19,12 +20,21 @@ type RollupSample struct {
 	Sum       float64 // sum of raw values
 	Avg       float64 // count-weighted mean: Sum/Count
 	Count     int     // number of raw samples in the window
+	// Increase is the reset-aware counter increase attributed to this window: the sum of
+	// the per-step deltas whose later sample falls in the window, a decrease counted as
+	// a reset (the post-reset value is the increase). Attributing each delta to the later
+	// sample's window makes the increase additive — Σ over any set of contiguous windows
+	// telescopes to the counter's growth across them — which is what lets ChainRollups
+	// build a coarse increase by summing finer ones and lets rate() be served coarse. See
+	// ADR-025.
+	Increase float64
 }
 
 // rollupAcc accumulates one window while aggregating.
 type rollupAcc struct {
 	min, max, sum float64
 	count         int
+	increase      float64
 }
 
 func newRollupAcc() *rollupAcc {
@@ -43,6 +53,7 @@ func finalize(buckets map[int64]*rollupAcc, windowMs int64) []RollupSample {
 			Sum:       a.sum,
 			Avg:       a.sum / float64(a.count),
 			Count:     a.count,
+			Increase:  a.increase,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp < out[j].Timestamp })
@@ -55,14 +66,23 @@ func finalize(buckets map[int64]*rollupAcc, windowMs int64) []RollupSample {
 // has the same boundaries regardless of where a series' data starts — this is what
 // lets independently-rolled spans (and the cascade) line up exactly.
 //
-// Points need not be sorted; aggregation is order-independent. Avg is the true mean
-// of the raw values in the window (Sum/Count), not an average of partial averages.
+// Avg is the true mean of the raw values in the window (Sum/Count), not an average of
+// partial averages. The counter Increase uses the reset-aware delta between consecutive
+// time-ordered samples, attributed to the later sample's window; the points are sorted by
+// time first so that pass is correct (the other aggregates are order-independent). The
+// very first sample is the increase baseline, so it contributes no delta — across a
+// generation batch this leaves at most one inter-sample delta unattributed at the batch's
+// leading edge, negligible over many windows (see ADR-025).
 func RollupPoints(points []Point, windowMs int64) []RollupSample {
 	if len(points) == 0 || windowMs <= 0 {
 		return nil
 	}
+	if !sort.SliceIsSorted(points, func(i, j int) bool { return points[i].Timestamp < points[j].Timestamp }) {
+		points = append([]Point(nil), points...)
+		sort.Slice(points, func(i, j int) bool { return points[i].Timestamp < points[j].Timestamp })
+	}
 	buckets := make(map[int64]*rollupAcc)
-	for _, p := range points {
+	for i, p := range points {
 		windowStart := floorDiv(p.Timestamp, windowMs) * windowMs
 		a := buckets[windowStart]
 		if a == nil {
@@ -77,8 +97,22 @@ func RollupPoints(points []Point, windowMs int64) []RollupSample {
 		}
 		a.sum += p.Value
 		a.count++
+		if i > 0 {
+			a.increase += counterDelta(points[i-1].Value, p.Value)
+		}
 	}
 	return finalize(buckets, windowMs)
+}
+
+// counterDelta is the increase from prev to cur for a counter: the rise cur-prev, or — on
+// a reset (cur < prev) — cur itself, since the counter restarted from ~0 and its current
+// value is the increase accrued since. This is the same reset handling rate() applies to
+// raw samples.
+func counterDelta(prev, cur float64) float64 {
+	if cur < prev {
+		return cur
+	}
+	return cur - prev
 }
 
 // ChainRollups derives a coarser tier from an already-rolled finer tier. The coarse
@@ -87,11 +121,12 @@ func RollupPoints(points []Point, windowMs int64) []RollupSample {
 // identical, for all five aggregates, to rolling the original raw data straight to
 // the coarse interval:
 //
-//	Sum   = Σ fine.Sum
-//	Count = Σ fine.Count
-//	Min   = min fine.Min
-//	Max   = max fine.Max
-//	Avg   = Sum/Count            (count-weighted — a plain mean of fine averages is wrong)
+//	Sum      = Σ fine.Sum
+//	Count    = Σ fine.Count
+//	Min      = min fine.Min
+//	Max      = max fine.Max
+//	Avg      = Sum/Count         (count-weighted — a plain mean of fine averages is wrong)
+//	Increase = Σ fine.Increase   (each finer window already holds its reset-aware delta)
 //
 // Each finer sample is placed by its window centre, which always falls inside the
 // coarse window it belongs to, so the bucketing recovers the correct coarse window.
@@ -115,6 +150,7 @@ func ChainRollups(samples []RollupSample, windowMs int64) []RollupSample {
 		}
 		a.sum += s.Sum
 		a.count += s.Count
+		a.increase += s.Increase
 	}
 	return finalize(buckets, windowMs)
 }

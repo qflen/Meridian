@@ -21,6 +21,11 @@ var aggregateOps = map[string]bool{
 var functionNames = map[string]bool{
 	"rate": true, "avg": true, "sum": true, "max": true, "min": true,
 	"count": true, "histogram_quantile": true,
+	// Range-aggregation functions: each takes a range vector (x[d]) and reduces it to
+	// one value per series per step. See onlyFunctionNames — they are always functions,
+	// never bare aggregations.
+	"avg_over_time": true, "min_over_time": true, "max_over_time": true,
+	"sum_over_time": true, "count_over_time": true, "last_over_time": true,
 }
 
 // Parse parses a PromQL-subset expression string into an AST.

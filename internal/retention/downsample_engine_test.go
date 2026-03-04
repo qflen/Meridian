@@ -143,6 +143,12 @@ func assertSampleEqual(t *testing.T, host string, want, got storage.RollupSample
 	if math.Abs(want.Sum-got.Sum) > 1e-6 || math.Abs(want.Avg-got.Avg) > 1e-9 {
 		t.Fatalf("host %s sum/avg: got %v/%v want %v/%v", host, got.Sum, got.Avg, want.Sum, want.Avg)
 	}
+	// Increase is additive: chaining 1s→10s through blocks equals a direct raw→10s rollup
+	// (host b decreases every step, so every delta is a reset — a stress test of the
+	// reset-aware path).
+	if math.Abs(want.Increase-got.Increase) > 1e-6 {
+		t.Fatalf("host %s increase: got %v want %v", host, got.Increase, want.Increase)
+	}
 }
 
 // TestQueryResolutionValues proves the coarse query path returns the exact window
@@ -161,7 +167,7 @@ func TestQueryResolutionValues(t *testing.T) {
 		{Name: "__name__", Value: "cpu", Type: storage.MatchEqual},
 		{Name: "host", Value: "a", Type: storage.MatchEqual},
 	}
-	ss, err := db.QueryResolution(context.Background(), matchers, 0, 30000, 1000)
+	ss, err := db.QueryResolution(context.Background(), matchers, 0, 30000, 1000, storage.AggAvg)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -76,6 +76,83 @@ func rate(points []storage.Point, rangeMs, end int64) (float64, bool) {
 	return increase * factor, true
 }
 
+// reduceOverTime collapses one series' windowed samples into a single range-aggregate
+// value, the per-step output of a *_over_time function. points are the samples in the
+// step's window (t-d, t].
+//
+// At raw resolution the points are raw samples; at a coarse resolution they are the
+// matching rollup aggregate column (max_over_time reads the max column, etc.), so the
+// reduction is the same in both cases — with one exception: count_over_time counts raw
+// samples but, served coarse, must SUM the per-window count column (each coarse point is
+// already a window's sample count). last_over_time has no stored column and is served raw
+// only. The bool is false when the window holds no samples (a gap, not a zero).
+func reduceOverTime(name string, points []storage.Point, coarse bool) (float64, bool) {
+	if len(points) == 0 {
+		return 0, false
+	}
+	switch name {
+	case "min_over_time":
+		min := points[0].Value
+		for _, p := range points[1:] {
+			if p.Value < min {
+				min = p.Value
+			}
+		}
+		return min, true
+	case "max_over_time":
+		max := points[0].Value
+		for _, p := range points[1:] {
+			if p.Value > max {
+				max = p.Value
+			}
+		}
+		return max, true
+	case "sum_over_time":
+		var sum float64
+		for _, p := range points {
+			sum += p.Value
+		}
+		return sum, true
+	case "count_over_time":
+		if coarse {
+			// Each coarse point is a window's raw-sample count; their sum is the total.
+			var total float64
+			for _, p := range points {
+				total += p.Value
+			}
+			return total, true
+		}
+		return float64(len(points)), true
+	case "last_over_time":
+		return points[len(points)-1].Value, true
+	default: // avg_over_time
+		var sum float64
+		for _, p := range points {
+			sum += p.Value
+		}
+		return sum / float64(len(points)), true
+	}
+}
+
+// rateFromIncrease computes a per-second rate from coarse rollup points whose values are
+// already per-window counter increases (the increase column): the rate is the total
+// increase across the window divided by the selector range in seconds. This is the
+// window-averaged rate served from a rollup tier — it loses the sub-window extrapolation
+// the raw rate() applies, so over a wide range it matches raw rate() within a few percent
+// but is not identical near the window edges (see ADR-025). Counter resets are already
+// folded into each window's stored increase. The bool is false only when the window holds
+// no rollup points (a gap); a flat counter yields a real 0.
+func rateFromIncrease(points []storage.Point, rangeMs int64) (float64, bool) {
+	if len(points) == 0 || rangeMs <= 0 {
+		return 0, false
+	}
+	var total float64
+	for _, p := range points {
+		total += p.Value
+	}
+	return total / (float64(rangeMs) / 1000.0), true
+}
+
 // aggregateFunc applies an aggregation operation across multiple series. It is
 // linear in the total number of points: each series is scanned once into a
 // per-timestamp accumulator, rather than rescanning every series for every

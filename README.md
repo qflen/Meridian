@@ -77,7 +77,8 @@ dashboard's compression gauge.
 - **PromQL subset**: recursive-descent parser with operator precedence and unary `+`/`-`
 - **Range/matrix evaluation**: a query is evaluated as an instant query at each `step` across `[start, end]` and returned as a matrix — one point per step per series, in time order. `rate(x[5m])` is a real multi-point series, not a single number.
 - **Selectors**: instant, range, and bare label-only (`{job="x"}`); matchers `=`, `!=`, `=~`, `!~`; compound/decimal durations (`1h30m`, `1.5h`)
-- **`rate()`**: per-second average over the selector range — counter-reset corrected and extrapolated to the window edges, Prometheus-style
+- **`rate()`**: per-second average over the selector range — counter-reset corrected and extrapolated to the window edges, Prometheus-style; a wide span is served from a coarse tier's stored counter-increase column (window-averaged), short spans read raw (ADR-025)
+- **Range aggregation**: `avg_over_time`, `min_over_time`, `max_over_time`, `sum_over_time`, `count_over_time`, `last_over_time` over a range vector `x[d]`; served from the matching rollup column at coarse resolution (`max_over_time`→max, …), exactly equal to the raw result for min/max/sum/count (ADR-025)
 - **`histogram_quantile()`**: linear interpolation within cumulative `le` buckets, grouped by the remaining labels
 - **Aggregations**: `sum`, `avg`, `min`, `max`, `count`, and `topk`/`bottomk`, with both `by` and `without` grouping
 - **Binary ops**: scalar↔vector and vector↔vector with label-set matching; `/` follows IEEE-754 (`x/0 → ±Inf`, `0/0 → NaN`)
@@ -182,16 +183,21 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
 - **Downsampling cascade**: a live raw → 1m → 1h rollup cascade (ADR-011). On each
   background pass, sealed raw blocks are rolled up to resolution-tagged 1m blocks and
   the 1m tier is chained — count-weighted, so a 1h average equals one built directly
-  from raw — into 1h blocks. Every window stores min/max/sum/count/avg. In the
-  single-binary `serve`, the query planner picks a resolution from the query span and
-  step, so a wide view reads coarse rollup points instead of thousands of raw samples
-  (the resolution test serves an 8h span at a 1h step from the 1h tier reading 16
-  points versus 3840 raw over the span — a 240× reduction), transparently to the
-  caller; the HTTP API reports the chosen `resolution_ms`/`points_read`, and `rate()`
-  and range selectors force raw. **Cluster caveat:** in the docker-compose tier the
-  storage nodes generate the same rollups, but the querier still reads raw — pushing
-  the chosen resolution across the remote storage client is not yet wired, so cluster
-  resolution selection is documented future work (ADR-011).
+  from raw — into 1h blocks. Every window stores min/max/sum/count/avg and a reset-aware
+  counter increase (ADR-025). In the single-binary `serve`, the query planner picks a
+  resolution from the query span and step, so a wide view reads coarse rollup points
+  instead of thousands of raw samples (the resolution test serves an 8h span at a 1h step
+  from the 1h tier reading 16 points versus 3840 raw over the span — a 240× reduction),
+  transparently to the caller; the HTTP API reports the chosen `resolution_ms`/`points_read`.
+- **Function-aware rollup queries** (ADR-025): served from a coarse tier, each query reads
+  the stored column that matches its operation — `max_over_time`→max, `sum_over_time`→sum,
+  a bare value/`avg_over_time`→avg — exact for min/max/sum/count, and `rate()` is served
+  from the counter-increase column as `Σincrease / range` (window-averaged, ~1% of raw
+  over a wide span). Short ranges, `last_over_time`, and bare range selectors stay on raw.
+  **Cluster caveat:** in the docker-compose tier the storage nodes generate the same
+  rollups, but the querier still reads raw — pushing the chosen resolution across the
+  remote storage client is not yet wired, so cluster resolution selection is documented
+  future work (ADR-011).
 - **Per-resolution retention**: each tier has its own TTL — raw expires first while
   the longer-lived 1m/1h tiers keep answering long-range queries (default raw 15d →
   1m 30d → 1h 365d). Raw is never dropped before the finest rollup tier has captured it.

@@ -194,10 +194,14 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   a bare value/`avg_over_time`→avg — exact for min/max/sum/count, and `rate()` is served
   from the counter-increase column as `Σincrease / range` (window-averaged, ~1% of raw
   over a wide span). Short ranges, `last_over_time`, and bare range selectors stay on raw.
-  **Cluster caveat:** in the docker-compose tier the storage nodes generate the same
-  rollups, but the querier still reads raw — pushing the chosen resolution across the
-  remote storage client is not yet wired, so cluster resolution selection is documented
-  future work (ADR-011).
+- **Cluster resolution selection**: the distributed query path selects a resolution and
+  aggregate column too, exactly like the monolith. The querier runs the same planner and
+  asks each storage node for the chosen resolution + column; nodes serve the coarsest tier
+  they hold at or below it (advertising availability on `/api/internal/resolutions`), and the
+  client merges the coarse results across replicas — skipping read-repair, since rollups are
+  node-local and raw replication is the convergence layer (ADR-011). A wide cluster query is
+  served from the 1h tier, a narrow one reads raw, and `resolution_ms`/`points_read` are
+  reported just like the single binary.
 - **Per-resolution retention**: each tier has its own TTL — raw expires first while
   the longer-lived 1m/1h tiers keep answering long-range queries (default raw 15d →
   1m 30d → 1h 365d). Raw is never dropped before the finest rollup tier has captured it.

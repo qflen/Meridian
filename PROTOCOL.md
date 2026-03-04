@@ -70,9 +70,11 @@ so a caller can see that a wide query read far fewer points from a coarse tier. 
 range query is also served coarse when its function maps to a stored column — the
 `*_over_time` family reads the matching aggregate (`max_over_time`→max, …) and `rate()`
 reads the counter-increase column as `Σincrease / range` (window-averaged). Short ranges,
-`last_over_time`, and a bare range selector still read raw. In the docker-compose cluster
-the querier currently reads raw (so `resolution_ms` is `0`); pushing the chosen resolution
-to the storage nodes — which do generate rollups — is documented future work (ADR-011).
+`last_over_time`, and a bare range selector still read raw. This selection runs in the
+docker-compose **cluster** too: the querier runs the same planner and requests the chosen
+resolution + aggregate column from the storage nodes (see Internal Cluster API below), so a
+wide cluster query reports a non-zero `resolution_ms` exactly like the single binary
+(ADR-011).
 
 ### Labels
 
@@ -89,6 +91,71 @@ GET /health
 ```
 
 Returns `{"status":"ok"}` with 200 if the server is healthy.
+
+## Internal Cluster API
+
+These endpoints are used between services (querier/ingestor → storage). They are JSON over
+HTTP on the storage node's address.
+
+### Storage query
+
+```
+POST /api/internal/query
+```
+
+**Request:**
+```json
+{
+  "matchers": [{"name": "__name__", "value": "cpu", "type": "="}],
+  "start": 1700000000000,
+  "end": 1700003600000,
+  "resolution": 3600000,
+  "aggregate": "max"
+}
+```
+
+- `resolution` (ms, optional): the requested rollup window. `0`/absent reads raw. The node
+  serves the **coarsest tier it holds at or below** this value, falling back to a finer tier
+  or raw when the requested tier is absent (so a node just restarted or mid-downsample never
+  fails the query).
+- `aggregate` (optional, ignored when `resolution` is 0): the rollup column to read —
+  `avg` (default), `min`, `max`, `sum`, `count`, or `increase` (for `rate()`). `increase` is
+  only served from tiers whose counter-increase column is complete.
+
+**Response:**
+```json
+{
+  "status": "success",
+  "resolution_ms": 3600000,
+  "data": [
+    {"name": "cpu", "labels": {"host": "web-1"}, "points": [{"t": 1700001800000, "v": 91.0}]}
+  ]
+}
+```
+
+- `resolution_ms`: the resolution the node **actually** served (`0` = raw). It can be finer
+  than requested when the node lacks the requested tier; the querier reconciles a merge
+  across replicas that served different resolutions (and falls back to a raw read for any
+  series whose replicas disagree).
+
+### Rollup tier availability
+
+```
+GET /api/internal/resolutions
+```
+
+Advertises a node's rollup tiers so the querier can plan a resolution (it requests only a
+resolution every live node can serve — the intersection):
+```json
+{
+  "resolutions": [60000, 3600000],
+  "increase_resolutions": [60000, 3600000]
+}
+```
+
+- `resolutions`: every tier (ms) that currently has data.
+- `increase_resolutions`: the subset whose counter-increase column is complete, i.e. the
+  tiers from which `rate()` can be served (ADR-025).
 
 ## WebSocket Streams
 

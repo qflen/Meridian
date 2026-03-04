@@ -195,7 +195,8 @@ quorum model (ADR-022):
   replica missing points relative to the merged truth.
 - **Health** — a background `/health` monitor (`StartHealthMonitor`) sets ring node
   state Active/Dead, so routing excludes dead nodes and re-includes recovered ones; a
-  revived node is caught up by read-repair.
+  revived node is caught up by read-repair. The same refresh discovers each live node's
+  rollup tier availability, which the resolution planner intersects across live nodes.
 
 The ingestor and querier each build this client from `REPLICATION_FACTOR`/
 `WRITE_QUORUM`/`READ_QUORUM` and run the health monitor. The `Coordinator`
@@ -218,12 +219,18 @@ and crash-recoverable (rollups are regenerable). At query time the planner
 the column that matches the operation (`TSDB.QueryResolution` with a `RollupAggregate`):
 avg for a bare value, max/min/sum/count for the matching `*_over_time` function, and the
 increase column for `rate()` (ADR-025) — rolling up the freshest not-yet-closed tail on
-the fly so the coarse series stays current. This query-time selection runs in the
-single-binary `serve`, whose TSDB implements the `ResolutionDataSource` capability; in
-the cluster the storage nodes still generate rollups, but the querier's `StorageClient`
-does not yet implement that capability and so reads raw (ADR-011). Older v1 blocks (no
-increase column) load and serve their five columns, with `rate()` falling back to raw
-for the spans they cover.
+the fly so the coarse series stays current. This query-time selection runs in both
+deployments: the single-binary `serve`, whose TSDB implements the `ResolutionDataSource`
+capability, **and** the cluster, where `service.StorageClient` implements the same
+capability — the engine and planner are reused unchanged. In the cluster the querier picks
+a resolution from the span/step against the intersection of the live nodes' advertised tiers
+(`/api/internal/resolutions`), asks the replicas for it (`QueryAtMostResolution` on each node
+serves the coarsest tier it holds at or below the request, reporting what it served), and
+merges the coarse results by (series, window-timestamp). The coarse merge skips read-repair —
+rollups are node-local derivations, so raw replication + read-repair is the convergence layer
+(ADR-022) — and a series whose replicas served different resolutions falls back to a raw read,
+so heterogeneity never breaks a query (ADR-011). Older v1 blocks (no increase column) load and
+serve their five columns, with `rate()` falling back to raw for the spans they cover.
 
 **Enforcer** (`internal/retention/enforcer.go`): Per-resolution TTL cleanup. Raw
 blocks expire first (and only once the finest rollup tier has captured them); each

@@ -174,11 +174,39 @@ and per-resolution retention.
 **function-aware aggregate selection** (serving `max_over_time` from the stored max
 column rather than avg) and **rate-on-rollup** — are now implemented in **ADR-025**,
 which adds the `*_over_time` functions, per-function column selection, and the
-counter-increase column that lets `rate()` be served from a coarse tier. In the
-**cluster**, rollups are generated on each storage node but the querier still reads
-raw (the remote client does not yet push a resolution to storage); cluster query-time
-selection is the remaining piece, so cluster raw retention should stay ≥ the longest
-query span until it lands.
+counter-increase column that lets `rate()` be served from a coarse tier.
+
+**Cluster resolution selection** (the gap this ADR previously deferred is now closed).
+The distributed query path selects a resolution and aggregate column exactly like the
+monolith — the asymmetry where storage nodes generated rollups but the querier only ever
+read raw is resolved:
+
+- **Storage node API.** The node query endpoint accepts a requested `resolution` + a
+  `aggregate` column and serves the **coarsest tier it holds at or below** the request via
+  `TSDB.QueryAtMostResolution`, reporting the resolution it actually served. A node missing
+  the requested tier (just restarted, mid-downsample, a heterogeneous cluster) falls back to
+  a finer tier or raw rather than failing the query, and `rate()` is restricted to
+  increase-capable tiers. A node also advertises its available + increase-capable tiers on
+  `/api/internal/resolutions`.
+- **Querier.** `service.StorageClient` implements the same `query.ResolutionDataSource` the
+  monolith's TSDB does, so the engine and its planner are **reused unchanged**: it picks a
+  resolution from the span/step against the **intersection of the live nodes' tiers** (so it
+  only ever requests a resolution the cluster can serve) and asks the replicas for it,
+  merging the coarse results by (series, window-timestamp) and reporting `resolution_ms` /
+  `points_read`.
+- **No coarse read-repair.** Rollups are **node-local** derivations — each node downsamples
+  its own raw data — so cross-node convergence is handled at the **raw** level (replication +
+  read-repair, ADR-022). The coarse read therefore deliberately skips read-repair; a series
+  whose replicas disagree on resolution (transient tier skew) falls back to a raw read for
+  that series, so a missing tier never breaks a query or returns mixed-width windows.
+
+With selection now active cluster-wide, the earlier caveat that "cluster raw retention
+should stay ≥ the longest query span" no longer applies: a wide query is answered from the
+coarse tiers on every node, just like the monolith. Verified by the cluster resolution
+integration tests (`internal/service`): a wide span is served from the 1h tier reading far
+fewer points, a narrow span reads raw, `max_over_time`/`min_over_time` read distinct columns
+and each equals the raw aggregate, `rate()` is served from the increase column within ~2% of
+raw, and a wide query still completes (coarse, equal to raw) with one replica down.
 
 **Consequences**: Verified by `TestEngineResolutionWideVsNarrow` (internal/query) on a
 2-series, 8-hour backfill at 15s raw resolution: a wide query (8h span, 1h step) is
@@ -893,5 +921,9 @@ resolution selection (ADR-011), not a rewrite of them.
 - The increase attribution leaves at most one inter-sample delta unattributed at a
   generation batch's leading edge (the batch's first sample is the increase baseline) and
   one at the on-the-fly tail seam — negligible over many windows.
-- As in ADR-011, the **cluster** querier still reads raw; pushing a resolution and an
-  aggregate across the remote storage client is the remaining piece.
+- The **cluster** querier now selects a resolution and aggregate column and pushes them
+  across the remote storage client, exactly as the monolith does (the node-local tier
+  selection and the cross-replica coarse merge are described in ADR-011). The function-aware
+  columns and rate-on-rollup defined here apply equally to the distributed path; the wire
+  protocol carries the aggregate as a stable string token so the column choice survives the
+  enum order changing.

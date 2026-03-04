@@ -124,6 +124,7 @@ func (s *storageServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/internal/write", s.handleWrite)
 	mux.HandleFunc("/api/internal/query", s.handleQuery)
+	mux.HandleFunc("/api/internal/resolutions", s.handleResolutions)
 	mux.HandleFunc("/api/internal/series", s.handleSeries)
 	mux.HandleFunc("/api/internal/labels", s.handleLabels)
 	mux.HandleFunc("/api/internal/label/", s.handleLabelValues)
@@ -197,7 +198,20 @@ func (s *storageServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		matchers[i] = service.MatcherToStorage(m)
 	}
 
-	ss, err := s.db.Query(r.Context(), matchers, req.Start, req.End)
+	// Serve the requested rollup resolution + aggregate column when asked (cluster
+	// query-time resolution selection, ADR-011); fall back to the coarsest tier this
+	// node holds at or below it, or raw. servedRes reports what was actually served so
+	// the querier can reconcile a merge across replicas that served different tiers.
+	var (
+		ss        storage.SeriesSet
+		servedRes int64
+		err       error
+	)
+	if req.Resolution > 0 {
+		ss, servedRes, err = s.db.QueryAtMostResolution(r.Context(), matchers, req.Start, req.End, req.Resolution, service.AggregateFromWire(req.Aggregate))
+	} else {
+		ss, err = s.db.Query(r.Context(), matchers, req.Start, req.End)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -212,7 +226,16 @@ func (s *storageServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		data[i] = service.SeriesResult{Name: rs.Name, Labels: rs.Labels, Points: points}
 	}
 
-	writeJSON(w, service.QueryResponse{Status: "success", Data: data})
+	writeJSON(w, service.QueryResponse{Status: "success", Data: data, ResolutionMs: servedRes})
+}
+
+// handleResolutions advertises this node's rollup tier availability so the querier can run
+// the same resolution planner the monolith does (ADR-011).
+func (s *storageServer) handleResolutions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, service.ResolutionsResponse{
+		Resolutions:         s.db.RollupResolutions(),
+		IncreaseResolutions: s.db.RollupIncreaseResolutions(),
+	})
 }
 
 func (s *storageServer) handleSeries(w http.ResponseWriter, r *http.Request) {

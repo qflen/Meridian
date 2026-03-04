@@ -304,6 +304,48 @@ func (db *TSDB) QueryResolution(ctx context.Context, matchers []LabelMatcher, st
 	return out, nil
 }
 
+// QueryAtMostResolution serves [start, end] from the coarsest rollup tier this node holds
+// that is no coarser than maxResolution, reading the aggregate column agg, and reports the
+// resolution actually served (0 = raw). It is the node-local half of cluster query-time
+// resolution selection (ADR-011): the querier picks one cluster-wide target resolution and
+// each node serves the coarsest tier it actually has at or below that target, falling back
+// to a finer tier or raw when the requested tier is absent (a node just restarted, is
+// mid-downsample, or the cluster is heterogeneous) so a missing tier never breaks a query.
+// When agg is AggIncrease only increase-capable tiers (format v2) qualify, so a node lacking
+// the column serves a finer/raw tier rather than under-counting rate(). The querier
+// reconciles a merge across replicas that served different resolutions (see the cluster
+// StorageClient); the resolution reported here is what makes that reconciliation possible.
+func (db *TSDB) QueryAtMostResolution(ctx context.Context, matchers []LabelMatcher, start, end, maxResolution int64, agg RollupAggregate) (SeriesSet, int64, error) {
+	served := db.servableResolution(maxResolution, agg)
+	if served <= 0 {
+		ss, err := db.Query(ctx, matchers, start, end)
+		return ss, 0, err
+	}
+	ss, err := db.QueryResolution(ctx, matchers, start, end, served, agg)
+	return ss, served, err
+}
+
+// servableResolution returns the coarsest available rollup resolution that is no coarser
+// than maxResolution, or 0 (raw) when this node has no qualifying tier. rate()
+// (AggIncrease) is restricted to the increase-capable tiers so it is never served from a
+// tier missing the counter-increase column.
+func (db *TSDB) servableResolution(maxResolution int64, agg RollupAggregate) int64 {
+	if maxResolution <= 0 {
+		return 0
+	}
+	available := db.RollupResolutions()
+	if agg == AggIncrease {
+		available = db.RollupIncreaseResolutions()
+	}
+	best := int64(0)
+	for _, r := range available { // ascending: the last r ≤ max is the coarsest qualifying tier
+		if r > 0 && r <= maxResolution {
+			best = r
+		}
+	}
+	return best
+}
+
 // RawBlockFrontier returns the largest MaxTime across immutable raw blocks, or
 // math.MinInt64 if there are none. The downsampler treats this as the global
 // ingestion frontier: a rollup window is only closed once a raw block exists whose

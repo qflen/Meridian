@@ -35,6 +35,49 @@ func openTestDB(t *testing.T) *storage.TSDB {
 	return db
 }
 
+// writeQueryResult serves a QueryRequest against db exactly as the production storage node
+// does: when a rollup resolution is requested it serves the coarsest tier the node holds at
+// or below it (the requested aggregate column) and reports the resolution actually served;
+// otherwise it reads raw. The in-process nodes share this so the cluster tests exercise the
+// real node-local tier selection (storage.QueryAtMostResolution).
+func writeQueryResult(ctx context.Context, w http.ResponseWriter, db *storage.TSDB, req service.QueryRequest) {
+	matchers := make([]storage.LabelMatcher, len(req.Matchers))
+	for i, m := range req.Matchers {
+		matchers[i] = service.MatcherToStorage(m)
+	}
+	var (
+		ss        storage.SeriesSet
+		servedRes int64
+		err       error
+	)
+	if req.Resolution > 0 {
+		ss, servedRes, err = db.QueryAtMostResolution(ctx, matchers, req.Start, req.End, req.Resolution, service.AggregateFromWire(req.Aggregate))
+	} else {
+		ss, err = db.Query(ctx, matchers, req.Start, req.End)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	data := make([]service.SeriesResult, len(ss))
+	for i, rs := range ss {
+		points := make([]service.PointJSON, len(rs.Points))
+		for j, p := range rs.Points {
+			points[j] = service.PointJSON{Timestamp: p.Timestamp, Value: p.Value}
+		}
+		data[i] = service.SeriesResult{Name: rs.Name, Labels: rs.Labels, Points: points}
+	}
+	json.NewEncoder(w).Encode(service.QueryResponse{Status: "success", Data: data, ResolutionMs: servedRes})
+}
+
+// writeResolutions advertises a node's rollup tier availability for cluster-side planning.
+func writeResolutions(w http.ResponseWriter, db *storage.TSDB) {
+	json.NewEncoder(w).Encode(service.ResolutionsResponse{
+		Resolutions:         db.RollupResolutions(),
+		IncreaseResolutions: db.RollupIncreaseResolutions(),
+	})
+}
+
 // startStorageNode starts a minimal storage HTTP server for testing.
 func startStorageNode(t *testing.T, db *storage.TSDB, nodeID string) (string, func()) {
 	t.Helper()
@@ -68,24 +111,10 @@ func startStorageNode(t *testing.T, db *storage.TSDB, nodeID string) (string, fu
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		matchers := make([]storage.LabelMatcher, len(req.Matchers))
-		for i, m := range req.Matchers {
-			matchers[i] = service.MatcherToStorage(m)
-		}
-		ss, err := db.Query(r.Context(), matchers, req.Start, req.End)
-		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
-		}
-		data := make([]service.SeriesResult, len(ss))
-		for i, rs := range ss {
-			points := make([]service.PointJSON, len(rs.Points))
-			for j, p := range rs.Points {
-				points[j] = service.PointJSON{Timestamp: p.Timestamp, Value: p.Value}
-			}
-			data[i] = service.SeriesResult{Name: rs.Name, Labels: rs.Labels, Points: points}
-		}
-		json.NewEncoder(w).Encode(service.QueryResponse{Status: "success", Data: data})
+		writeQueryResult(r.Context(), w, db, req)
+	})
+	mux.HandleFunc("/api/internal/resolutions", func(w http.ResponseWriter, r *http.Request) {
+		writeResolutions(w, db)
 	})
 	mux.HandleFunc("/api/internal/series", func(w http.ResponseWriter, r *http.Request) {
 		series := db.Series()
@@ -365,24 +394,10 @@ func replMux(n *replNode) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		matchers := make([]storage.LabelMatcher, len(req.Matchers))
-		for i, m := range req.Matchers {
-			matchers[i] = service.MatcherToStorage(m)
-		}
-		ss, err := n.db.Query(r.Context(), matchers, req.Start, req.End)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		data := make([]service.SeriesResult, len(ss))
-		for i, rs := range ss {
-			points := make([]service.PointJSON, len(rs.Points))
-			for j, p := range rs.Points {
-				points[j] = service.PointJSON{Timestamp: p.Timestamp, Value: p.Value}
-			}
-			data[i] = service.SeriesResult{Name: rs.Name, Labels: rs.Labels, Points: points}
-		}
-		json.NewEncoder(w).Encode(service.QueryResponse{Status: "success", Data: data})
+		writeQueryResult(r.Context(), w, n.db, req)
+	})
+	mux.HandleFunc("/api/internal/resolutions", func(w http.ResponseWriter, r *http.Request) {
+		writeResolutions(w, n.db)
 	})
 	// Gate: a "down" node fails every request, the way a crashed process would.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

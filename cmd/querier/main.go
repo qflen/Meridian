@@ -63,6 +63,12 @@ func main() {
 	log.Println("Querier stopped.")
 }
 
+// The cluster query path reuses the monolith's engine unchanged: the StorageClient
+// implements query.ResolutionDataSource (the same capability *storage.TSDB exposes), so the
+// engine selects a rollup resolution + aggregate and the client requests it from the
+// storage nodes. This assertion fails the build if that contract ever drifts.
+var _ query.ResolutionDataSource = (*service.StorageClient)(nil)
+
 type querierServer struct {
 	nodeID    string
 	engine    *query.Engine
@@ -114,7 +120,7 @@ func (s *querierServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	startExec := time.Now()
-	results, err := s.engine.Execute(r.Context(), q, start, end, step)
+	results, meta, err := s.engine.ExecuteWithMeta(r.Context(), q, start, end, step)
 	execTime := time.Since(startExec)
 	s.latency.Record(execTime)
 
@@ -139,6 +145,11 @@ func (s *querierServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"status":    "success",
 		"exec_time": execTime.String(),
+		// Resolution selection is transparent across the cluster too: a wide span is
+		// served from a coarse rollup tier on the storage nodes (resolution_ms>0) reading
+		// far fewer points; 0 means raw. See ADR-011.
+		"resolution_ms": meta.ResolutionMs,
+		"points_read":   meta.PointsRead,
 		"data": map[string]interface{}{
 			"resultType": "matrix",
 			"result":     data,

@@ -27,6 +27,12 @@ type StorageClient struct {
 	rf   int // N — replication factor
 	w    int // W — write quorum
 	r    int // R — read quorum
+
+	// nodeRes caches each node's advertised rollup tier availability, discovered
+	// alongside health. RollupResolutions intersects it over the live nodes so the
+	// resolution planner only picks a tier the cluster can serve. Guarded by resMu.
+	resMu   sync.RWMutex
+	nodeRes map[string]ResolutionsResponse
 }
 
 // ReplicationOptions configures the replication behaviour of a StorageClient.
@@ -77,12 +83,13 @@ func NewReplicatedStorageClient(addrs []string, opts ReplicationOptions) *Storag
 		n = 1
 	}
 	return &StorageClient{
-		addrs:  addrs,
-		client: &http.Client{Timeout: 30 * time.Second},
-		ring:   ring,
-		rf:     n,
-		w:      clampInt(opts.WriteQuorum, 1, n),
-		r:      clampInt(opts.ReadQuorum, 1, n),
+		addrs:   addrs,
+		client:  &http.Client{Timeout: 30 * time.Second},
+		ring:    ring,
+		rf:      n,
+		w:       clampInt(opts.WriteQuorum, 1, n),
+		r:       clampInt(opts.ReadQuorum, 1, n),
+		nodeRes: make(map[string]ResolutionsResponse),
 	}
 }
 
@@ -118,7 +125,9 @@ func (c *StorageClient) Replicas(name string, labels map[string]string) []string
 
 // RefreshHealth probes every storage node's /health once and updates its ring state
 // to Active or Dead, so routing immediately excludes nodes that have gone away and
-// re-includes ones that have returned. Probes run concurrently.
+// re-includes ones that have returned. For a healthy node it also refreshes the cached
+// rollup tier availability used by the resolution planner, so discovery rides the same
+// cycle as liveness and never lags it. Probes run concurrently.
 func (c *StorageClient) RefreshHealth() {
 	var wg sync.WaitGroup
 	for _, addr := range c.addrs {
@@ -127,12 +136,44 @@ func (c *StorageClient) RefreshHealth() {
 			defer wg.Done()
 			if _, ok := HealthCheck(addr); ok {
 				c.ring.SetState(addr, cluster.NodeActive)
+				if res, ok := c.fetchResolutions(addr); ok {
+					c.resMu.Lock()
+					c.nodeRes[addr] = res
+					c.resMu.Unlock()
+				}
 			} else {
 				c.ring.SetState(addr, cluster.NodeDead)
 			}
 		}(addr)
 	}
 	wg.Wait()
+}
+
+// fetchResolutions reads a node's advertised rollup tier availability. A failure (node
+// briefly unreachable, no rollup endpoint) leaves the last-known entry in place; the
+// intersection in RollupResolutions simply ignores a live node it has not discovered yet.
+func (c *StorageClient) fetchResolutions(addr string) (ResolutionsResponse, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	url := fmt.Sprintf("http://%s/api/internal/resolutions", addr)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return ResolutionsResponse{}, false
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return ResolutionsResponse{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return ResolutionsResponse{}, false
+	}
+	var rr ResolutionsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
+		return ResolutionsResponse{}, false
+	}
+	return rr, true
 }
 
 // StartHealthMonitor runs RefreshHealth immediately and then every interval until ctx
@@ -301,7 +342,7 @@ func (c *StorageClient) Query(ctx context.Context, matchers []storage.LabelMatch
 	ch := make(chan nodeResp, len(live))
 	for _, n := range live {
 		go func(addr string) {
-			data, ok := c.queryNode(ctx, addr, body)
+			data, _, ok := c.queryNode(ctx, addr, body)
 			ch <- nodeResp{addr: addr, data: data, ok: ok}
 		}(n.Addr)
 	}
@@ -380,29 +421,257 @@ func (c *StorageClient) Query(ctx context.Context, matchers []storage.LabelMatch
 	return ss, nil
 }
 
-// queryNode runs the query against one storage node, returning its series and whether
-// the node responded successfully (HTTP 200, decodable body).
-func (c *StorageClient) queryNode(ctx context.Context, addr string, body []byte) ([]SeriesResult, bool) {
+// RollupResolutions reports the rollup resolutions (ms, ascending) the cluster can serve
+// for query planning: the intersection of the live nodes' advertised tiers, so the planner
+// only ever picks a resolution every discovered live node can serve. In steady state every
+// storage node runs the same downsampling cascade, so the intersection is the full tier
+// set; a node mid-downsample or just back from Dead narrows it, and the per-series merge in
+// QueryResolution reconciles any residual skew. A live node whose tiers have not been
+// discovered yet does not veto the intersection (the merge handles it). Implements
+// query.ResolutionDataSource, the same capability *storage.TSDB exposes to the monolith.
+func (c *StorageClient) RollupResolutions() []int64 {
+	return c.intersectLiveResolutions(func(r ResolutionsResponse) []int64 { return r.Resolutions })
+}
+
+// RollupIncreaseResolutions reports the resolutions whose counter-increase column is
+// complete across the cluster (the intersection over live nodes), i.e. the tiers from which
+// rate() can be served. A tier where any live node lacks the column is excluded, so rate()
+// falls back to raw rather than under-counting.
+func (c *StorageClient) RollupIncreaseResolutions() []int64 {
+	return c.intersectLiveResolutions(func(r ResolutionsResponse) []int64 { return r.IncreaseResolutions })
+}
+
+// intersectLiveResolutions returns the resolutions present on every discovered live node,
+// per the selector pick. Live nodes whose availability is not yet cached are skipped rather
+// than treated as having none, so incomplete discovery degrades to more per-series raw
+// fallback (still correct) instead of forcing the whole cluster to raw.
+func (c *StorageClient) intersectLiveResolutions(pick func(ResolutionsResponse) []int64) []int64 {
+	live := c.ring.LiveNodes()
+	c.resMu.RLock()
+	defer c.resMu.RUnlock()
+	counts := make(map[int64]int)
+	known := 0
+	for _, n := range live {
+		rr, ok := c.nodeRes[n.Addr]
+		if !ok {
+			continue // tiers not discovered for this live node; don't let it veto
+		}
+		known++
+		seen := make(map[int64]bool)
+		for _, res := range pick(rr) {
+			if res > 0 && !seen[res] {
+				seen[res] = true
+				counts[res]++
+			}
+		}
+	}
+	if known == 0 {
+		return nil
+	}
+	out := make([]int64, 0, len(counts))
+	for res, cnt := range counts {
+		if cnt == known {
+			out = append(out, res)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// QueryResolution serves a coarse read from a quorum of replicas: it asks every live node
+// for the chosen resolution and aggregate column, then merges the responses by (series,
+// window-timestamp). It is the cluster counterpart of TSDB.QueryResolution and the method
+// that closes the asymmetry between the monolith and cluster query paths — the engine calls
+// it (via query.ResolutionDataSource) exactly as it calls the monolith's TSDB.
+//
+// A resolution of 0 delegates to the raw Query, which keeps its read-repair. For a coarse
+// read, read-repair is deliberately skipped: rollups are node-local derivations — each node
+// downsamples its own raw data — so cross-node convergence is handled at the raw level
+// (replication + read-repair). Repairing coarse windows across nodes would fight the local
+// downsamplers and is unnecessary, since every replica regenerates its own rollups from its
+// own converging raw. See ADR-011/ADR-022.
+//
+// Because a node missing the requested tier serves a finer one (reporting what it served),
+// replicas of one series can disagree on resolution. Windows of different widths cannot be
+// merged, so such a series falls back to a raw read (the convergence layer) for correctness;
+// this is transient skew only and never returns mixed-width data. Quorum is enforced
+// globally (≥R live nodes responded) and per series (≥R of its replicas responded), exactly
+// as the raw path does.
+func (c *StorageClient) QueryResolution(ctx context.Context, matchers []storage.LabelMatcher, start, end, resolution int64, agg storage.RollupAggregate) (storage.SeriesSet, error) {
+	if resolution <= 0 {
+		return c.Query(ctx, matchers, start, end)
+	}
+
+	live := c.ring.LiveNodes()
+	if len(live) < c.r {
+		return nil, fmt.Errorf("read quorum unavailable: %d live storage node(s) < R=%d", len(live), c.r)
+	}
+
+	matcherJSON := make([]MatcherJSON, len(matchers))
+	for i, m := range matchers {
+		matcherJSON[i] = StorageToMatcher(m)
+	}
+	body, err := json.Marshal(QueryRequest{
+		Matchers:   matcherJSON,
+		Start:      start,
+		End:        end,
+		Resolution: resolution,
+		Aggregate:  AggregateToWire(agg),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	type nodeResp struct {
+		addr     string
+		data     []SeriesResult
+		servedMs int64
+		ok       bool
+	}
+	ch := make(chan nodeResp, len(live))
+	for _, n := range live {
+		go func(addr string) {
+			data, servedMs, ok := c.queryNode(ctx, addr, body)
+			ch <- nodeResp{addr: addr, data: data, servedMs: servedMs, ok: ok}
+		}(n.Addr)
+	}
+
+	// Gather each series' points keyed by the resolution the replica served, so a node
+	// that served a finer tier than requested (or raw) is reconciled rather than blindly
+	// interleaved with coarser windows. Replicas that served the same resolution merge by
+	// timestamp — their windows are identical node-local derivations of the converged raw,
+	// so the merge just dedups them (a stale replica contributes a subset a fresh one fills).
+	responded := make(map[string]bool, len(live))
+	byRes := make(map[string]map[int64]*storage.ResultSeries)
+	for range live {
+		nr := <-ch
+		if !nr.ok {
+			continue
+		}
+		responded[nr.addr] = true
+		for _, sr := range nr.data {
+			key := seriesKey(sr.Name, sr.Labels)
+			points := make([]storage.Point, len(sr.Points))
+			for i, p := range sr.Points {
+				points[i] = storage.Point{Timestamp: p.Timestamp, Value: p.Value}
+			}
+			perRes := byRes[key]
+			if perRes == nil {
+				perRes = make(map[int64]*storage.ResultSeries)
+				byRes[key] = perRes
+			}
+			if existing, ok := perRes[nr.servedMs]; ok {
+				existing.Points = mergePoints(existing.Points, points)
+			} else {
+				perRes[nr.servedMs] = &storage.ResultSeries{
+					Name:   sr.Name,
+					Labels: sr.Labels,
+					Points: append([]storage.Point(nil), points...),
+				}
+			}
+		}
+	}
+
+	if len(responded) < c.r {
+		return nil, fmt.Errorf("read quorum not met: %d/%d live storage node(s) responded (R=%d)", len(responded), len(live), c.r)
+	}
+
+	// Reconcile per series; a series whose replicas disagreed on resolution falls back to
+	// raw. No read-repair on the coarse path (see the method doc).
+	ss := make(storage.SeriesSet, 0, len(byRes))
+	var mixed []storage.ResultSeries
+	for key, perRes := range byRes {
+		var sample *storage.ResultSeries
+		for _, rs := range perRes {
+			sample = rs
+			break
+		}
+		replicas := c.ring.GetNodes(ringKey(sample.Name, sample.Labels), c.rf)
+		respondedReplicas := 0
+		for _, n := range replicas {
+			if responded[n.Addr] {
+				respondedReplicas++
+			}
+		}
+		if respondedReplicas < c.r {
+			return nil, fmt.Errorf("read quorum not met for series %q: %d responding replica(s) < R=%d", key, respondedReplicas, c.r)
+		}
+
+		if len(perRes) == 1 {
+			sort.Slice(sample.Points, func(i, j int) bool { return sample.Points[i].Timestamp < sample.Points[j].Timestamp })
+			ss = append(ss, *sample)
+			continue
+		}
+		mixed = append(mixed, *sample) // replicas served different resolutions → raw fallback
+	}
+
+	if len(mixed) > 0 {
+		rawSS, err := c.queryRawSeries(ctx, mixed, start, end)
+		if err != nil {
+			return nil, err
+		}
+		ss = append(ss, rawSS...)
+	}
+
+	return ss, nil
+}
+
+// queryRawSeries reads the given series from raw via the normal quorum raw path (which
+// keeps read-repair), pinning each series with exact-match label matchers. It backs the
+// per-series raw fallback when a coarse read found replicas that served different
+// resolutions for a series; raw is the cross-node convergence layer, so this is always
+// correct, just heavier, and only triggers during transient tier-availability skew.
+func (c *StorageClient) queryRawSeries(ctx context.Context, series []storage.ResultSeries, start, end int64) (storage.SeriesSet, error) {
+	var out storage.SeriesSet
+	for _, s := range series {
+		ss, err := c.Query(ctx, exactMatchers(s.Name, s.Labels), start, end)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ss...)
+	}
+	return out, nil
+}
+
+// exactMatchers builds equality matchers that pin exactly one series by its name and full
+// label set (the metric name is carried as __name__).
+func exactMatchers(name string, labels map[string]string) []storage.LabelMatcher {
+	matchers := make([]storage.LabelMatcher, 0, len(labels)+1)
+	matchers = append(matchers, storage.LabelMatcher{Name: "__name__", Value: name, Type: storage.MatchEqual})
+	for k, v := range labels {
+		if k == "__name__" {
+			continue
+		}
+		matchers = append(matchers, storage.LabelMatcher{Name: k, Value: v, Type: storage.MatchEqual})
+	}
+	return matchers
+}
+
+// queryNode runs the query against one storage node, returning its series, the resolution
+// the node actually served (0 for a raw read), and whether the node responded successfully
+// (HTTP 200, decodable body). The served resolution lets a coarse read reconcile replicas
+// that served different tiers; the raw read path ignores it.
+func (c *StorageClient) queryNode(ctx context.Context, addr string, body []byte) ([]SeriesResult, int64, bool) {
 	url := fmt.Sprintf("http://%s/api/internal/query", addr)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
-		return nil, false
+		return nil, 0, false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, false
+		return nil, 0, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, resp.Body)
-		return nil, false
+		return nil, 0, false
 	}
 	var qr QueryResponse
 	if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
-		return nil, false
+		return nil, 0, false
 	}
-	return qr.Data, true
+	return qr.Data, qr.ResolutionMs, true
 }
 
 // readRepair writes the missing points back to stale replicas in the background, under

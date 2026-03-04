@@ -32,11 +32,18 @@ type WriteResponse struct {
 	SamplesIngested int64 `json:"samples_ingested"`
 }
 
-// QueryRequest is sent from querier → storage to query raw series data.
+// QueryRequest is sent from querier → storage to query series data. Resolution and
+// Aggregate are the cluster's half of query-time rollup selection (ADR-011): the querier
+// runs the same planner the monolith does and asks each node to serve a chosen rollup
+// resolution and aggregate column. Resolution is the requested rollup window in ms; 0 (the
+// zero value, so older callers are unaffected) means raw. Aggregate names the rollup column
+// to read at a coarse resolution (see AggregateToWire); it is ignored when Resolution is 0.
 type QueryRequest struct {
-	Matchers []MatcherJSON `json:"matchers"`
-	Start    int64         `json:"start"`
-	End      int64         `json:"end"`
+	Matchers   []MatcherJSON `json:"matchers"`
+	Start      int64         `json:"start"`
+	End        int64         `json:"end"`
+	Resolution int64         `json:"resolution,omitempty"`
+	Aggregate  string        `json:"aggregate,omitempty"`
 }
 
 // MatcherJSON serializes a label matcher over the wire.
@@ -59,10 +66,25 @@ type PointJSON struct {
 	Value     float64 `json:"v"`
 }
 
-// QueryResponse is returned by storage nodes for query requests.
+// QueryResponse is returned by storage nodes for query requests. ResolutionMs reports the
+// resolution the node actually served (0 = raw): a node serves the coarsest tier it holds
+// that is no coarser than the requested resolution, so a node missing the requested tier
+// (just restarted, mid-downsample, heterogeneous) reports a finer resolution and the
+// querier reconciles the merge across replicas. It is the wire counterpart of the
+// monolith's transparent resolution reporting.
 type QueryResponse struct {
-	Status string         `json:"status"`
-	Data   []SeriesResult `json:"data"`
+	Status       string         `json:"status"`
+	Data         []SeriesResult `json:"data"`
+	ResolutionMs int64          `json:"resolution_ms"`
+}
+
+// ResolutionsResponse advertises a storage node's rollup tier availability so the querier
+// can run the same resolution planner the monolith does. Resolutions lists every tier (ms)
+// that currently has data; IncreaseResolutions is the subset whose counter-increase column
+// is complete, i.e. the tiers from which rate() can be served (ADR-025).
+type ResolutionsResponse struct {
+	Resolutions         []int64 `json:"resolutions"`
+	IncreaseResolutions []int64 `json:"increase_resolutions"`
 }
 
 // BlockInfo describes a persistent block on a storage node. Resolution is 0 for a raw
@@ -122,6 +144,45 @@ func MatcherToStorage(m MatcherJSON) storage.LabelMatcher {
 		mt = storage.MatchEqual
 	}
 	return storage.LabelMatcher{Name: m.Name, Value: m.Value, Type: mt}
+}
+
+// AggregateToWire renders a storage.RollupAggregate as a stable wire token. A string
+// (rather than the enum's integer value) keeps the protocol legible and robust to the
+// constant order changing. An unknown aggregate maps to "avg", the safe default column.
+func AggregateToWire(agg storage.RollupAggregate) string {
+	switch agg {
+	case storage.AggMin:
+		return "min"
+	case storage.AggMax:
+		return "max"
+	case storage.AggSum:
+		return "sum"
+	case storage.AggCount:
+		return "count"
+	case storage.AggIncrease:
+		return "increase"
+	default:
+		return "avg"
+	}
+}
+
+// AggregateFromWire parses a wire token back into a storage.RollupAggregate, defaulting to
+// AggAvg for the empty string or an unrecognised token.
+func AggregateFromWire(s string) storage.RollupAggregate {
+	switch s {
+	case "min":
+		return storage.AggMin
+	case "max":
+		return storage.AggMax
+	case "sum":
+		return storage.AggSum
+	case "count":
+		return storage.AggCount
+	case "increase":
+		return storage.AggIncrease
+	default:
+		return storage.AggAvg
+	}
 }
 
 // StorageToMatcher converts a storage.LabelMatcher to a MatcherJSON.

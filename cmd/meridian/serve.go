@@ -91,6 +91,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 		BlockDuration:   cfg.Storage.BlockDuration.Std(),
 		RetentionPeriod: cfg.Storage.Retention.Std(),
 		FlushInterval:   cfg.Storage.FlushInterval.Std(),
+		WALGroupCommit:  cfg.Storage.WALGroupCommit,
+		WALCommitLinger: cfg.Storage.WALCommitLinger.Std(),
 	}
 
 	db, err := storage.Open(cfg.Storage.DataDir, opts)

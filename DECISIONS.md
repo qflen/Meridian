@@ -370,8 +370,8 @@ the write path is checked, and durability is confirmed (rename + parent fsync) b
 any WAL is reclaimed. The trade-off is a brief ingest stall during the cut (one
 segment sync while the writer lock is held) and that a (rare) block-write failure
 makes the in-flight generation queryable only after a restart. Group-commit of WAL
-frames (one fsync for coalesced writes) is noted as future work; today each frame
-still fsyncs individually.
+frames — coalescing concurrent writes behind one fsync while preserving this
+low-water-mark cut — is implemented in ADR-026.
 
 ## ADR-017: Ingestion Rate as a Windowed Rate, Cumulative Count for the Counter
 
@@ -927,3 +927,62 @@ resolution selection (ADR-011), not a rewrite of them.
   columns and rate-on-rollup defined here apply equally to the distributed path; the wire
   protocol carries the aggregate as a stable string token so the column choice survives the
   enum order changing.
+
+## ADR-026: WAL Group Commit
+
+**Status**: Accepted (implemented)
+
+**Context**: `writeFrame` fsynced every frame while holding the global WAL mutex, so a
+`LogSamples`/`LogSeries` returned only after its own fsync and no two writers could
+fsync at once. WAL write throughput was therefore bounded by `1 / fsync_latency`
+*regardless of how many writers were active* — adding concurrency added contention, not
+throughput. This is the exact bottleneck the storage node hits: a worker pool drains
+many concurrent writers into the local TSDB (ADR-023), and they all serialized behind
+one fsync-under-lock. ADR-016 already flagged group commit as the intended fix.
+
+**Decision**: coalesce concurrently-submitted frames so one fsync acknowledges many,
+without changing the on-disk format or the durability contract. A single committer
+goroutine owns every segment write and fsync in group-commit mode.
+
+- **Submit (any writer).** `writeFrame` encodes the frame (CRC + length + padding —
+  pure computation, no lock), appends it to a FIFO queue under a small commit mutex,
+  signals the committer, and parks on a per-frame buffered channel. **No submitting
+  goroutine holds a lock across the fsync**, which is what lets them coalesce.
+- **Commit (one goroutine).** The committer drains the queue in FIFO order, writes
+  every frame to the active segment, fsyncs **once**, and signals every waiter. Every
+  frame submitted while the previous fsync was in flight rides the next single fsync, so
+  the effective batch size scales with concurrency. An optional `Linger` (default `0`)
+  delays the fsync to coalesce more frames per batch (Nagle-style) at a latency cost.
+- **Rotation owned by the committer.** Size-based rotation happens inside the batch
+  write, so a batch may span a segment boundary: the sealed segment is fsynced by the
+  seal, the new one by the batch fsync — every frame is durable. The committer holds the
+  segment mutex across its write+fsync, so a concurrent `Rotate` (the flush cut) or
+  `Close` can never swap or close the segment underneath an in-flight fsync. Because
+  ingest holds `db.mu` as a reader across its WAL append (ADR-016) and `Flush` takes it
+  as a writer, no ingest is ever in flight when the flush `Rotate` runs — the shared
+  mutex makes standalone use race-free too.
+- **Durability is identical.** A call still returns only after the fsync covering its
+  frame. A write/fsync error **fails the whole batch** — every waiter receives it —
+  matching the existing semantics where a failed synchronous fsync leaves the frame's
+  durability indeterminate (it may be on disk yet report an error). `Close` drains and
+  commits every queued frame, then stops the committer, so shutdown loses nothing and no
+  goroutine touches the segment after it is closed.
+- **Toggle and defaults.** `TSDBOptions.WALGroupCommit` / `WALCommitLinger`, surfaced as
+  `storage.wal_group_commit` / `storage.wal_commit_linger`, default **on with linger 0**
+  for the running services. The library-level `OpenWAL` and `DefaultTSDBOptions` stay
+  synchronous, so the default on-disk path — and every existing WAL/flush/crash test —
+  is byte-for-byte unchanged; group commit is exercised by its own tests.
+
+**Consequences**: under concurrent writers the WAL fsyncs far fewer times. Measured on
+this machine (Apple M5, APFS) by `BenchmarkWALConcurrentWrite`: at 8 concurrent writers
+group commit raises throughput ~4× (1→4 frames/fsync), at 64 writers ~30–37× (1→~32
+frames/fsync); a 200 µs linger takes it to ~7× and ~60–65× (1→8 and 1→~64 frames/fsync).
+The synchronous path is flat at ~1 fsync per frame because the fsyncs serialize. The
+trade-offs: one extra goroutine plus a channel handoff per write (negligible beside an
+fsync, but pure overhead for a *single* writer, which gets no coalescing — hence the
+conservative library default); group-commit errors are indeterminate exactly as a
+synchronous fsync error already is; and an in-flight `Flush` cut briefly waits on a
+committer fsync through the shared segment mutex. Durability and the frame format are
+unchanged: the crash/flush suite passes unmodified on the synchronous default, and new
+`-race` tests cover many-writer durability and ordering, a batch spanning a rotation,
+the whole-batch error path, and that one fsync covers many frames.

@@ -68,13 +68,41 @@ The live `meridian_downsampling_point_reduction` gauge reports this per resoluti
 Query-time selection runs in the single-binary `serve`; the cluster querier currently
 reads raw (ADR-011).
 
+## WAL Group Commit — fsync Coalescing Under Concurrency
+
+The WAL coalesces concurrently-submitted frames behind a single fsync (ADR-026).
+Measured by `BenchmarkWALConcurrentWrite` (`internal/storage`), which drives a fixed
+number of concurrent writers through `LogSamples` against a real on-disk segment and
+reports `frames/fsync` alongside `ns/op`:
+
+| Concurrent writers | Mode | frames/fsync | Throughput vs synchronous |
+|--------------------|------|-------------:|--------------------------:|
+| 8  | synchronous (off)        | 1.0   | 1× (baseline) |
+| 8  | group commit             | ~4.0  | ~4× |
+| 8  | group commit, 200 µs linger | ~8.0  | ~7× |
+| 64 | synchronous (off)        | 1.0   | 1× (baseline) |
+| 64 | group commit             | ~32   | ~30–37× |
+| 64 | group commit, 200 µs linger | ~64   | ~60–65× |
+
+The synchronous path is **flat in concurrency** — every frame pays its own fsync under
+the global lock, so 8 and 64 writers reach the same ceiling (~1 fsync per frame, bounded
+by `1 / fsync_latency`). Group commit instead coalesces every frame submitted while the
+prior fsync is in flight, so the batch size — and the speedup — **scale with the number
+of concurrent writers**: ~N frames share each fsync at N writers. A small `linger`
+(default 0) trades a little latency to push the batch size to the full writer count. The
+absolute fsync latency on this machine's APFS is ~3–4 ms (the synchronous ceiling); the
+multiples above are the structural result and are stable run-to-run even as that latency
+drifts with the filesystem and thermal state. Durability is unchanged — a write still
+returns only after the fsync covering its frame.
+
 ## Write Path, Query, Memory (characteristics, not micro-benchmarked)
 
 These paths have no repeatable benchmark in this repo, so rather than quote invented
 numbers, here are the cost characteristics and where to read the real signal live:
 
-- **Ingestion**: TCP JSON decode → bounded block-then-shed queue (ADR-023) → one WAL
-  fsync per frame → in-memory head append (with an inverted-index update). The live
+- **Ingestion**: TCP JSON decode → bounded block-then-shed queue (ADR-023) → WAL
+  append (group-commit fsync, ADR-026 — see below) → in-memory head append (with an
+  inverted-index update). The live
   rate is on `/api/v1/stats` (`ingestion_rate`, a windowed samples/sec — ADR-017) and
   the cumulative `meridian_samples_ingested_total` counter; `ingest_queue_depth`/
   `_capacity` and `meridian_dropped_samples_total` expose backpressure. The default

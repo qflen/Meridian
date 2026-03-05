@@ -10,6 +10,15 @@ storage:
   block_duration: "15m"
   retention: "15d"
   flush_interval: "30s"
+  # Coalesce concurrently-submitted WAL frames into a single fsync (ADR-026).
+  # Durability is unchanged — a write still returns only after its frame is fsynced —
+  # but concurrent writers share one fsync, raising ingest throughput. Set false for
+  # the legacy one-fsync-per-frame path.
+  wal_group_commit: true
+  # Optional Nagle-style delay before each batch fsync, to coalesce more frames per
+  # fsync at the cost of latency. "0" adds no latency and still coalesces in-flight
+  # arrivals. Try "1ms"–"5ms" only if fsync is a hard bottleneck under bursty load.
+  wal_commit_linger: "0s"
 
 cluster:
   enabled: false

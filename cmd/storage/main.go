@@ -34,6 +34,10 @@ func main() {
 		BlockDuration:   envDuration("STORAGE_BLOCK_DURATION", 2*time.Hour),
 		RetentionPeriod: envDuration("STORAGE_RETENTION", 15*24*time.Hour),
 		FlushInterval:   envDuration("STORAGE_FLUSH_INTERVAL", 1*time.Minute),
+		// Group commit coalesces concurrent WAL fsyncs; the write pool drains many
+		// concurrent writers into the TSDB, so this is the common case here (ADR-026).
+		WALGroupCommit:  envBool("STORAGE_WAL_GROUP_COMMIT", true),
+		WALCommitLinger: envDuration("STORAGE_WAL_COMMIT_LINGER", 0),
 	}
 
 	db, err := storage.Open(dataDir, opts)

@@ -45,11 +45,15 @@ flushed to a persistent block.
 
 **Write-Ahead Log** (`internal/storage/wal.go`): CRC32-framed WAL with 8-byte
 aligned entries and automatic segment rotation at 128 MB. Every write is fsynced
-before acknowledgment. Recovery is resilient to corruption: a bad length field or
-CRC mismatch re-anchors at the next 8-byte frame boundary and keeps scanning, so
-one corrupt frame no longer discards the rest of a segment. Replay can start past
-a given segment so that data already captured in a durable block is not replayed
-again (see below).
+before acknowledgment. Under **group commit** (default on, ADR-026) a single
+committer goroutine coalesces concurrently-submitted frames behind one fsync — a
+write still returns only after the fsync covering its frame, so durability and the
+on-disk format are unchanged, but concurrent writers no longer serialize one fsync
+at a time. Recovery is resilient to corruption: a bad length field or CRC mismatch
+re-anchors at the next 8-byte frame boundary and keeps scanning, so one corrupt
+frame no longer discards the rest of a segment. Replay can start past a given
+segment so that data already captured in a durable block is not replayed again
+(see below).
 
 **Persistent Blocks** (`internal/storage/block.go`): Gorilla-compressed blocks
 with ULID-named directories. Each block contains a binary index file mapping
@@ -240,7 +244,8 @@ tier after the raw behind it is gone.
 ## Data Flow
 
 1. **Ingest**: Samples arrive via TCP → BatchWriter's bounded queue (block-then-shed
-   backpressure) → drain → WAL (fsync) → HeadBlock (in-order policy). The TCP server
+   backpressure) → drain → WAL (group-commit fsync, ADR-026) → HeadBlock (in-order
+   policy). The TCP server
    bounds message size, applies a per-message read deadline, and caps concurrent
    connections; a full queue sheds and NACKs the producer rather than growing memory
    (ADR-023).

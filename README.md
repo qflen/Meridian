@@ -61,9 +61,10 @@ dashboard's compression gauge.
 
 ### Storage Engine
 - **Gorilla compression**: delta-of-delta timestamps + XOR float encoding
-- **Write-ahead log**: CRC32-framed, 128 MB segment rotation, fsync per write;
-  corrupt frames resync to the next 8-byte boundary instead of discarding the rest
-  of the segment
+- **Write-ahead log**: CRC32-framed, 128 MB segment rotation, fsync before
+  acknowledgment with optional group commit (concurrent frames coalesced behind one
+  fsync, ADR-026); corrupt frames resync to the next 8-byte boundary instead of
+  discarding the rest of the segment
 - **Crash-consistent flush**: an atomic head-swap + WAL-rotate cut, a block written
   via temp-dir → fsync → atomic rename, and a per-block WAL low-water-mark so a crash
   mid-flush neither loses concurrently-ingested samples nor double-counts on replay

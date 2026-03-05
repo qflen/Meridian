@@ -16,8 +16,8 @@ import (
 
 // TSDBOptions configures the time-series database engine.
 type TSDBOptions struct {
-	WALDir          string
-	BlockDir        string
+	WALDir   string
+	BlockDir string
 	// RollupDir holds resolution-tagged rollup blocks (one subdirectory per
 	// resolution). Defaults to "<dataDir>/rollups". Rollup blocks are derived data,
 	// kept separate from raw blocks so each tier is loaded, queried, and expired
@@ -26,6 +26,15 @@ type TSDBOptions struct {
 	BlockDuration   time.Duration
 	RetentionPeriod time.Duration
 	FlushInterval   time.Duration
+	// WALGroupCommit enables WAL group commit: concurrently-submitted frames are
+	// coalesced into one fsync, raising ingest throughput under concurrency without
+	// weakening durability (an ingest still returns only after its frame is fsynced).
+	// See ADR-026.
+	WALGroupCommit bool
+	// WALCommitLinger optionally delays each group-commit fsync to coalesce more
+	// frames per batch (Nagle-style). Zero adds no latency and still coalesces frames
+	// that arrive while a prior fsync is in flight.
+	WALCommitLinger time.Duration
 	// RateWindow is the rolling window over which IngestionRate is averaged
 	// (default 5s). RateSampleInterval is how often the background sampler feeds the
 	// rate meter (default 1s). The cumulative counter behind IngestedTotal is
@@ -147,7 +156,10 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 		return nil, fmt.Errorf("create block dir: %w", err)
 	}
 
-	wal, err := OpenWAL(opts.WALDir)
+	wal, err := OpenWALWithOptions(opts.WALDir, WALOptions{
+		GroupCommit: opts.WALGroupCommit,
+		Linger:      opts.WALCommitLinger,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("open WAL: %w", err)
 	}

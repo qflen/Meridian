@@ -123,6 +123,15 @@ type StorageConfig struct {
 	BlockDuration Duration `yaml:"block_duration"`
 	Retention     Duration `yaml:"retention"`
 	FlushInterval Duration `yaml:"flush_interval"`
+	// WALGroupCommit coalesces concurrently-submitted WAL frames into a single fsync,
+	// raising ingest throughput under concurrent writers without weakening durability
+	// (a write still returns only after the fsync covering its frame). Default on; set
+	// false to force the legacy one-fsync-per-frame path. See ADR-026.
+	WALGroupCommit bool `yaml:"wal_group_commit"`
+	// WALCommitLinger optionally delays each group-commit fsync to coalesce more
+	// frames per batch (Nagle-style). Default 0 — no added latency, while still
+	// coalescing frames that arrive during an in-flight fsync.
+	WALCommitLinger Duration `yaml:"wal_commit_linger"`
 }
 
 // ClusterConfig holds cluster membership and replication settings.
@@ -370,11 +379,13 @@ func DefaultConfig() *Config {
 			QueryTimeout: Duration(30 * time.Second),
 		},
 		Storage: StorageConfig{
-			DataDir:       "./data",
-			WALDir:        "./data/wal",
-			BlockDuration: Duration(15 * time.Minute),
-			Retention:     Duration(15 * 24 * time.Hour),
-			FlushInterval: Duration(30 * time.Second),
+			DataDir:         "./data",
+			WALDir:          "./data/wal",
+			BlockDuration:   Duration(15 * time.Minute),
+			Retention:       Duration(15 * 24 * time.Hour),
+			FlushInterval:   Duration(30 * time.Second),
+			WALGroupCommit:  true,
+			WALCommitLinger: 0,
 		},
 		Cluster: ClusterConfig{
 			Enabled:           false,

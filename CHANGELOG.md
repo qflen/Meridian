@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Storage & durability
+- WAL group commit: a single committer goroutine coalesces concurrently-submitted
+  frames behind one fsync, so a write still returns only after its own frame is
+  durable while concurrent writers stop serializing one fsync at a time — measured
+  ~30–37× WAL write throughput at 64 concurrent writers and ~4× at 8 (ADR-026).
+  Default on with zero linger; the on-disk frame format is byte-for-byte unchanged
+  and the synchronous path remains available (`storage.wal_group_commit`).
+
 ## v0.2.0 — 2026-06-18
 
 Meridian as it stands at this release: a distributed time-series database in Go

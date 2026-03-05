@@ -14,12 +14,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
 	walSegmentMaxSize = 128 * 1024 * 1024 // 128 MB
-	walFrameHeader    = 8                  // 4 bytes CRC + 4 bytes length
-	walAlignment      = 8                  // pad frames to 8-byte boundary
+	walFrameHeader    = 8                 // 4 bytes CRC + 4 bytes length
+	walAlignment      = 8                 // pad frames to 8-byte boundary
 
 	// WAL entry type markers.
 	walEntrySeries  byte = 0x01
@@ -41,21 +43,89 @@ type WALHandler interface {
 
 // WAL is an append-only write-ahead log with CRC32-framed entries.
 type WAL struct {
+	// mu guards the open segment and its bookkeeping (segment, segmentSize,
+	// segmentSeq). In group-commit mode it is held by the committer goroutine across
+	// its batch write + fsync and by control operations (Rotate/Truncate/Close/Size);
+	// submitting goroutines never take it, so an fsync never serializes writers.
 	mu  sync.Mutex
 	dir string
 
 	segment     *os.File
 	segmentSize int64
 	segmentSeq  int
+	// segmentMaxSize is the byte threshold at which the active segment is rotated.
+	// It defaults to walSegmentMaxSize (128 MB); only the rotation decision reads it,
+	// the replay corruption bound stays pinned to the const.
+	segmentMaxSize int64
+
+	// fsyncs counts commit fsyncs: one per synchronous frame, one per coalesced
+	// batch. Tests and benchmarks read it to prove a batch fsync covers many frames.
+	fsyncs atomic.Uint64
+
+	// Group commit. When groupCommit is false the WAL keeps its original synchronous
+	// path — each frame is written and fsynced under mu before the call returns. When
+	// true, frames are encoded by the caller, handed to the committer goroutine, and
+	// coalesced into one fsync per batch; a submitting call returns only once the
+	// fsync covering its frame has completed. Durability is identical either way.
+	groupCommit bool
+	linger      time.Duration
+
+	commitMu      sync.Mutex    // guards pending + closing
+	commitCond    *sync.Cond    // signals the committer that work or shutdown is ready
+	pending       []*walCommit  // FIFO queue of frames awaiting a commit
+	closing       bool          // set by Close to drain and stop the committer
+	committerDone chan struct{} // closed when the committer goroutine has exited
 }
 
-// OpenWAL opens or creates a WAL in the given directory.
+// walCommit is one frame awaiting a group commit. done receives the batch result
+// (nil, or the write/fsync error that failed the whole batch) once the fsync that
+// covers this frame completes. It is buffered so the committer never blocks while
+// signalling a waiter.
+type walCommit struct {
+	frame []byte
+	done  chan error
+}
+
+// WALOptions configures optional WAL behaviors.
+type WALOptions struct {
+	// GroupCommit coalesces concurrently-submitted frames so a single fsync
+	// acknowledges many writes. Durability is unchanged: a LogSamples/LogSeries still
+	// returns only after the fsync covering its frame. When false (the default) each
+	// frame is fsynced individually, preserving the original on-disk path byte-for-byte.
+	GroupCommit bool
+	// Linger is how long the committer waits to accumulate more frames before it seals
+	// and fsyncs a batch. Zero (the default) fsyncs as soon as the committer is
+	// scheduled — it still coalesces every frame that arrived while the prior fsync was
+	// in flight (the dominant win under concurrency) while adding no latency when idle.
+	Linger time.Duration
+	// SegmentMaxSize overrides the segment rotation threshold in bytes. Zero uses the
+	// default (walSegmentMaxSize, 128 MB). Primarily a testing seam for exercising
+	// rotation without writing 128 MB.
+	SegmentMaxSize int64
+}
+
+// OpenWAL opens or creates a WAL in the given directory with default options
+// (synchronous commit — one fsync per frame).
 func OpenWAL(dir string) (*WAL, error) {
+	return OpenWALWithOptions(dir, WALOptions{})
+}
+
+// OpenWALWithOptions opens or creates a WAL with the given options. With
+// GroupCommit set it starts a background committer goroutine that Close stops.
+func OpenWALWithOptions(dir string, opts WALOptions) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create WAL dir: %w", err)
 	}
 
-	w := &WAL{dir: dir}
+	w := &WAL{
+		dir:            dir,
+		groupCommit:    opts.GroupCommit,
+		linger:         opts.Linger,
+		segmentMaxSize: opts.SegmentMaxSize,
+	}
+	if w.segmentMaxSize <= 0 {
+		w.segmentMaxSize = walSegmentMaxSize
+	}
 	// Find the highest existing segment number
 	segs, err := w.listSegments()
 	if err != nil {
@@ -67,6 +137,14 @@ func OpenWAL(dir string) (*WAL, error) {
 
 	if err := w.rotateSegment(); err != nil {
 		return nil, err
+	}
+
+	// Start the committer only in group-commit mode; the synchronous path spawns no
+	// goroutine, so the default WAL behaves exactly as before.
+	if w.groupCommit {
+		w.commitCond = sync.NewCond(&w.commitMu)
+		w.committerDone = make(chan struct{})
+		go w.committerLoop()
 	}
 
 	return w, nil
@@ -251,9 +329,20 @@ func (w *WAL) Truncate() error {
 	return errors.Join(errs...)
 }
 
-// Close flushes and closes the WAL. Sync and Close errors are aggregated, and the
-// segment is always closed (even if Sync fails) so the file descriptor never leaks.
+// Close flushes and closes the WAL. In group-commit mode it first tells the
+// committer to drain every queued frame and stop, and waits for it to exit, so no
+// queued frame is lost and no goroutine touches the segment after it is closed. Sync
+// and Close errors are aggregated, and the segment is always closed (even if Sync
+// fails) so the file descriptor never leaks. Close is idempotent.
 func (w *WAL) Close() error {
+	if w.groupCommit {
+		w.commitMu.Lock()
+		w.closing = true
+		w.commitCond.Signal()
+		w.commitMu.Unlock()
+		<-w.committerDone // committer has drained all pending frames and fsynced them
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -285,14 +374,20 @@ func (w *WAL) Size() int64 {
 }
 
 func (w *WAL) writeFrame(payload []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if w.segment == nil {
-		return fmt.Errorf("WAL: no open segment")
+	frame := encodeFrame(payload)
+	if w.groupCommit {
+		return w.submitFrame(frame)
 	}
 
-	// Frame: CRC32(4) + Length(4) + Payload + Padding
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeFrameLocked(frame)
+}
+
+// encodeFrame builds an on-disk frame: CRC32(4) + Length(4) + Payload + zero padding
+// to the next 8-byte boundary. The byte layout is identical in both commit modes, so
+// the on-disk format never depends on whether group commit is enabled.
+func encodeFrame(payload []byte) []byte {
 	frameLen := walFrameHeader + len(payload)
 	padded := (frameLen + walAlignment - 1) / walAlignment * walAlignment
 	frame := make([]byte, padded)
@@ -301,8 +396,18 @@ func (w *WAL) writeFrame(payload []byte) error {
 	binary.LittleEndian.PutUint32(frame[0:4], checksum)
 	binary.LittleEndian.PutUint32(frame[4:8], uint32(len(payload)))
 	copy(frame[walFrameHeader:], payload)
+	return frame
+}
 
-	if w.segmentSize+int64(len(frame)) > walSegmentMaxSize {
+// writeFrameLocked appends one already-encoded frame to the current segment,
+// rotating first if it would overflow the segment, and fsyncs it. The caller holds
+// w.mu. This is the synchronous (group-commit-disabled) commit path.
+func (w *WAL) writeFrameLocked(frame []byte) error {
+	if w.segment == nil {
+		return fmt.Errorf("WAL: no open segment")
+	}
+
+	if w.segmentSize+int64(len(frame)) > w.segmentMaxSize {
 		if err := w.rotateSegmentLocked(); err != nil {
 			return err
 		}
@@ -317,6 +422,101 @@ func (w *WAL) writeFrame(payload []byte) error {
 	if err := w.segment.Sync(); err != nil {
 		return fmt.Errorf("WAL sync: %w", err)
 	}
+	w.fsyncs.Add(1)
+	return nil
+}
+
+// submitFrame hands an encoded frame to the committer and blocks until the fsync
+// that covers it completes. It is the group-commit submission path; many goroutines
+// call it concurrently and are coalesced by the committer into a single fsync. No
+// lock is held while waiting, so submitters never serialize on each other's fsync.
+func (w *WAL) submitFrame(frame []byte) error {
+	c := &walCommit{frame: frame, done: make(chan error, 1)}
+
+	w.commitMu.Lock()
+	if w.closing {
+		// The committer is draining for shutdown; refuse rather than enqueue a frame
+		// that might never be committed (which would block the caller forever).
+		w.commitMu.Unlock()
+		return fmt.Errorf("WAL: closed")
+	}
+	w.pending = append(w.pending, c)
+	w.commitCond.Signal()
+	w.commitMu.Unlock()
+
+	return <-c.done
+}
+
+// committerLoop is the single group-commit committer. It owns every segment write
+// and rotation in group-commit mode: it drains the pending queue in FIFO order,
+// writes the frames, fsyncs once, and signals every waiter in the batch. One fsync
+// thus acknowledges every frame submitted while the previous fsync was in flight.
+func (w *WAL) committerLoop() {
+	defer close(w.committerDone)
+	for {
+		w.commitMu.Lock()
+		for len(w.pending) == 0 && !w.closing {
+			w.commitCond.Wait()
+		}
+		if len(w.pending) == 0 {
+			// Woken only to shut down, with nothing left to drain.
+			w.commitMu.Unlock()
+			return
+		}
+		closing := w.closing
+		w.commitMu.Unlock()
+
+		// Optional linger lets more frames coalesce into this batch. Skip it while
+		// shutting down so Close drains promptly.
+		if w.linger > 0 && !closing {
+			time.Sleep(w.linger)
+		}
+
+		w.commitMu.Lock()
+		batch := w.pending
+		w.pending = nil
+		w.commitMu.Unlock()
+
+		err := w.commitBatch(batch)
+		for _, c := range batch {
+			c.done <- err
+		}
+	}
+}
+
+// commitBatch writes every frame in the batch to the current segment — rotating
+// mid-batch if a frame would overflow the segment — and fsyncs once. It holds w.mu
+// across the write+fsync so a concurrent Rotate/Truncate/Close can never swap or
+// close the segment underneath an in-flight fsync; submitting goroutines hold no
+// lock here, so the fsync never serializes writers. Any write/fsync error fails the
+// whole batch and every waiter receives it. (Frames already sealed by a mid-batch
+// rotation may still be durable — an errored commit is indeterminate, exactly as a
+// failed synchronous fsync is.)
+func (w *WAL) commitBatch(batch []*walCommit) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.segment == nil {
+		return fmt.Errorf("WAL: no open segment")
+	}
+
+	for _, c := range batch {
+		if w.segmentSize+int64(len(c.frame)) > w.segmentMaxSize {
+			if err := w.rotateSegmentLocked(); err != nil {
+				return err
+			}
+		}
+		n, err := w.segment.Write(c.frame)
+		if err != nil {
+			return fmt.Errorf("WAL write: %w", err)
+		}
+		w.segmentSize += int64(n)
+	}
+
+	if err := w.segment.Sync(); err != nil {
+		return fmt.Errorf("WAL sync: %w", err)
+	}
+	w.fsyncs.Add(1)
 	return nil
 }
 

@@ -40,11 +40,18 @@ func main() {
 	// Bound in-flight writes: a worker pool drains a bounded queue to the quorum
 	// Write, so a stalled replica backpressures (then sheds → 429) the producer
 	// instead of piling up unbounded concurrent writes. See ADR-023.
+	// Optional per-series fair-share / priority-class shedding (ADR-027), configured by
+	// env; nil (the default) leaves the queue's uniform block-then-shed in place.
+	adm := config.AdmissionFromEnv("INGEST")
+	if err := adm.Validate(); err != nil {
+		log.Fatalf("invalid admission config: %v", err)
+	}
 	pool := service.NewWritePool(sc, service.PoolOptions{
 		Capacity:      envInt("INGEST_QUEUE_CAPACITY", 50000),
 		HighWatermark: envInt("INGEST_QUEUE_HIGH_WATERMARK", 40000),
 		BlockDeadline: envDuration("INGEST_BLOCK_DEADLINE", 250*time.Millisecond),
 		Workers:       envInt("MAX_CONCURRENT_WRITES", 64),
+		Admission:     adm.Shaper(),
 	})
 	defer pool.Close()
 
@@ -125,6 +132,7 @@ func (s *ingestorServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	server.WriteServiceMetrics(w, s.nodeID, "ingestor", time.Since(s.startTime))
 	if s.pool != nil {
 		server.WriteQueueMetrics(w, s.nodeID, "ingestor", s.pool.Stats())
+		server.WriteAdmissionMetrics(w, s.nodeID, "ingestor", s.pool.AdmissionStats())
 	}
 }
 

@@ -194,6 +194,21 @@ func (q *Queue[T]) shed(cost int) {
 	q.shedEvents++
 }
 
+// RecordShed folds a shed of cost samples that was decided *before* the queue — by an
+// upstream admission Shaper (ADR-027) — into the queue's grand-total drop counter, so
+// meridian_dropped_samples_total stays the authoritative total across both the uniform
+// queue shed and priority/fair-share admission. It accounts samples only (it does not
+// touch the buffer or the per-Enqueue shedEvents tally, which counts enqueue attempts);
+// the dimensional breakdown by class/series lives in the Shaper.
+func (q *Queue[T]) RecordShed(cost int) {
+	if cost < 1 {
+		cost = 1
+	}
+	q.mu.Lock()
+	q.dropped += int64(cost)
+	q.mu.Unlock()
+}
+
 // grow doubles the ring buffer, re-linearising items from head; callers hold mu.
 func (q *Queue[T]) grow() {
 	n := len(q.buf)

@@ -100,13 +100,21 @@ returns only after the fsync covering its frame.
 These paths have no repeatable benchmark in this repo, so rather than quote invented
 numbers, here are the cost characteristics and where to read the real signal live:
 
-- **Ingestion**: TCP JSON decode → bounded block-then-shed queue (ADR-023) → WAL
+- **Ingestion**: TCP JSON decode → (optional per-series/priority admission, ADR-027) →
+  bounded block-then-shed queue (ADR-023) → WAL
   append (group-commit fsync, ADR-026 — see below) → in-memory head append (with an
   inverted-index update). The live
   rate is on `/api/v1/stats` (`ingestion_rate`, a windowed samples/sec — ADR-017) and
   the cumulative `meridian_samples_ingested_total` counter; `ingest_queue_depth`/
   `_capacity` and `meridian_dropped_samples_total` expose backpressure. The default
   simulator (8 hosts × ~43 series at a 5 s cadence) is a light, steady load.
+- **Admission shaping** (when enabled, ADR-027): one classify (a short scan over the
+  configured classes) plus an allocation-free order-independent hash of the series
+  identity per offered series, and — only above the contention threshold — one
+  sharded token-bucket consult. State is O(shards + metric-buckets), fixed at
+  construction, so cost and memory are independent of series cardinality. Off by
+  default, it adds nothing to the hot path; the selectivity it buys is visible in the
+  `meridian_admission_*` counters.
 - **Query**: cost scales with the number of series matched (inverted-index
   intersection) × steps — each leaf selector is fetched once over the whole range and
   sliced per step (ADR-014) — plus the block scan/merge. Per-query latency is recorded

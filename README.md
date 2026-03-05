@@ -121,9 +121,18 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   producer is NACKed: **HTTP 429 + `Retry-After`**, or a clear NACK on the raw-TCP
   path. A stalled replica (quorum write) or slow WAL fsync propagates backpressure
   upstream rather than OOMing, and a counted drop beats a silent OOM. (ADR-023.)
+- **Per-series fair-share & priority shedding** (opt-in): an admission shaper in front
+  of the queue sheds by **priority class** (a label or `__name__` match → a capacity
+  ceiling, so low priority sheds before high) and **per-series token-bucket fair share**
+  (a hot/high-cardinality series is throttled instead of starving well-behaved ones).
+  Both engage only under contention; per-series state is bounded (sharded), so a
+  cardinality flood can't grow it. Order within a series is preserved; off by default,
+  leaving ADR-023's uniform shedding as the fallback. (ADR-027.)
 - **Observable**: `meridian_dropped_samples_total`, ingest queue depth/capacity, and
   shed/backpressure-event counters on `/metrics`; queue depth + a derived drop rate on
-  `/api/v1/stats` and the dashboard load view, which the simulator's spikes drive.
+  `/api/v1/stats` and the dashboard load view, which the simulator's spikes drive. When
+  admission is enabled, `meridian_admission_*` adds admitted/dropped-by-class and
+  dropped-by-reason (priority vs fair-share) counters.
 
 ### Streaming anomaly detection
 - **Per-series online detector**: single-pass and O(1) state per series, run inline
@@ -163,7 +172,9 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   query-latency histogram); the gateway also reports connected WebSocket clients;
   every ingest-bounding node exposes the flow-control families
   (`meridian_dropped_samples_total`, ingest queue depth/capacity/high-water,
-  shed/backpressure-event counters — ADR-023); the monolith and gateway, where the
+  shed/backpressure-event counters — ADR-023, plus the `meridian_admission_*`
+  by-class/by-reason families when per-series/priority shedding is enabled — ADR-027);
+  the monolith and gateway, where the
   anomaly detector runs, also expose `meridian_anomalies_total` and
   `meridian_active_anomalies` (ADR-024); and every service exposes `meridian_up` and
   uptime. (ADR-019.)
@@ -292,6 +303,14 @@ ingestion:                # write-path backpressure (ADR-023)
   queue_high_watermark: 40000   # depth at which producers are flagged to throttle
   block_deadline:       "250ms" # how long a full queue blocks before shedding
   max_concurrent_writes: 64     # drain worker-pool size (ingestor/storage)
+  admission:                    # per-series/priority shedding (ADR-027); off by default
+    enabled:            false
+    contention_fraction: 0.8    # depth/capacity at which fair share engages
+    fair_share_rate:    2000    # per-series token refill (samples/sec); 0 = priority only
+    fair_share_burst:   4000    # per-series burst (samples)
+    classes:                    # priority bands, highest first; ceiling = capacity fraction
+      - { name: high,    label: priority, value: high, ceiling: 1.0 }
+      - { name: default,                               ceiling: 0.6 }
 anomaly:                  # streaming anomaly detection (ADR-024)
   enabled:    true        # toggle the detector on the live path
   threshold:  3.5         # local z-score above which a sample is out-of-band
@@ -330,7 +349,7 @@ internal/
   storage/          WAL, head block, persistent blocks, TSDB
   query/            Lexer, parser, planner, executor
   ingestion/        TCP server, batch writer
-  backpressure/     Bounded block-then-shed ingest queue (flow control)
+  backpressure/     Bounded block-then-shed ingest queue + per-series/priority admission
   anomaly/          Streaming per-series EWMA anomaly detector
   server/           HTTP API, WebSocket hub, /metrics exporter
   cluster/          Hash ring, coordinator, node lifecycle
@@ -349,7 +368,8 @@ ingestion, rAF batching for WebSocket, the out-of-order sample policy, the
 crash-consistent flush model, the windowed ingestion-rate vs cumulative counter, the
 CORS policy, cluster-wide `/metrics`, the replication consistency model (quorum
 writes/reads + read-repair), the write-path backpressure model (bounded queues with
-block-then-shed load shedding), the streaming anomaly detector (EWMA baseline +
+block-then-shed load shedding, plus per-series fair-share / priority admission), the
+streaming anomaly detector (EWMA baseline +
 dispersion, robust to a moving diurnal baseline), and more.
 
 ## Development

@@ -723,7 +723,8 @@ wiring.
 **Deferred (honest scope)**:
 - **Per-series / priority shedding**: past the cap all series are shed equally;
   there is no per-series fairness, priority class, or token-bucket rate limit
-  (cardinality control is noted as future work in the roadmap).
+  (cardinality control is noted as future work in the roadmap). This is delivered
+  in **ADR-027**.
 - **Adaptive control**: the block deadline and capacity are static, not an
   AIMD/aware-of-latency controller; there is no spill-to-disk overflow.
 - **Storage parallelism**: the storage pool's workers serialize on the TSDB write
@@ -986,3 +987,112 @@ committer fsync through the shared segment mutex. Durability and the frame forma
 unchanged: the crash/flush suite passes unmodified on the synchronous default, and new
 `-race` tests cover many-writer durability and ordering, a batch spanning a rotation,
 the whole-batch error path, and that one fsync covers many frames.
+
+## ADR-027: Per-Series Fair-Share and Priority-Class Load Shedding
+
+**Status**: Accepted
+**Context**: The write-path backpressure of ADR-023 bounds memory by shedding past
+a cap, but it sheds **uniformly**: whatever arrives next when the queue is full is
+dropped, regardless of which series it belongs to or how important it is. Two
+failure modes follow. First, a single hot or high-cardinality series — a runaway
+exporter, a label explosion, a misbehaving client — fills the queue with its own
+samples and the *collateral* drops fall on well-behaved series that happen to
+arrive during the squeeze; the noisy neighbour starves the quiet ones. Second,
+there is no way to protect critical telemetry (a heartbeat, an SLO metric) from
+being shed alongside bulk debug data when the node is overloaded. Uniform shedding
+spends the scarce queue on whatever shows up rather than on the traffic that
+matters. ADR-023 named both gaps as deferred. The constraint from ADR-015 is that
+order **within** a single series must be preserved (the in-order head depends on
+it), so any fairness scheme must act *across* series only.
+**Decision**: Add an **admission shaper** (`internal/backpressure.Shaper`) that is
+consulted **before** the bounded queue on every ingest path. It does not hold
+samples and is not the memory bound — the queue's capacity remains the hard cap
+(depth ≤ capacity always); the shaper only decides *what to offer the queue*, so
+under overload the cap is spent on high-priority and in-budget series and the shed
+victims are the lowest-priority and most-over-budget ones. The whole layer is
+**opt-in and off by default**: with no shaper the paths behave exactly as ADR-023,
+and uniform block-then-shed is the fallback whenever priority/fairness can't be
+exploited (e.g. all-equal traffic with no single hot series).
+
+- **Two gates, both engaged only under load.** There is no reason to be selective
+  while the queue has room, so both gates are inert below their thresholds and only
+  bite as the queue fills:
+  - **Priority bands.** Each series is classified into a configured priority class
+    by a label match (or the `__name__` metric-name pseudo-label); the catch-all
+    default class holds the rest. A class may occupy at most its **Ceiling**
+    fraction of the capacity — so a low-priority class is shed once resident depth
+    passes, say, 40% while a high class keeps being admitted to 100%. Reserving the
+    top band for higher classes sheds low priority first and protects high priority
+    until the queue is genuinely full. Classes are a small configured set, so the
+    `class` metric label is bounded-cardinality.
+  - **Per-series fair share.** Above a **contention threshold** (a depth/capacity
+    fraction) each series is metered by a **token bucket** (rate + burst); a series
+    that has burned its tokens is shed while series still in budget pass. This
+    contains a flood to the offending series instead of charging its cost to
+    everyone.
+- **Bounded memory by construction.** A naïve per-series map would let a
+  high-cardinality flood — the very thing being defended against — grow the
+  tracking state without bound. Instead the token buckets are a **fixed-size array
+  of shards** indexed by a hash of the series identity, and the per-series shed
+  *metrics* are a second, smaller fixed array of hash buckets. Footprint is O(shards
+  + metric-buckets) regardless of how many distinct series arrive. The trade-off is
+  hash collisions: two series in one shard share a token budget (mild unfairness),
+  but with thousands of shards a *hot* series almost always owns its shard and is
+  metered there. The series hash is an order-independent FNV-1a over name + label
+  set, computed without allocating an intermediate key string.
+- **Wired into both shed points, additively.** The monolith `BatchWriter` filters
+  samples per-series at `Add`/`AddBatch` before they are buffered; the service
+  `WritePool` filters a request's series at `Submit` before enqueuing the survivors
+  (so a multi-series request is trimmed to its admitted series, and an all-shed
+  request returns `ErrShed` → 429 / NACK). In both, admission acts per-series even
+  though a batch or request mixes series. Fairness is across series; FIFO order
+  within a series is untouched, so ADR-015's in-order guarantee holds.
+- **One authoritative drop total, plus a breakdown.** An admission drop is folded
+  into the queue's grand-total counter via `Queue.RecordShed`, so
+  `meridian_dropped_samples_total` stays the authoritative cumulative drop count
+  across both uniform and selective shedding (conservation `enqueued + dropped =
+  offered` still holds at the queue). The shaper additionally attributes drops by
+  **class**, **reason** (priority band vs fair-share budget), and **series-hash
+  bucket**, exposed as `meridian_admission_admitted_samples_total{class}`,
+  `meridian_admission_dropped_samples_total{class,reason}`, and
+  `meridian_admission_series_bucket_dropped_total{bucket}` (all cumulative,
+  Prometheus-correct), plus admitted/dropped totals on `/api/v1/stats`.
+- **Config.** `ingestion.admission` (YAML, monolith) configures the enable flag,
+  contention fraction, fair-share rate/burst, bounded shard/metric-bucket counts,
+  and the priority classes (each a name, a label/value or `__name__` match, and a
+  ceiling), validated at load (fractions and ceilings in range, unique class names,
+  at most one catch-all, and a guard that an enabled layer configures *something*).
+  The env-configured ingestor/storage services build the same config from
+  `<PREFIX>_ADMISSION_*` variables (fair-share knobs plus one optional high class).
+
+**Consequences**: under overload a hot or high-cardinality series is throttled to
+its token budget and can no longer starve well-behaved series, and a high-priority
+class is protected until the queue is genuinely full — the scarce queue is spent on
+the traffic that matters rather than on whatever arrives next. Memory stays bounded
+by the queue capacity exactly as before, and the shaper's own state is bounded
+independent of cardinality. With the layer disabled (the default) every path is
+byte-for-byte ADR-023, and uniform shedding remains the fallback when there is no
+priority or fairness signal to exploit. Verified by tests across the stack, all
+under `-race`: the shaper's priority ordering (low shed before high at a fixed
+depth), token-bucket fairness and refill, bounded memory under a 100k-distinct-key
+flood, and order-independent hashing; end-to-end on the BatchWriter (low sheds
+while high fills to capacity; one flooding series throttled while a well-behaved
+series is fully delivered) and on the WritePool (a low-priority series trimmed from
+a mixed request, all-shed → `ErrShed`, a flood throttled while a quiet series is
+never shed); the config validation; and the metric families.
+
+**Deferred (honest scope)**:
+- **Shard collisions are not resolved.** Two hot series hashing to the same shard
+  share a fair-share budget; the defence degrades gracefully (more shards make it
+  rarer) but there is no per-series exactness, by design — that is the price of
+  bounded memory.
+- **Fixed token rate.** The fair-share rate/burst are static configuration, not
+  derived from the live drain/service rate; an adaptive per-series rate (and the
+  AIMD controller deferred by ADR-023) remain future work.
+- **Whole-request priority on the wire.** The protocol carries no explicit priority
+  field; class is inferred from labels/name at the node. A producer cannot assert a
+  priority the labels don't already encode.
+- **Residual capacity drops are unattributed.** Once admission has shed the
+  low-priority and over-budget traffic, any remaining hard-capacity block-then-shed
+  drop (rare under the new policy) is counted in the grand total but not broken down
+  by class — the breakdown covers the admission-stage decisions.

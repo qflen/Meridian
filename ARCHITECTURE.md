@@ -121,6 +121,19 @@ cost-bounded, block-then-shed FIFO behind every ingest path. The cost is a sampl
 count, so queue depth is a memory bound (depth ≤ capacity); `Enqueue` blocks up to a
 deadline when full, then sheds.
 
+**Admission shaper** (`internal/backpressure/admission.go`): an optional, off-by-default
+layer consulted *before* the queue that makes shedding selective instead of uniform
+(ADR-027). It sheds by **priority class** (a label or `__name__` match → a capacity
+ceiling, so low priority sheds before high) and **per-series token-bucket fair share**
+(a hot/high-cardinality series is throttled rather than starving well-behaved ones).
+Both gates engage only under contention; per-series token buckets live in a fixed-size
+shard array, so a cardinality flood cannot grow the tracking state. It holds no samples
+— the queue capacity is still the hard memory bound — and an admission drop is folded
+into `meridian_dropped_samples_total` while also being attributed by class, reason, and
+series-hash bucket. The monolith `BatchWriter` and the service `WritePool` both apply it
+per-series (a multi-series batch/request is filtered, not classified as a whole), and
+order within a series is preserved.
+
 **Service write pool** (`internal/service/pool.go`): the ingestor and storage node
 bound in-flight writes with a fixed worker pool draining a bounded queue. `Submit`
 blocks while the queue is full and sheds past the deadline (`ErrShed` → HTTP 429 +
@@ -155,7 +168,12 @@ is kept distinct from the windowed ingestion rate reported on `/api/v1/stats`
 exports the write-path flow-control families via `WriteQueueMetrics`:
 `meridian_dropped_samples_total`, `meridian_ingest_shed_events_total`, and
 `meridian_ingest_backpressure_events_total` (cumulative counters), plus
-`meridian_ingest_queue_depth`/`_capacity`/`_high_watermark` (gauges) — ADR-023. The
+`meridian_ingest_queue_depth`/`_capacity`/`_high_watermark` (gauges) — ADR-023. When
+per-series/priority admission is enabled, `WriteAdmissionMetrics` adds the
+`meridian_admission_admitted_samples_total{class}`,
+`meridian_admission_dropped_samples_total{class,reason}`, and
+`meridian_admission_series_bucket_dropped_total{bucket}` families (ADR-027); they are
+omitted entirely when it is off, so the default scrape is unchanged. The
 monolith and the gateway, where the anomaly detector runs, additionally export
 `meridian_anomalies_total` (counter) and `meridian_active_anomalies` (gauge) via
 `WriteAnomalyMetrics` (ADR-024).
@@ -243,12 +261,13 @@ tier after the raw behind it is gone.
 
 ## Data Flow
 
-1. **Ingest**: Samples arrive via TCP → BatchWriter's bounded queue (block-then-shed
-   backpressure) → drain → WAL (group-commit fsync, ADR-026) → HeadBlock (in-order
-   policy). The TCP server
+1. **Ingest**: Samples arrive via TCP → (optional per-series/priority admission shaper,
+   ADR-027) → BatchWriter's bounded queue (block-then-shed backpressure) → drain → WAL
+   (group-commit fsync, ADR-026) → HeadBlock (in-order policy). The TCP server
    bounds message size, applies a per-message read deadline, and caps concurrent
    connections; a full queue sheds and NACKs the producer rather than growing memory
-   (ADR-023).
+   (ADR-023), and when admission is enabled the shed victims are chosen by lowest
+   priority / most over-budget series rather than uniformly.
 2. **Flush**: Head swap + WAL rotate (cut) → Gorilla-compressed block written via
    temp-dir + fsync + atomic rename → covered WAL segments reclaimed.
 3. **Query**: Parser → Planner (also selects a rollup resolution from the span/step)

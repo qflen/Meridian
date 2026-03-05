@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Write path & flow control
+- Per-series fair-share / priority-class load shedding (ADR-027): an opt-in admission
+  shaper in front of the bounded ingest queue makes overload shedding selective
+  instead of uniform. Priority bands (a label or `__name__` match → a capacity
+  ceiling) shed low priority before high; per-series token buckets throttle a hot or
+  high-cardinality series so it can't starve well-behaved ones. Both engage only under
+  contention, per-series state is bounded (sharded — a cardinality flood can't grow
+  it), and order within a series is preserved. Wired into the monolith BatchWriter and
+  the service WritePool; drops fold into `meridian_dropped_samples_total` and are
+  broken down by class/reason/series-bucket via `meridian_admission_*`. Off by default
+  (`ingestion.admission`), leaving ADR-023's uniform shedding as the fallback.
+
 ### Storage & durability
 - WAL group commit: a single committer goroutine coalesces concurrently-submitted
   frames behind one fsync, so a write still returns only after its own frame is

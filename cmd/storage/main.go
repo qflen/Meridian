@@ -48,11 +48,18 @@ func main() {
 	// Bound the accept queue: a worker pool drains writes into the local TSDB, so a
 	// node whose WAL fsync is the bottleneck backpressures (then sheds → 429) and
 	// pushes flow control upstream to the ingestor/quorum layer. See ADR-023.
+	// Optional per-series fair-share / priority-class shedding (ADR-027), configured by
+	// env; nil (the default) leaves the queue's uniform block-then-shed in place.
+	adm := config.AdmissionFromEnv("STORAGE")
+	if err := adm.Validate(); err != nil {
+		log.Fatalf("invalid admission config: %v", err)
+	}
 	pool := service.NewWritePool(localIngest{db: db}, service.PoolOptions{
 		Capacity:      envInt("STORAGE_QUEUE_CAPACITY", 50000),
 		HighWatermark: envInt("STORAGE_QUEUE_HIGH_WATERMARK", 40000),
 		BlockDeadline: envDuration("STORAGE_BLOCK_DEADLINE", 250*time.Millisecond),
 		Workers:       envInt("STORAGE_MAX_CONCURRENT_WRITES", 8),
+		Admission:     adm.Shaper(),
 	})
 	defer pool.Close()
 
@@ -145,6 +152,7 @@ func (s *storageServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	server.WriteServiceMetrics(w, s.nodeID, "storage", time.Since(s.startTime))
 	if s.pool != nil {
 		server.WriteQueueMetrics(w, s.nodeID, "storage", s.pool.Stats())
+		server.WriteAdmissionMetrics(w, s.nodeID, "storage", s.pool.AdmissionStats())
 	}
 }
 

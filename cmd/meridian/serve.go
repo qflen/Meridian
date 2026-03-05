@@ -105,6 +105,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		Capacity:      cfg.Ingestion.QueueCapacity,
 		HighWatermark: cfg.Ingestion.QueueHighWatermark,
 		BlockDeadline: cfg.Ingestion.BlockDeadline.Std(),
+		// Per-series fair-share / priority-class shedding (ADR-027); nil when disabled,
+		// leaving the queue's uniform block-then-shed as the only policy.
+		Admission: cfg.Ingestion.Admission.Shaper(),
 	})
 	if err := ingServer.Start(cfg.Server.GRPCAddr); err != nil {
 		return fmt.Errorf("start ingestion server: %w", err)
@@ -136,6 +139,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	httpServer.SetAllowedOrigins(cfg.Server.AllowedOrigins)
 	// Surface the ingest queue depth / capacity / drops on /metrics and /api/v1/stats.
 	httpServer.SetIngestStatsSource(ingServer.BatchWriter().QueueStats)
+	// Surface the per-series/priority admission counters too (ADR-027); a no-op for the
+	// scrape output when admission is disabled.
+	httpServer.SetAdmissionStatsSource(ingServer.BatchWriter().AdmissionStats)
 	if err := httpServer.Start(cfg.Server.HTTPAddr); err != nil {
 		return fmt.Errorf("start HTTP server: %w", err)
 	}

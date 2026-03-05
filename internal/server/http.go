@@ -33,11 +33,11 @@ const clusterProbeTimeout = 2 * time.Second
 
 // HTTPServer serves the REST API, dashboard, and WebSocket endpoints.
 type HTTPServer struct {
-	db         *storage.TSDB
-	engine     *query.Engine
-	wsHub      *WebSocketHub
-	mux        *http.ServeMux
-	httpServer *http.Server
+	db             *storage.TSDB
+	engine         *query.Engine
+	wsHub          *WebSocketHub
+	mux            *http.ServeMux
+	httpServer     *http.Server
 	startTime      time.Time
 	nodeID         string
 	peerAddrs      []string // HTTP addresses of cluster peers
@@ -48,6 +48,10 @@ type HTTPServer struct {
 	// /metrics and /api/v1/stats handlers. The ingestion server owns the queue, so
 	// the serve command wires this after constructing both.
 	ingestStats func() backpressure.Stats
+	// admissionStats, when set, supplies the per-series/priority admission snapshot
+	// (ADR-027) for /metrics and /api/v1/stats. Wired by the serve command alongside
+	// ingestStats when the admission layer is enabled.
+	admissionStats func() backpressure.ShaperStats
 	// anomalyDet, when set, is the streaming anomaly detector fed by the broadcast
 	// loop. It backs the /api/v1/anomalies endpoint and the anomaly metrics/stats.
 	anomalyDet *anomaly.Detector
@@ -87,11 +91,11 @@ func (lt *latencyTracker) record(d time.Duration) {
 // NewHTTPServer creates a new HTTP server.
 func NewHTTPServer(db *storage.TSDB, nodeID string, peerAddrs []string) *HTTPServer {
 	s := &HTTPServer{
-		db:        db,
-		engine:    query.NewEngine(db),
-		wsHub:     NewWebSocketHub(),
-		mux:       http.NewServeMux(),
-		startTime: time.Now(),
+		db:           db,
+		engine:       query.NewEngine(db),
+		wsHub:        NewWebSocketHub(),
+		mux:          http.NewServeMux(),
+		startTime:    time.Now(),
 		nodeID:       nodeID,
 		peerAddrs:    peerAddrs,
 		latency:      newLatencyTracker(),
@@ -120,6 +124,13 @@ func (s *HTTPServer) SetAllowedOrigins(origins []string) {
 // and /api/v1/stats handlers so the monolith exposes write-path flow control.
 func (s *HTTPServer) SetIngestStatsSource(fn func() backpressure.Stats) {
 	s.ingestStats = fn
+}
+
+// SetAdmissionStatsSource wires the per-series/priority admission snapshot (ADR-027)
+// into the /metrics and /api/v1/stats handlers. It is a no-op for the scrape output
+// when admission is disabled (the snapshot is empty).
+func (s *HTTPServer) SetAdmissionStatsSource(fn func() backpressure.ShaperStats) {
+	s.admissionStats = fn
 }
 
 // SetAnomalyDetector wires the streaming anomaly detector (fed by the broadcast
@@ -413,6 +424,14 @@ func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		out["ingest_queue_high_watermark"] = q.HighWatermark
 		out["dropped_samples"] = q.DroppedSamples
 	}
+	// Per-series/priority admission (ADR-027): the admitted/dropped totals when enabled,
+	// so the dashboard can show how much shedding is selective rather than uniform.
+	if s.admissionStats != nil {
+		if a := s.admissionStats(); len(a.Classes) > 0 {
+			out["admission_admitted_samples"] = a.TotalAdmitted
+			out["admission_dropped_samples"] = a.TotalDropped
+		}
+	}
 	// Streaming anomaly detection (ADR-024): cumulative alerts raised and the number
 	// of series currently firing.
 	if s.anomalyDet != nil {
@@ -542,6 +561,11 @@ func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	// Write-path flow-control metrics from the bounded ingest queue, when wired.
 	if s.ingestStats != nil {
 		WriteQueueMetrics(w, node, "monolith", s.ingestStats())
+	}
+
+	// Per-series/priority admission metrics, when the shaper is enabled (ADR-027).
+	if s.admissionStats != nil {
+		WriteAdmissionMetrics(w, node, "monolith", s.admissionStats())
 	}
 
 	// Streaming anomaly detection metrics, when wired.

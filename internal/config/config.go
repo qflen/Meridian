@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/meridiandb/meridian/internal/anomaly"
+	"github.com/meridiandb/meridian/internal/backpressure"
 	"github.com/meridiandb/meridian/internal/retention"
 	"gopkg.in/yaml.v3"
 )
@@ -286,6 +287,122 @@ type IngestionConfig struct {
 	// BlockDeadline is how long an enqueue blocks against a full queue before the
 	// batch is shed. Zero makes enqueue non-blocking (shed immediately when full).
 	BlockDeadline Duration `yaml:"block_deadline"`
+	// Admission optionally layers per-series fair-share / priority-class shedding on
+	// top of the uniform bounded-queue shedding (ADR-027). Disabled by default.
+	Admission AdmissionConfig `yaml:"admission"`
+}
+
+// AdmissionConfig tunes per-series fair-share / priority-class load shedding (ADR-027),
+// layered in front of the bounded ingest queue. When disabled (the default) the queue's
+// uniform block-then-shed is the only policy. When enabled, overload sheds the lowest
+// priority and most over-budget series first instead of the next arrival regardless of
+// series or importance, while preserving FIFO order within a single series.
+type AdmissionConfig struct {
+	// Enabled turns the layer on. At least one priority class or a positive
+	// fair_share_rate must be configured for it to have any effect.
+	Enabled bool `yaml:"enabled"`
+	// ContentionFraction is the queue depth/capacity at or above which per-series
+	// fair-share metering engages; below it there is room, so every series is admitted.
+	// In [0,1]; 0 meters as soon as anything is resident.
+	ContentionFraction float64 `yaml:"contention_fraction"`
+	// FairShareRate is the per-series token-bucket refill in samples/sec. Zero disables
+	// the fair-share gate, leaving only the priority bands.
+	FairShareRate float64 `yaml:"fair_share_rate"`
+	// FairShareBurst is the per-series token-bucket depth in samples (the burst a quiet
+	// series may spend at once). Defaults to FairShareRate when unset.
+	FairShareBurst float64 `yaml:"fair_share_burst"`
+	// Shards is the number of fair-share token buckets (bounded memory regardless of
+	// cardinality). Defaults to 4096 when unset.
+	Shards int `yaml:"shards"`
+	// MetricBuckets is the number of per-series shed counters exposed as metrics; the
+	// series space is hashed into this many buckets to bound cardinality. Defaults to 16.
+	MetricBuckets int `yaml:"metric_buckets"`
+	// Classes are the priority classes in descending priority order: the first whose
+	// matcher matches a series wins. Exactly one catch-all (empty label) is the default.
+	Classes []ClassConfig `yaml:"classes"`
+}
+
+// ClassConfig defines one priority class for AdmissionConfig.
+type ClassConfig struct {
+	// Name labels the class in metrics; it must be unique and non-empty.
+	Name string `yaml:"name"`
+	// Label selects the class: a series matches when its label Label equals Value. The
+	// special label "__name__" matches the metric name. An empty Label marks the
+	// catch-all default class.
+	Label string `yaml:"label"`
+	Value string `yaml:"value"`
+	// Ceiling is the fraction (0,1] of the queue capacity this class may occupy before
+	// it is shed. Higher-priority classes take a higher ceiling so the top band is held
+	// for them.
+	Ceiling float64 `yaml:"ceiling"`
+}
+
+// Validate checks the admission tunables when enabled, so a misconfiguration is caught
+// at load time rather than producing a layer that silently does nothing or a class set
+// that can never match.
+func (c AdmissionConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.ContentionFraction < 0 || c.ContentionFraction > 1 {
+		return fmt.Errorf("ingestion.admission.contention_fraction must be in [0,1], got %g", c.ContentionFraction)
+	}
+	if c.FairShareRate < 0 {
+		return fmt.Errorf("ingestion.admission.fair_share_rate must be >= 0, got %g", c.FairShareRate)
+	}
+	if c.FairShareBurst < 0 {
+		return fmt.Errorf("ingestion.admission.fair_share_burst must be >= 0, got %g", c.FairShareBurst)
+	}
+	if c.Shards < 0 {
+		return fmt.Errorf("ingestion.admission.shards must be >= 0, got %d", c.Shards)
+	}
+	if c.MetricBuckets < 0 {
+		return fmt.Errorf("ingestion.admission.metric_buckets must be >= 0, got %d", c.MetricBuckets)
+	}
+	if len(c.Classes) == 0 && c.FairShareRate <= 0 {
+		return fmt.Errorf("ingestion.admission.enabled is true but neither classes nor a positive fair_share_rate is configured")
+	}
+	seen := make(map[string]bool, len(c.Classes))
+	defaults := 0
+	for i, cl := range c.Classes {
+		if cl.Name == "" {
+			return fmt.Errorf("ingestion.admission.classes[%d]: name must not be empty", i)
+		}
+		if seen[cl.Name] {
+			return fmt.Errorf("ingestion.admission.classes: duplicate class name %q", cl.Name)
+		}
+		seen[cl.Name] = true
+		if cl.Ceiling <= 0 || cl.Ceiling > 1 {
+			return fmt.Errorf("ingestion.admission.classes[%q]: ceiling must be in (0,1], got %g", cl.Name, cl.Ceiling)
+		}
+		if cl.Label == "" {
+			defaults++
+		}
+	}
+	if defaults > 1 {
+		return fmt.Errorf("ingestion.admission.classes: at most one catch-all (empty label) class is allowed, got %d", defaults)
+	}
+	return nil
+}
+
+// Shaper maps the validated config onto a backpressure.ShaperConfig, or nil when the
+// layer is disabled (so the caller leaves the queue's uniform shedding in place).
+func (c AdmissionConfig) Shaper() *backpressure.ShaperConfig {
+	if !c.Enabled {
+		return nil
+	}
+	classes := make([]backpressure.ClassRule, len(c.Classes))
+	for i, cl := range c.Classes {
+		classes[i] = backpressure.ClassRule{Name: cl.Name, Label: cl.Label, Value: cl.Value, Ceiling: cl.Ceiling}
+	}
+	return &backpressure.ShaperConfig{
+		Classes:            classes,
+		ContentionFraction: c.ContentionFraction,
+		FairShareRate:      c.FairShareRate,
+		FairShareBurst:     c.FairShareBurst,
+		Shards:             c.Shards,
+		MetricBuckets:      c.MetricBuckets,
+	}
 }
 
 // Validate checks the ingestion flow-control parameters are internally consistent
@@ -306,6 +423,9 @@ func (c IngestionConfig) Validate() error {
 	}
 	if c.BlockDeadline < 0 {
 		return fmt.Errorf("ingestion.block_deadline must be >= 0, got %s", time.Duration(c.BlockDeadline))
+	}
+	if err := c.Admission.Validate(); err != nil {
+		return err
 	}
 	return nil
 }

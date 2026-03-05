@@ -76,6 +76,41 @@ func TestWriteQueueMetricsFamilies(t *testing.T) {
 	}
 }
 
+func TestWriteAdmissionMetricsFamilies(t *testing.T) {
+	var buf bytes.Buffer
+	WriteAdmissionMetrics(&buf, "node-1", "monolith", backpressure.ShaperStats{
+		TotalAdmitted: 30, TotalDropped: 12,
+		Classes: []backpressure.ClassStat{
+			{Name: "high", Admitted: 20, DroppedPriority: 0, DroppedFairShare: 1},
+			{Name: "default", Admitted: 10, DroppedPriority: 8, DroppedFairShare: 3},
+		},
+		BucketDrops: []int64{5, 0, 7},
+	})
+	body := buf.String()
+	for _, want := range []string{
+		`meridian_admission_admitted_samples_total{node="node-1",role="monolith",class="high"} 20`,
+		`meridian_admission_dropped_samples_total{node="node-1",role="monolith",class="default",reason="priority"} 8`,
+		`meridian_admission_dropped_samples_total{node="node-1",role="monolith",class="default",reason="fairshare"} 3`,
+		`meridian_admission_series_bucket_dropped_total{node="node-1",role="monolith",bucket="2"} 7`,
+		"# TYPE meridian_admission_admitted_samples_total counter",
+		"# TYPE meridian_admission_dropped_samples_total counter",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("admission metrics missing %q\n%s", want, body)
+		}
+	}
+}
+
+// TestWriteAdmissionMetricsDisabledEmpty confirms a disabled (empty) snapshot emits
+// nothing, so the default uniform-shedding scrape is byte-for-byte unchanged.
+func TestWriteAdmissionMetricsDisabledEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	WriteAdmissionMetrics(&buf, "node-1", "monolith", backpressure.ShaperStats{})
+	if buf.Len() != 0 {
+		t.Fatalf("disabled admission emitted %d bytes, want 0:\n%s", buf.Len(), buf.String())
+	}
+}
+
 // TestMonolithMetricsAndStatsIncludeQueue proves the wired ingest stats source
 // surfaces the bounded-queue families on /metrics and the fields on /api/v1/stats.
 func TestMonolithMetricsAndStatsIncludeQueue(t *testing.T) {

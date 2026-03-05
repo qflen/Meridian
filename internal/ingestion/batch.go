@@ -27,6 +27,11 @@ type QueueOptions struct {
 	Capacity      int           // hard cap in samples
 	HighWatermark int           // throttle threshold in samples
 	BlockDeadline time.Duration // how long enqueue blocks before shedding
+	// Admission, when non-nil, layers per-series fair-share / priority-class shedding
+	// (ADR-027) in front of the bounded queue: under overload it sheds the lowest
+	// priority and most over-budget series first. Nil leaves the queue's uniform
+	// block-then-shed as the only policy (the default).
+	Admission *backpressure.ShaperConfig
 }
 
 func (o QueueOptions) normalize(batchSize int) QueueOptions {
@@ -72,6 +77,9 @@ type BatchWriter struct {
 
 	queue *backpressure.Queue[[]storage.IngestSample]
 	block time.Duration
+	// shaper, when set, runs per-series fair-share / priority admission ahead of the
+	// queue (ADR-027); nil falls back to the queue's uniform shedding.
+	shaper *backpressure.Shaper
 
 	mu     sync.Mutex
 	buffer []storage.IngestSample // staging accumulation, always < batchSize between calls
@@ -103,12 +111,17 @@ func newBatchWriterSink(sink batchSink, batchSize int, flushInterval time.Durati
 		batchSize = 1
 	}
 	opts = opts.normalize(batchSize)
+	var shaper *backpressure.Shaper
+	if opts.Admission != nil {
+		shaper = backpressure.NewShaper(opts.Capacity, *opts.Admission)
+	}
 	bw := &BatchWriter{
 		sink:          sink,
 		batchSize:     batchSize,
 		flushInterval: flushInterval,
 		queue:         backpressure.New[[]storage.IngestSample](opts.Capacity, opts.HighWatermark),
 		block:         opts.BlockDeadline,
+		shaper:        shaper,
 		buffer:        make([]storage.IngestSample, 0, batchSize),
 		done:          make(chan struct{}),
 		drain:         make(chan struct{}),
@@ -123,6 +136,14 @@ func newBatchWriterSink(sink batchSink, batchSize int, flushInterval time.Durati
 // block-then-shed flow control. The returned AddResult reports any shedding so the
 // caller can NACK the producer.
 func (bw *BatchWriter) Add(name string, labels map[string]string, ts int64, value float64) AddResult {
+	// Admission shedding (ADR-027) runs before the sample is buffered: a low-priority
+	// or over-budget series is dropped here rather than crowding the queue.
+	if bw.shaper != nil {
+		if !bw.shaper.Admit(name, labels, 1, bw.queue.Depth()).Admit {
+			bw.queue.RecordShed(1)
+			return AddResult{Shed: 1, Throttled: true}
+		}
+	}
 	bw.mu.Lock()
 	bw.buffer = append(bw.buffer, storage.IngestSample{Name: name, Labels: labels, Timestamp: ts, Value: value})
 	batches := bw.cutFullLocked()
@@ -130,16 +151,48 @@ func (bw *BatchWriter) Add(name string, labels map[string]string, ts int64, valu
 	return bw.enqueueAll(batches)
 }
 
-// AddBatch buffers many samples and enqueues every full batch that forms.
+// AddBatch buffers many samples and enqueues every full batch that forms. When
+// admission shedding is enabled, samples are first filtered per-series (ADR-027): the
+// shed ones are dropped and counted before any buffering.
 func (bw *BatchWriter) AddBatch(samples []storage.IngestSample) AddResult {
 	if len(samples) == 0 {
 		return AddResult{}
+	}
+	var preShed int64
+	if bw.shaper != nil {
+		samples, preShed = bw.admit(samples)
 	}
 	bw.mu.Lock()
 	bw.buffer = append(bw.buffer, samples...)
 	batches := bw.cutFullLocked()
 	bw.mu.Unlock()
-	return bw.enqueueAll(batches)
+	res := bw.enqueueAll(batches)
+	res.Shed += preShed
+	if preShed > 0 {
+		res.Throttled = true
+	}
+	return res
+}
+
+// admit filters samples through the shaper, returning the kept samples (compacted into
+// the input's backing array) and the number shed. Each admission drop is folded into
+// the queue's grand-total drop counter so meridian_dropped_samples_total stays
+// authoritative; the per-class/series breakdown is recorded inside the shaper.
+func (bw *BatchWriter) admit(samples []storage.IngestSample) ([]storage.IngestSample, int64) {
+	depth := bw.queue.Depth()
+	kept := samples[:0]
+	var shed int64
+	for _, s := range samples {
+		if bw.shaper.Admit(s.Name, s.Labels, 1, depth).Admit {
+			kept = append(kept, s)
+		} else {
+			shed++
+		}
+	}
+	if shed > 0 {
+		bw.queue.RecordShed(int(shed))
+	}
+	return kept, shed
 }
 
 // Flush enqueues the current staging buffer immediately, even below batchSize. It
@@ -246,6 +299,12 @@ func (bw *BatchWriter) Stats() BatchStats {
 // drops, shed/backpressure events), used by the /metrics and /api/v1/stats handlers.
 func (bw *BatchWriter) QueueStats() backpressure.Stats {
 	return bw.queue.Stats()
+}
+
+// AdmissionStats returns the per-series fair-share / priority-class admission snapshot
+// (ADR-027), or the zero value when admission shedding is disabled.
+func (bw *BatchWriter) AdmissionStats() backpressure.ShaperStats {
+	return bw.shaper.Stats() // nil-safe: a disabled (nil) shaper reports the zero value
 }
 
 // BatchStats holds batch writer metrics.

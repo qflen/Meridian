@@ -118,6 +118,37 @@ func WriteQueueMetrics(w io.Writer, node, role string, st backpressure.Stats) {
 	fmt.Fprintf(w, "meridian_ingest_queue_high_watermark{node=%q,role=%q} %d\n", node, role, st.HighWatermark)
 }
 
+// WriteAdmissionMetrics writes the per-series fair-share / priority-class admission
+// metrics for one node/role from a shaper snapshot (ADR-027): admitted and dropped
+// samples by class (drops split by reason — priority band vs fair-share budget), and the
+// shed distribution across series-hash buckets so a hot series bucket is visible without
+// per-series cardinality. The counters are cumulative (Prometheus-correct); a scraper
+// derives a per-class shed rate with rate(). Nothing is emitted when the admission layer
+// is disabled (an empty snapshot), so the uniform-shedding default scrape is unchanged.
+func WriteAdmissionMetrics(w io.Writer, node, role string, st backpressure.ShaperStats) {
+	if len(st.Classes) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "# HELP meridian_admission_admitted_samples_total Samples admitted by the priority/fair-share shaper, by class.\n")
+	fmt.Fprintf(w, "# TYPE meridian_admission_admitted_samples_total counter\n")
+	for _, c := range st.Classes {
+		fmt.Fprintf(w, "meridian_admission_admitted_samples_total{node=%q,role=%q,class=%q} %d\n", node, role, c.Name, c.Admitted)
+	}
+
+	fmt.Fprintf(w, "# HELP meridian_admission_dropped_samples_total Samples shed by the priority/fair-share shaper, by class and reason.\n")
+	fmt.Fprintf(w, "# TYPE meridian_admission_dropped_samples_total counter\n")
+	for _, c := range st.Classes {
+		fmt.Fprintf(w, "meridian_admission_dropped_samples_total{node=%q,role=%q,class=%q,reason=\"priority\"} %d\n", node, role, c.Name, c.DroppedPriority)
+		fmt.Fprintf(w, "meridian_admission_dropped_samples_total{node=%q,role=%q,class=%q,reason=\"fairshare\"} %d\n", node, role, c.Name, c.DroppedFairShare)
+	}
+
+	fmt.Fprintf(w, "# HELP meridian_admission_series_bucket_dropped_total Shed samples by series-hash bucket (bounded cardinality) — a hot bucket flags an unfair series.\n")
+	fmt.Fprintf(w, "# TYPE meridian_admission_series_bucket_dropped_total counter\n")
+	for i, d := range st.BucketDrops {
+		fmt.Fprintf(w, "meridian_admission_series_bucket_dropped_total{node=%q,role=%q,bucket=\"%d\"} %d\n", node, role, i, d)
+	}
+}
+
 // WriteAnomalyMetrics writes the streaming-anomaly-detector metrics for one
 // node/role: the cumulative count of alerts raised (a counter) and the number of
 // series currently firing (a gauge). Shared by the monolith and the gateway so

@@ -28,6 +28,11 @@ default). Each message is a JSON object terminated by a newline.
 - `samples`: Array of timestamp (Unix ms) / value (float64) pairs.
 - Samples must be in chronological order within each series.
 - Maximum batch size is configured via `ingestion.batch_size`.
+- Under overload the server may **shed** samples (ADR-023). The wire format is
+  unchanged, but when per-series/priority admission is enabled (ADR-027) the shed
+  decision is per-series: a series' `__name__` or a label value can place it in a
+  priority class, and a single series flooding faster than its fair-share budget is
+  shed before well-behaved ones. Order within an admitted series is preserved.
 
 ### Response
 

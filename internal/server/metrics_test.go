@@ -132,6 +132,27 @@ func TestWriteHandoffMetricsFamilies(t *testing.T) {
 	}
 }
 
+func TestWriteAntiEntropyMetricsFamilies(t *testing.T) {
+	var buf bytes.Buffer
+	WriteAntiEntropyMetrics(&buf, "ingestor-1", "ingestor", AntiEntropyStats{
+		Rounds: 50, DivergentWindows: 7, Repairs: 4, SamplesTransferred: 130, BytesTransferred: 4096,
+	})
+	body := buf.String()
+	for _, want := range []string{
+		`meridian_anti_entropy_rounds_total{node="ingestor-1",role="ingestor"} 50`,
+		`meridian_anti_entropy_divergent_windows_total{node="ingestor-1",role="ingestor"} 7`,
+		`meridian_anti_entropy_repairs_total{node="ingestor-1",role="ingestor"} 4`,
+		`meridian_anti_entropy_transferred_samples_total{node="ingestor-1",role="ingestor"} 130`,
+		`meridian_anti_entropy_transferred_bytes_total{node="ingestor-1",role="ingestor"} 4096`,
+		"# TYPE meridian_anti_entropy_rounds_total counter",
+		"# TYPE meridian_anti_entropy_transferred_bytes_total counter",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("anti-entropy metrics missing %q\n%s", want, body)
+		}
+	}
+}
+
 // TestMonolithMetricsAndStatsIncludeQueue proves the wired ingest stats source
 // surfaces the bounded-queue families on /metrics and the fields on /api/v1/stats.
 func TestMonolithMetricsAndStatsIncludeQueue(t *testing.T) {

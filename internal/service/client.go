@@ -40,6 +40,13 @@ type StorageClient struct {
 	// once at startup via SetHintStore; nil leaves the ADR-022 behaviour unchanged. The
 	// handoff methods live in handoff.go.
 	hints *HintStore
+
+	// ae holds the anti-entropy counters (ADR-030); aeCursor is the round-robin position
+	// over the ring's replica groups. Both are owned by the single background sweep
+	// goroutine (and tests driving AntiEntropyRound), so aeCursor needs no lock. The
+	// anti-entropy methods live in antientropy.go.
+	ae       aeStats
+	aeCursor int
 }
 
 // ReplicationOptions configures the replication behaviour of a StorageClient.

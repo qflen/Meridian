@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/cluster"
 	"github.com/meridiandb/meridian/internal/config"
 	"github.com/meridiandb/meridian/internal/retention"
 	"github.com/meridiandb/meridian/internal/server"
@@ -142,6 +143,8 @@ func (s *storageServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/internal/label/", s.handleLabelValues)
 	mux.HandleFunc("/api/internal/stats", s.handleStats)
 	mux.HandleFunc("/api/internal/blocks", s.handleBlocks)
+	mux.HandleFunc("/api/internal/antientropy/digest", s.handleAntiEntropyDigest)
+	mux.HandleFunc("/api/internal/antientropy/range", s.handleAntiEntropyRange)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	// DELETE for specific block: /api/internal/blocks/{ulid}
 }
@@ -383,6 +386,79 @@ func (s *storageServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, infos)
+}
+
+// handleAntiEntropyDigest returns a Merkle range digest over the series whose ring
+// position falls in the requested hash arcs, for the requested span and window (ADR-030).
+// The arcs come from the coordinator (which holds the ring); cluster.HashKey classifies
+// series here exactly as writes were routed, so this node stays ring-agnostic.
+func (s *storageServer) handleAntiEntropyDigest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req service.DigestRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	d, err := s.db.RangeDigest(wireRanges(req.Ranges), req.Start, req.End, req.Window, cluster.HashKey)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, d)
+}
+
+// handleAntiEntropyRange exports the raw samples whose ring position falls in the
+// requested hash arcs over the requested span, as a WriteRequest the coordinator can push
+// to a lagging peer through the backfill path (ADR-030).
+func (s *storageServer) handleAntiEntropyRange(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req service.RangeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	series, err := s.db.RangeExport(wireRanges(req.Ranges), req.Start, req.End, cluster.HashKey)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, exportToWriteRequest(series))
+}
+
+// wireRanges converts the wire [lo,hi] arc pairs to storage hash ranges.
+func wireRanges(ranges [][2]uint64) []storage.HashRange {
+	out := make([]storage.HashRange, len(ranges))
+	for i, p := range ranges {
+		out[i] = storage.HashRange{Lo: p[0], Hi: p[1]}
+	}
+	return out
+}
+
+// exportToWriteRequest renders exported series as a WriteRequest (the backfill wire
+// shape), dropping the synthetic __name__ label so a backfilled series recreates the
+// same canonical key.
+func exportToWriteRequest(series []storage.ResultSeries) service.WriteRequest {
+	wr := service.WriteRequest{}
+	for _, rs := range series {
+		var labels []service.Label
+		for k, v := range rs.Labels {
+			if k != "__name__" {
+				labels = append(labels, service.Label{Name: k, Value: v})
+			}
+		}
+		samples := make([]service.Sample, len(rs.Points))
+		for i, p := range rs.Points {
+			samples[i] = service.Sample{TimestampMs: p.Timestamp, Value: p.Value}
+		}
+		wr.TimeSeries = append(wr.TimeSeries, service.TimeSeries{Name: rs.Name, Labels: labels, Samples: samples})
+	}
+	return wr
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

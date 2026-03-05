@@ -3,6 +3,18 @@
 ## Unreleased
 
 ### Replication & clustering
+- Proactive anti-entropy (ADR-030): a rate-limited, jittered background sweep on the
+  ingestor converges co-replicas that read-repair and hinted handoff never reach — cold
+  data, an unobserved partial write, a hint dropped past the cap, a series no longer
+  written. Each storage node summarises its data as **Merkle range digests** over
+  `(ring-range × time-window)` buckets (`/api/internal/antientropy/digest`); the sweep
+  round-robins the ring's replica groups, and where two replicas' digest roots differ it
+  reads only the divergent window (`/api/internal/antientropy/range`) and pushes each the
+  points it lacks back through the same out-of-order-tolerant `/api/internal/backfill`
+  apply (ADR-029) — bidirectional gap-fill to the window union. Agreement transfers
+  nothing. The ring hash is injected so the storage node stays ring-agnostic.
+  `meridian_anti_entropy_*` exposes rounds/divergence/repairs/bytes. On by default for the
+  cluster tier (`cluster.anti_entropy`); disabled it is exactly the ADR-029 behaviour.
 - Hinted handoff (ADR-029): a write that can't reach a natural replica (it's down or
   catching up) buffers a durable, bounded hint while quorum still succeeds on the
   survivors, and replays it on the replica's return so it **fully converges** — including

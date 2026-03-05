@@ -67,6 +67,98 @@ func TestStorageMetricsRouteWired(t *testing.T) {
 	}
 }
 
+func newAEServer(t *testing.T) (*storageServer, *http.ServeMux) {
+	t.Helper()
+	dir := t.TempDir()
+	db, err := storage.Open(dir, storage.TSDBOptions{
+		WALDir: dir + "/wal", BlockDir: dir + "/blocks", FlushInterval: time.Hour, RateSampleInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	s := &storageServer{db: db, nodeID: "storage-test", startTime: time.Now()}
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
+	return s, mux
+}
+
+func postAE(t *testing.T, mux *http.ServeMux, method, path string, reqBody, respOut any) int {
+	t.Helper()
+	b, _ := json.Marshal(reqBody)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(method, path, bytes.NewReader(b)))
+	if rec.Code == http.StatusOK && respOut != nil {
+		if err := json.NewDecoder(rec.Body).Decode(respOut); err != nil {
+			t.Fatalf("decode %s response: %v", path, err)
+		}
+	}
+	return rec.Code
+}
+
+// TestAntiEntropyEndpointsRoundTrip drives the real storage routes (ADR-030): digest the
+// source, export its range, backfill that into an empty node through the actual backfill
+// route, and confirm the destination's digest now equals the source's — the full transfer
+// path the coordinator uses, exercised end-to-end against the binary's handlers.
+func TestAntiEntropyEndpointsRoundTrip(t *testing.T) {
+	src, srcMux := newAEServer(t)
+	_, dstMux := newAEServer(t)
+
+	if _, err := src.db.Backfill([]storage.IngestSample{
+		{Name: "cpu", Labels: map[string]string{"h": "a"}, Timestamp: 100, Value: 1},
+		{Name: "cpu", Labels: map[string]string{"h": "a"}, Timestamp: 1500, Value: 2},
+		{Name: "mem", Timestamp: 200, Value: 7},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	whole := [][2]uint64{{0, 0}} // Lo == Hi ⇒ the whole ring
+	dreq := service.DigestRequest{Ranges: whole, Start: 0, End: 1 << 62, Window: 1000}
+
+	var srcDigest storage.MerkleDigest
+	if code := postAE(t, srcMux, "POST", "/api/internal/antientropy/digest", dreq, &srcDigest); code != http.StatusOK {
+		t.Fatalf("digest status = %d", code)
+	}
+	if srcDigest.Root == "" || len(srcDigest.Leaves) == 0 {
+		t.Fatalf("expected a non-empty digest, got %+v", srcDigest)
+	}
+
+	var export service.WriteRequest
+	if code := postAE(t, srcMux, "POST", "/api/internal/antientropy/range",
+		service.RangeRequest{Ranges: whole, Start: 0, End: 1 << 62}, &export); code != http.StatusOK {
+		t.Fatalf("range status = %d", code)
+	}
+	if len(export.TimeSeries) != 2 {
+		t.Fatalf("expected 2 series exported, got %d", len(export.TimeSeries))
+	}
+	for _, ts := range export.TimeSeries {
+		for _, l := range ts.Labels {
+			if l.Name == "__name__" {
+				t.Fatalf("export must strip the synthetic __name__ label, got it on %q", ts.Name)
+			}
+		}
+	}
+
+	if code := postAE(t, dstMux, "POST", "/api/internal/backfill", export, nil); code != http.StatusOK {
+		t.Fatalf("backfill status = %d", code)
+	}
+
+	var dstDigest storage.MerkleDigest
+	postAE(t, dstMux, "POST", "/api/internal/antientropy/digest", dreq, &dstDigest)
+	if dstDigest.Root != srcDigest.Root {
+		t.Fatalf("destination root %s != source root %s after transfer", dstDigest.Root, srcDigest.Root)
+	}
+
+	// Guard rails: wrong method and a zero window are rejected.
+	if code := postAE(t, srcMux, "GET", "/api/internal/antientropy/digest", dreq, nil); code != http.StatusMethodNotAllowed {
+		t.Errorf("GET digest = %d, want 405", code)
+	}
+	bad := service.DigestRequest{Ranges: whole, Start: 0, End: 1 << 62, Window: 0}
+	if code := postAE(t, srcMux, "POST", "/api/internal/antientropy/digest", bad, nil); code != http.StatusBadRequest {
+		t.Errorf("zero-window digest = %d, want 400", code)
+	}
+}
+
 // TestStorageWriteShedReturns429 proves the storage accept queue NACKs with 429
 // when its bounded pool sheds under a stalled downstream (a stand-in for a slow
 // WAL fsync), pushing backpressure upstream to the quorum write.

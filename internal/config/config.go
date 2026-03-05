@@ -155,6 +155,9 @@ type ClusterConfig struct {
 	// Handoff configures hinted handoff (ADR-029), which buffers writes for a replica
 	// that is unreachable at write time and replays them on its return.
 	Handoff HandoffConfig `yaml:"handoff"`
+	// AntiEntropy configures proactive Merkle anti-entropy (ADR-030), the background
+	// sweep that converges co-replicas read-repair and handoff cannot reach.
+	AntiEntropy AntiEntropyConfig `yaml:"anti_entropy"`
 }
 
 // HandoffConfig configures hinted handoff (ADR-029): durable, bounded buffering of
@@ -191,6 +194,54 @@ func (c HandoffConfig) Validate() error {
 	return nil
 }
 
+// AntiEntropyConfig configures proactive Merkle anti-entropy (ADR-030): a rate-limited,
+// jittered background sweep that compares co-replicas' range digests and repairs the
+// divergence neither read-repair nor hinted handoff reaches — cold data, a series no
+// longer written, or a window dropped past the hint cap. Disabled, convergence stays
+// write- and read-triggered (the ADR-029 behaviour).
+type AntiEntropyConfig struct {
+	// Enabled turns the background sweep on for the coordinator (the ingestor).
+	Enabled bool `yaml:"enabled"`
+	// Interval is the time between sweep rounds.
+	Interval Duration `yaml:"interval"`
+	// Window is the time-bucket size for digests; a divergent bucket is the unit
+	// transferred, so a smaller window re-transfers less at the cost of a larger digest.
+	Window Duration `yaml:"window"`
+	// Lookback bounds how far back from now a round reconciles. 0 reconciles all history;
+	// a finite value bounds the per-round read cost on large datasets.
+	Lookback Duration `yaml:"lookback"`
+	// Jitter is a random [0, Jitter) delay added to each interval so coordinators do not
+	// sweep in lockstep.
+	Jitter Duration `yaml:"jitter"`
+	// GroupsPerRound caps the replica groups reconciled per round (the spatial rate
+	// limit); a round-robin cursor covers the rest over subsequent rounds.
+	GroupsPerRound int `yaml:"groups_per_round"`
+}
+
+// Validate checks the anti-entropy tunables when enabled, so a misconfiguration is
+// caught at load time rather than producing a sweep that never makes progress.
+func (c AntiEntropyConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.Interval <= 0 {
+		return fmt.Errorf("cluster.anti_entropy.interval must be > 0, got %s", time.Duration(c.Interval))
+	}
+	if c.Window <= 0 {
+		return fmt.Errorf("cluster.anti_entropy.window must be > 0, got %s", time.Duration(c.Window))
+	}
+	if c.Lookback < 0 {
+		return fmt.Errorf("cluster.anti_entropy.lookback must be >= 0, got %s", time.Duration(c.Lookback))
+	}
+	if c.Jitter < 0 {
+		return fmt.Errorf("cluster.anti_entropy.jitter must be >= 0, got %s", time.Duration(c.Jitter))
+	}
+	if c.GroupsPerRound < 1 {
+		return fmt.Errorf("cluster.anti_entropy.groups_per_round must be >= 1, got %d", c.GroupsPerRound)
+	}
+	return nil
+}
+
 // Validate checks the replication parameters are internally consistent. It enforces
 // 1 <= W,R <= N and the read-your-writes condition W+R > N, so a misconfiguration is
 // caught at load time rather than silently weakening consistency at runtime.
@@ -212,6 +263,9 @@ func (c ClusterConfig) Validate() error {
 		return fmt.Errorf("cluster.virtual_nodes must be >= 1, got %d", c.VirtualNodes)
 	}
 	if err := c.Handoff.Validate(); err != nil {
+		return err
+	}
+	if err := c.AntiEntropy.Validate(); err != nil {
 		return err
 	}
 	return nil
@@ -558,6 +612,14 @@ func DefaultConfig() *Config {
 				Enabled:           true,
 				MaxSamplesPerNode: 1_000_000,
 				ReplayInterval:    Duration(5 * time.Second),
+			},
+			AntiEntropy: AntiEntropyConfig{
+				Enabled:        true,
+				Interval:       Duration(30 * time.Second),
+				Window:         Duration(1 * time.Hour),
+				Lookback:       0, // all history
+				Jitter:         Duration(10 * time.Second),
+				GroupsPerRound: 16,
 			},
 		},
 		Downsampling: DownsamplingConfig{

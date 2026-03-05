@@ -131,3 +131,16 @@ numbers, here are the cost characteristics and where to read the real signal liv
   bounded per target by `max_samples_per_node` (drop-oldest past it), so a long outage
   caps hint disk/memory rather than growing without bound; `meridian_handoff_pending_*`
   shows the live backlog and `_replayed_/_dropped_samples_total` the catch-up progress.
+- **Anti-entropy** (ADR-030): a background sweep, never on the read or write path, and
+  bounded on both axes. *Spatially*, `groups_per_round` caps how many replica groups a
+  round touches (the round-robin cursor covers the rest over later rounds) and the number
+  of groups tracks the cluster's distinct replica sets, not the virtual-node count.
+  *Temporally*, a round's per-group cost is one match-all read over `[now-lookback, now]`
+  per replica to compute the digest; the agreement case ends at a single root comparison
+  and transfers nothing, and only a divergent `window` is re-read and gap-filled. Smaller
+  `window` re-transfers less per divergence but enlarges the digest; `lookback` bounds the
+  per-round read on large datasets (`0` re-digests all history). `interval`+`jitter` set
+  the cadence and de-sync coordinators. Progress shows in
+  `meridian_anti_entropy_repairs_total` / `_transferred_samples_total`; `_divergent_windows_total`
+  climbing while `_repairs_total` does not flags an unresolvable difference (a same-timestamp
+  value conflict, which gap-fill does not overwrite).

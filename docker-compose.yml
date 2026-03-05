@@ -55,6 +55,9 @@ services:
       INGESTOR_NODE_ID: "ingestor-1"
       INGESTOR_DATA_DIR: "/app/data"
       STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
+      # Sole anti-entropy coordinator (ADR-030): one ingestor sweeps so the proactive
+      # convergence work is not duplicated across ingestors (hints stay per-ingestor).
+      ANTI_ENTROPY_ENABLED: "true"
     depends_on:
       storage-1:
         condition: service_healthy
@@ -86,6 +89,8 @@ services:
       INGESTOR_NODE_ID: "ingestor-2"
       INGESTOR_DATA_DIR: "/app/data"
       STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
+      # ingestor-1 is the anti-entropy coordinator; disable here to avoid duplicate sweeps.
+      ANTI_ENTROPY_ENABLED: "false"
     depends_on:
       storage-1:
         condition: service_healthy

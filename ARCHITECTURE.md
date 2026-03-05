@@ -244,12 +244,31 @@ interior-gap case read-repair cannot reach.
   drain, so it is made whole before it can take a fresh write that would strand an
   interior gap. An already-Active node is never demoted by a transient hint.
 
+**Proactive anti-entropy** (`internal/service/antientropy.go`, `internal/storage/merkle.go`,
+`internal/cluster/antientropy.go`; ADR-030): a rate-limited, jittered background sweep on
+the ingestor converges co-replicas neither read-repair nor hinted handoff reaches — cold
+data, an unobserved partial write, a hint dropped past the cap, a series no longer written.
+
+- **Digest** — each storage node summarises the series whose ring position falls in a set
+  of hash arcs, bucketed by time window, as a Merkle tree
+  (`/api/internal/antientropy/digest`). Equal roots mean the replicas agree over the whole
+  span and nothing transfers; a differing root localises divergence to specific windows.
+  The ring hash is injected (`cluster.HashKey`), so the storage node stays ring-agnostic.
+- **Sweep** — `ring.ReplicaGroups` partitions the ring into the arc sets that share a
+  replica set; the loop round-robins them (`groups_per_round` per round), fetches each live
+  replica's digest, and for a divergent window reads it from every replica
+  (`/api/internal/antientropy/range`) and pushes each the points it lacks back through the
+  same `/api/internal/backfill` apply hinted handoff uses — bidirectional gap-fill to the
+  window union.
+- **Scoped to shared arcs** — comparison runs per replica group, so a node's data outside
+  an arc it actually shares with the peer is never mistaken for divergence and re-shipped.
+
 The ingestor and querier each build this client from `REPLICATION_FACTOR`/
 `WRITE_QUORUM`/`READ_QUORUM` and run the health monitor; only the ingestor wires the
 hint store (the write owner). The `Coordinator` (`internal/cluster/coordinator.go`)
-wraps the same ring with `RouteWrite`/`RouteRead` helpers. Cross-node anti-entropy and
-rebalancing on membership change are future work; the monolith `serve` path is
-single-node and does not use the ring.
+wraps the same ring with `RouteWrite`/`RouteRead` helpers. Proactive cross-node
+anti-entropy is now in place (ADR-030, above); rebalancing/GC on membership change remains
+future work (ADR-022). The monolith `serve` path is single-node and does not use the ring.
 
 ### Retention & Downsampling
 

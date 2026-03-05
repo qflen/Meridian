@@ -185,6 +185,42 @@ Backfilled samples are logged under a distinct WAL frame, so they survive a stor
 restart and replay through the same out-of-order-tolerant path; only a recovering replica
 uses this endpoint, so the live in-order write path is unaffected.
 
+### Anti-entropy digest & range
+
+```
+POST /api/internal/antientropy/digest
+POST /api/internal/antientropy/range
+```
+
+The proactive convergence path (ADR-030). The coordinator (the ingestor) holds the ring,
+so it sends the hash arcs to compare; the storage node stays ring-agnostic and classifies
+its series with the same ring hash writes were routed by. Both requests carry a list of
+`[lo, hi]` hash arcs — half-open `(lo, hi]`; `lo > hi` wraps the ring; `lo == hi` is the
+whole ring — and a `[start, end]` millisecond span.
+
+`digest` buckets the in-arc series into `window`-ms leaves and returns a Merkle tree over
+them — each leaf a content hash over its `(series, sample)` data, plus a sample count:
+
+```json
+{ "ranges": [[1024, 4096]], "start": 0, "end": 1750000000000, "window": 3600000 }
+```
+```json
+{
+  "root": "9f86d0…",
+  "window": 3600000,
+  "leaves": [ { "start": 1749996000000, "hash": "a1b2…", "count": 240 } ]
+}
+```
+
+Equal roots between two replicas mean they agree over the whole span — nothing transfers;
+a differing root localises divergence to the leaves whose `hash` differs.
+
+`range` exports the raw samples for the same arcs and span as a write body
+(`{"time_series":[...]}`, with the synthetic `__name__` label dropped), so the coordinator
+can read a divergent window from each replica and push whatever a peer is missing straight
+back through `/api/internal/backfill`. Both the read and the push are scoped to the
+differing window, so a converged cluster moves no data.
+
 ## WebSocket Streams
 
 ### Metrics Stream

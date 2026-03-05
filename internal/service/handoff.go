@@ -122,6 +122,14 @@ func (c *StorageClient) sendBackfill(ctx context.Context, addr string, series []
 	if err != nil {
 		return false
 	}
+	return c.postBackfill(ctx, addr, body)
+}
+
+// postBackfill POSTs an already-marshaled WriteRequest body to a replica's backfill
+// endpoint, returning whether it was applied (HTTP 200). Splitting the POST from the
+// marshaling lets anti-entropy (ADR-030) reuse the exact transfer path while measuring
+// the bytes it sent, without encoding the body twice.
+func (c *StorageClient) postBackfill(ctx context.Context, addr string, body []byte) bool {
 	url := fmt.Sprintf("http://%s/api/internal/backfill", addr)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {

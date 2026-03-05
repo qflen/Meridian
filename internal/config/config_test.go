@@ -112,6 +112,40 @@ func TestHandoffConfigValidate(t *testing.T) {
 	}
 }
 
+func TestAntiEntropyConfigValidate(t *testing.T) {
+	valid := []AntiEntropyConfig{
+		{Enabled: false}, // disabled needs no tunables
+		{Enabled: true, Interval: Duration(30 * time.Second), Window: Duration(time.Hour), GroupsPerRound: 1},
+		DefaultConfig().Cluster.AntiEntropy, // the shipped default must be valid
+	}
+	for _, c := range valid {
+		if err := c.Validate(); err != nil {
+			t.Errorf("expected %+v to be valid, got %v", c, err)
+		}
+	}
+
+	base := DefaultConfig().Cluster.AntiEntropy
+	invalid := []AntiEntropyConfig{
+		{Enabled: true, Window: Duration(time.Hour), GroupsPerRound: 1},        // interval <= 0
+		{Enabled: true, Interval: Duration(time.Second), GroupsPerRound: 1},    // window <= 0
+		{Enabled: true, Interval: Duration(time.Second), Window: Duration(time.Hour)}, // groups < 1
+		func() AntiEntropyConfig { c := base; c.Lookback = Duration(-time.Second); return c }(), // negative lookback
+		func() AntiEntropyConfig { c := base; c.Jitter = Duration(-time.Second); return c }(),   // negative jitter
+	}
+	for _, c := range invalid {
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected %+v to be invalid", c)
+		}
+	}
+
+	// A bad anti-entropy block must fail cluster validation (it is nested).
+	cc := ClusterConfig{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 256,
+		AntiEntropy: AntiEntropyConfig{Enabled: true, Interval: 0, Window: Duration(time.Hour), GroupsPerRound: 1}}
+	if err := cc.Validate(); err == nil {
+		t.Error("cluster validate must reject an invalid nested anti-entropy config")
+	}
+}
+
 func TestIngestionConfigValidate(t *testing.T) {
 	valid := []IngestionConfig{
 		{BatchSize: 1000, MaxConcurrentWrites: 64, QueueCapacity: 50000, QueueHighWatermark: 40000, BlockDeadline: Duration(250 * time.Millisecond)},

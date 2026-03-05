@@ -110,6 +110,12 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   newer than a replica's last; storage rejects out-of-order). Replay goes through an
   out-of-order-tolerant backfill path, and a returning replica catches up in the
   `joining` state before it rejoins live routing. (ADR-029.)
+- **Proactive anti-entropy**: a rate-limited, jittered background sweep compares
+  co-replicas with compact **Merkle range digests** (`ring-range × time-window`) and
+  repairs the divergence read-repair and handoff never see — cold data, an unobserved
+  partial write, a series no longer written. Equal digest roots transfer nothing; a
+  differing root ships only the differing window's missing points, back through the same
+  backfill path. (ADR-030.)
 - **Health-driven membership**: a background `/health` monitor marks nodes
   active/dead so routing excludes the dead and re-includes the recovered; a node that
   returns with a hint backlog passes through `joining` (catching up) before `active`.
@@ -310,6 +316,13 @@ cluster:                  # microservices tier only; W+R must exceed N
     enabled:             true
     max_samples_per_node: 1000000  # per-target hint buffer cap (samples); drop-oldest past it
     replay_interval:    "5s"       # how often buffered hints are replayed to recovered replicas
+  anti_entropy:           # proactive Merkle anti-entropy (ADR-030); on by default for the tier
+    enabled:          true
+    interval:         "30s"  # time between sweep rounds
+    window:           "1h"   # digest time-bucket size (the unit transferred on divergence)
+    lookback:         "0s"   # how far back to reconcile; 0 = all history
+    jitter:           "10s"  # random delay added per round so coordinators don't sweep in lockstep
+    groups_per_round: 16     # replica groups reconciled per round (spatial rate limit)
 ingestion:                # write-path backpressure (ADR-023)
   queue_capacity:       50000   # hard ingest-queue cap in samples (memory bound)
   queue_high_watermark: 40000   # depth at which producers are flagged to throttle
@@ -335,7 +348,10 @@ The microservice binaries read the same knobs from the environment: replication
 (`REPLICATION_FACTOR`, `WRITE_QUORUM`, `READ_QUORUM`, `VIRTUAL_NODES`) — clamped to
 the live node count so a cluster smaller than N still works — hinted handoff on the
 ingestor (`HINTED_HANDOFF_ENABLED`, `HINT_DIR`, `HINT_MAX_SAMPLES_PER_NODE`,
-`HINT_REPLAY_INTERVAL`) — backpressure
+`HINT_REPLAY_INTERVAL`) — proactive anti-entropy on the ingestor
+(`ANTI_ENTROPY_ENABLED`, `ANTI_ENTROPY_INTERVAL`, `ANTI_ENTROPY_WINDOW`,
+`ANTI_ENTROPY_LOOKBACK`, `ANTI_ENTROPY_JITTER`, `ANTI_ENTROPY_GROUPS_PER_ROUND`) —
+backpressure
 (`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
 `MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents) — and the
 gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`). The storage node also reads its

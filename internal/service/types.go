@@ -46,6 +46,29 @@ type QueryRequest struct {
 	Aggregate  string        `json:"aggregate,omitempty"`
 }
 
+// DigestRequest asks a storage node for a Merkle range digest (ADR-030): the per-window
+// content hashes over the series whose ring position falls in any of Ranges, for samples
+// in [Start, End], bucketed by Window ms. Each range is a [lo, hi] hash arc — half-open
+// (lo, hi]; lo > hi wraps the ring; lo == hi is the whole ring. The response is a
+// storage.MerkleDigest. The arc set is supplied by the coordinator (which holds the
+// ring) so the storage node stays ring-agnostic.
+type DigestRequest struct {
+	Ranges [][2]uint64 `json:"ranges"`
+	Start  int64       `json:"start"`
+	End    int64       `json:"end"`
+	Window int64       `json:"window"`
+}
+
+// RangeRequest asks a storage node to export the raw samples whose ring position falls
+// in any of Ranges, for samples in [Start, End] (ADR-030). The response is a
+// WriteRequest, so the coordinator can push whatever a peer is missing straight back
+// through the same backfill path hinted handoff uses.
+type RangeRequest struct {
+	Ranges [][2]uint64 `json:"ranges"`
+	Start  int64       `json:"start"`
+	End    int64       `json:"end"`
+}
+
 // MatcherJSON serializes a label matcher over the wire.
 type MatcherJSON struct {
 	Name  string `json:"name"`

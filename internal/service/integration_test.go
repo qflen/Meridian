@@ -13,10 +13,41 @@ import (
 	"testing"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/cluster"
 	"github.com/meridiandb/meridian/internal/query"
 	"github.com/meridiandb/meridian/internal/service"
 	"github.com/meridiandb/meridian/internal/storage"
 )
+
+// wireRangesToStorage converts the wire [lo,hi] arc pairs to storage hash ranges, the
+// same conversion cmd/storage's anti-entropy handlers do.
+func wireRangesToStorage(ranges [][2]uint64) []storage.HashRange {
+	out := make([]storage.HashRange, len(ranges))
+	for i, p := range ranges {
+		out[i] = storage.HashRange{Lo: p[0], Hi: p[1]}
+	}
+	return out
+}
+
+// exportToWrite renders exported series as a WriteRequest (the backfill wire shape),
+// dropping the synthetic __name__ label so a backfilled series recreates the same key.
+func exportToWrite(series []storage.ResultSeries) service.WriteRequest {
+	wr := service.WriteRequest{}
+	for _, rs := range series {
+		var labels []service.Label
+		for k, v := range rs.Labels {
+			if k != "__name__" {
+				labels = append(labels, service.Label{Name: k, Value: v})
+			}
+		}
+		samples := make([]service.Sample, len(rs.Points))
+		for i, p := range rs.Points {
+			samples[i] = service.Sample{TimestampMs: p.Timestamp, Value: p.Value}
+		}
+		wr.TimeSeries = append(wr.TimeSeries, service.TimeSeries{Name: rs.Name, Labels: labels, Samples: samples})
+	}
+	return wr
+}
 
 // openTestDB opens a TSDB whose WAL and blocks live under a unique temp dir.
 // DefaultTSDBOptions hardcodes ./data/{wal,blocks}, so without overriding those every
@@ -421,6 +452,35 @@ func replMux(n *replNode) http.Handler {
 	})
 	mux.HandleFunc("/api/internal/resolutions", func(w http.ResponseWriter, r *http.Request) {
 		writeResolutions(w, n.db)
+	})
+	// Anti-entropy (ADR-030): a digest endpoint and a range-export endpoint, mirroring
+	// the storage node. The ring hash is injected (cluster.HashKey), exactly as
+	// cmd/storage does, so a series is classified the same way it was routed.
+	mux.HandleFunc("/api/internal/antientropy/digest", func(w http.ResponseWriter, r *http.Request) {
+		var req service.DigestRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		d, err := n.db.RangeDigest(wireRangesToStorage(req.Ranges), req.Start, req.End, req.Window, cluster.HashKey)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(d)
+	})
+	mux.HandleFunc("/api/internal/antientropy/range", func(w http.ResponseWriter, r *http.Request) {
+		var req service.RangeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		series, err := n.db.RangeExport(wireRangesToStorage(req.Ranges), req.Start, req.End, cluster.HashKey)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(exportToWrite(series))
 	})
 	// Gate: a "down" node fails every request, the way a crashed process would.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

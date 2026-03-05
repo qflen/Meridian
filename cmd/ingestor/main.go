@@ -65,6 +65,33 @@ func main() {
 	sc.StartHealthMonitor(monitorCtx, 2*time.Second)
 	sc.StartHintReplay(monitorCtx, hc.ReplayInterval.Std())
 
+	// Proactive Merkle anti-entropy (ADR-030): a rate-limited, jittered background sweep
+	// compares co-replicas' range digests and repairs the divergence read-repair and
+	// hinted handoff cannot reach — cold data, a series no longer written, or a window
+	// dropped past the hint cap. No-op when disabled or the cluster is not replicated.
+	aec := config.AntiEntropyConfig{
+		Enabled:        envBool("ANTI_ENTROPY_ENABLED", true),
+		Interval:       config.Duration(envDuration("ANTI_ENTROPY_INTERVAL", 30*time.Second)),
+		Window:         config.Duration(envDuration("ANTI_ENTROPY_WINDOW", time.Hour)),
+		Lookback:       config.Duration(envDuration("ANTI_ENTROPY_LOOKBACK", 0)),
+		Jitter:         config.Duration(envDuration("ANTI_ENTROPY_JITTER", 10*time.Second)),
+		GroupsPerRound: envInt("ANTI_ENTROPY_GROUPS_PER_ROUND", 16),
+	}
+	if err := aec.Validate(); err != nil {
+		log.Fatalf("invalid anti-entropy config: %v", err)
+	}
+	if aec.Enabled {
+		sc.StartAntiEntropy(monitorCtx, service.AntiEntropyOptions{
+			Interval:       aec.Interval.Std(),
+			Window:         aec.Window.Std(),
+			Lookback:       aec.Lookback.Std(),
+			Jitter:         aec.Jitter.Std(),
+			GroupsPerRound: aec.GroupsPerRound,
+		})
+		log.Printf("anti-entropy enabled: interval=%s window=%s lookback=%s jitter=%s groups/round=%d",
+			aec.Interval.Std(), aec.Window.Std(), aec.Lookback.Std(), aec.Jitter.Std(), aec.GroupsPerRound)
+	}
+
 	// Bound in-flight writes: a worker pool drains a bounded queue to the quorum
 	// Write, so a stalled replica backpressures (then sheds → 429) the producer
 	// instead of piling up unbounded concurrent writes. See ADR-023.
@@ -171,6 +198,14 @@ func (s *ingestorServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 				DroppedSamples:  hs.Dropped(),
 			})
 		}
+		ae := s.storage.AntiEntropyStats()
+		server.WriteAntiEntropyMetrics(w, s.nodeID, "ingestor", server.AntiEntropyStats{
+			Rounds:             ae.Rounds,
+			DivergentWindows:   ae.DivergentWindows,
+			Repairs:            ae.Repairs,
+			SamplesTransferred: ae.SamplesTransferred,
+			BytesTransferred:   ae.BytesTransferred,
+		})
 	}
 }
 

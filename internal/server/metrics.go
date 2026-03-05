@@ -185,6 +185,48 @@ func WriteHandoffMetrics(w io.Writer, node, role string, st HandoffStats) {
 	fmt.Fprintf(w, "meridian_handoff_dropped_samples_total{node=%q,role=%q} %d\n", node, role, st.DroppedSamples)
 }
 
+// AntiEntropyStats is a snapshot of the anti-entropy sweep counters for metrics
+// (ADR-030). The coordinator (the ingestor) builds it from its StorageClient.
+type AntiEntropyStats struct {
+	// Rounds is the cumulative replica-group comparisons run (a converged group counts).
+	Rounds int64
+	// DivergentWindows is the cumulative (group × window) buckets found to disagree.
+	DivergentWindows int64
+	// Repairs is the cumulative backfill pushes sent to converge a peer.
+	Repairs int64
+	// SamplesTransferred is the cumulative samples moved by those repairs.
+	SamplesTransferred int64
+	// BytesTransferred is the cumulative bytes of those backfill bodies.
+	BytesTransferred int64
+}
+
+// WriteAntiEntropyMetrics writes the proactive anti-entropy metrics for one node/role
+// (ADR-030): the rounds run, the divergent windows found, and the repairs/samples/bytes
+// transferred. All are cumulative counters, so a scraper derives a convergence or
+// transfer rate with rate(). divergent_windows climbing without repairs climbing flags
+// divergence the sweep cannot resolve (e.g. a value conflict at the same timestamp).
+func WriteAntiEntropyMetrics(w io.Writer, node, role string, st AntiEntropyStats) {
+	fmt.Fprintf(w, "# HELP meridian_anti_entropy_rounds_total Replica-group digest comparisons run by the anti-entropy sweep.\n")
+	fmt.Fprintf(w, "# TYPE meridian_anti_entropy_rounds_total counter\n")
+	fmt.Fprintf(w, "meridian_anti_entropy_rounds_total{node=%q,role=%q} %d\n", node, role, st.Rounds)
+
+	fmt.Fprintf(w, "# HELP meridian_anti_entropy_divergent_windows_total Time windows found divergent between co-replicas.\n")
+	fmt.Fprintf(w, "# TYPE meridian_anti_entropy_divergent_windows_total counter\n")
+	fmt.Fprintf(w, "meridian_anti_entropy_divergent_windows_total{node=%q,role=%q} %d\n", node, role, st.DivergentWindows)
+
+	fmt.Fprintf(w, "# HELP meridian_anti_entropy_repairs_total Backfill pushes sent to converge a replica.\n")
+	fmt.Fprintf(w, "# TYPE meridian_anti_entropy_repairs_total counter\n")
+	fmt.Fprintf(w, "meridian_anti_entropy_repairs_total{node=%q,role=%q} %d\n", node, role, st.Repairs)
+
+	fmt.Fprintf(w, "# HELP meridian_anti_entropy_transferred_samples_total Samples transferred to converge replicas.\n")
+	fmt.Fprintf(w, "# TYPE meridian_anti_entropy_transferred_samples_total counter\n")
+	fmt.Fprintf(w, "meridian_anti_entropy_transferred_samples_total{node=%q,role=%q} %d\n", node, role, st.SamplesTransferred)
+
+	fmt.Fprintf(w, "# HELP meridian_anti_entropy_transferred_bytes_total Bytes transferred by anti-entropy repairs.\n")
+	fmt.Fprintf(w, "# TYPE meridian_anti_entropy_transferred_bytes_total counter\n")
+	fmt.Fprintf(w, "meridian_anti_entropy_transferred_bytes_total{node=%q,role=%q} %d\n", node, role, st.BytesTransferred)
+}
+
 // WriteAnomalyMetrics writes the streaming-anomaly-detector metrics for one
 // node/role: the cumulative count of alerts raised (a counter) and the number of
 // series currently firing (a gauge). Shared by the monolith and the gateway so

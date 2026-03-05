@@ -1201,3 +1201,108 @@ byte-for-byte as ADR-022.
   hints are dropped and counted; that replica then relies on read-repair for the forward
   part and stays holed on the dropped interior window. The cap is the memory/disk bound;
   raising it trades durability headroom for footprint.
+
+---
+
+## ADR-030: Proactive Anti-Entropy — Merkle Range Digests for Background Replica Convergence
+
+**Status**: Accepted
+**Context**: After ADR-022 (replication) and ADR-029 (hinted handoff), every convergence
+path is still *triggered* — and each leaves a gap the others do not close:
+
+- **Read-repair only converges on read.** A series that is written but rarely (or never)
+  queried, or a replica that fell behind on cold historical data, is never compared until
+  someone reads it. Divergence in cold data can persist indefinitely.
+- **Hinted handoff only covers a miss the ingestor *observed*.** A hint exists only
+  because a write-time quorum noticed a natural owner was unreachable. Divergence from a
+  cause no ingestor saw — a hint dropped past `max_samples_per_node`, a partial write that
+  reached some replicas before a crash, on-disk bit-rot, a node restored from a stale
+  backup — produces no hint and is never replayed.
+- **A series no longer written gets neither.** No new writes means no hints; no reads
+  means no repair.
+
+ADR-029 explicitly deferred this. The goal: a **proactive** background sweep that compares
+what replicas *actually hold* and repairs any difference — cheaply (compare compact
+digests, transfer only what differs) and with bounded cost.
+
+**Decision**: Compute **Merkle range digests** over `(ring-range × time-window)` buckets
+and run a rate-limited coordinator sweep that reuses the ADR-029 backfill apply for the
+transfer. The work splits across the existing layers along the import direction (a
+ring-agnostic storage digest; the ring-aware loop in the service layer).
+
+- **Ring-range × time-window digests — pure, ring-agnostic (storage).** A storage node
+  summarises the series whose ring position falls in a set of hash arcs, over a time span,
+  bucketed into fixed windows. Each leaf hashes the contained `(series, sample)` data
+  (order-independent across series; the window start is bound in); a binary Merkle fold
+  over the leaves gives the **root**. Equal roots ⇒ the two sides already agree over the
+  whole span — the common case, and the sweep stops there transferring **nothing**; only a
+  differing root needs descending into the per-window leaves to localise divergence. The
+  ring hash is **injected** (`cluster.HashKey`), so the node classifies a series by exactly
+  the key writes were routed by *without* the storage layer importing the ring.
+- **Replica-group sweep — the loop (service / the ingestor).** `ring.ReplicaGroups`
+  partitions the ring into the arc sets that share a replica set — the same clockwise
+  distinct-owner walk `PreferenceList` does per key, but computed once per arc and
+  **state-independent**, so the grouping is stable across up/down churn and the group count
+  tracks the cluster's distinct replica sets, not the virtual-node count. The background
+  loop round-robins these groups — **rate-limited** (`groups_per_round`) and **jittered** so
+  co-located coordinators do not sweep in lockstep. For each group it fetches a digest from
+  every live replica over the group's arcs, finds the windows whose leaves disagree, reads
+  *only* those windows, and pushes each replica the `(series, timestamp)` pairs it is
+  missing.
+- **Reuse the out-of-order-tolerant backfill apply (ADR-029) — DRY.** Repairs go through
+  the *exact* `/api/internal/backfill` path hints replay through: gap-fill, idempotent,
+  out-of-order tolerant, WAL-durable. So a coordinator pushing a peer's missing points
+  fills interior gaps, never overwrites an existing point, and survives a storage crash —
+  and **bidirectional missing-fill** (read the window from every replica, push each what it
+  lacks) converges co-replicas to the window's **union** in a single pass. The read is a
+  sibling range-export endpoint; the push reuses the shared POST body (`postBackfill`), so
+  there is no second transfer path to keep correct.
+- **Scope to shared arcs — the correctness crux.** Two nodes are co-replicas only over the
+  arcs where *both* are natural owners; data a node holds outside that (where only it is an
+  owner, or left over from a topology change) is **not** divergence and must not transfer.
+  Bucketing by ring-range and comparing only a group's own replicas is precisely what stops
+  the sweep from "repairing" data the other node was never meant to hold — the reason the
+  digest is scoped by hash arc rather than taken over a node's whole dataset.
+
+Why this shape: it **complements** rather than replaces. Read-repair stays the cheap
+forward-converging read-path case; hinted handoff stays the write-path known-down-window
+case; anti-entropy is the proactive backstop for everything neither sees — and it is built
+out of the pieces already there (the `PreferenceList` ring walk and the backfill apply)
+rather than a parallel mechanism. Merkle digests make it affordable: agreement costs one
+root comparison per group, and divergence transfers only the differing window's missing
+points, not the range.
+
+**Consequences**: Co-replicas converge with no read and no recorded miss, proven
+end-to-end — write divergent subsets *straight to two nodes' TSDBs* (never the client read
+path, so read-repair cannot be what converges them), run one round, and both hold the union
+with exactly the differing window's missing points transferred (two samples, not the whole
+range), while a second round over the now-equal cluster transfers nothing. Bounded by
+construction: `groups_per_round` caps the spatial fan-out per round (the round-robin cursor
+covers the rest over successive rounds), jitter de-synchronises coordinators, and per-round
+read cost is bounded by `window`/`lookback`. Observability:
+`meridian_anti_entropy_rounds_total`, `_divergent_windows_total`, `_repairs_total`,
+`_transferred_samples_total`, and `_transferred_bytes_total` on the coordinator. Opt-in and
+on by default for the cluster tier; disabled, convergence is byte-for-byte the ADR-029
+behaviour.
+
+**Deferred (honest scope)**:
+- **One coordinator per deployment.** The sweep runs on the ingestor (it already holds the
+  ring and the backfill client). Multiple ingestors would each sweep the same groups —
+  redundant but safe (every apply is idempotent); the compose tier designates a single
+  coordinator with `ANTI_ENTROPY_ENABLED`. A storage-side peer-to-peer sweep would drop the
+  coordinator role but requires each storage node to carry the ring.
+- **Value conflicts are surfaced, not resolved.** Because backfill is gap-fill, two
+  replicas holding the *same* timestamp with *different* values never reconcile that point;
+  the window stays divergent (visible as `divergent_windows` climbing while `repairs` does
+  not) rather than being silently overwritten — Meridian has no last-writer-wins clock. In
+  practice append-only ingestion does not produce same-`(series, timestamp)`, different-value
+  conflicts.
+- **Full-history cost is the operator's dial.** `lookback: 0` re-digests all history each
+  round (correct — it catches everything); a finite lookback bounds per-round read cost and
+  leans on hints/read-repair for older data. Digests are recomputed from the window's points
+  each round — no cached/incremental digest yet, which a write-time rolling hash per window
+  could add.
+- **A divergent window is re-read whole.** Localisation is to the window; a divergent
+  window reads all its in-range points from each replica before pushing only the gaps. A
+  finer per-series or per-point digest would read less at the cost of a larger digest —
+  `window` is the knob that trades the two off.

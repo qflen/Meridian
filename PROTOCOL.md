@@ -162,6 +162,29 @@ resolution every live node can serve — the intersection):
 - `increase_resolutions`: the subset whose counter-increase column is complete, i.e. the
   tiers from which `rate()` can be served (ADR-025).
 
+### Hinted-handoff backfill
+
+```
+POST /api/internal/backfill
+```
+
+The catch-up path for hinted handoff (ADR-029). The ingestor replays the hints it
+buffered for a replica that was down through this endpoint when the replica returns. The
+request body is identical to a storage write (`{"time_series":[...]}`); the difference is
+the apply semantics: backfill accepts samples **older** than a series' last (inserting
+them in sorted position, filling only gaps) where `/api/internal/write` would reject them
+as out-of-order (ADR-015). This is what fills an interior gap read-repair cannot. The
+response reports how many samples were applied (an exact duplicate of an existing point is
+skipped):
+
+```json
+{ "samples_ingested": 128 }
+```
+
+Backfilled samples are logged under a distinct WAL frame, so they survive a storage
+restart and replay through the same out-of-order-tolerant path; only a recovering replica
+uses this endpoint, so the live in-order write path is unaffected.
+
 ## WebSocket Streams
 
 ### Metrics Stream

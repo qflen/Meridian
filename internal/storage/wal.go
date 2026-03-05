@@ -26,6 +26,13 @@ const (
 	// WAL entry type markers.
 	walEntrySeries  byte = 0x01
 	walEntrySamples byte = 0x02
+	// walEntryBackfill is a batch of out-of-order catch-up samples (hinted-handoff
+	// replay, ADR-029). It encodes identically to walEntrySamples but replays through
+	// the out-of-order-tolerant backfill path (HandleBackfill) rather than the strict
+	// in-order sample path, so a head recovered from the WAL matches the live head even
+	// where backfill filled an interior gap. Live out-of-order rejection (ADR-015) is
+	// unchanged: only frames written by the dedicated backfill path carry this marker.
+	walEntryBackfill byte = 0x03
 )
 
 // Sample represents a single timestamped data point for a series.
@@ -35,10 +42,14 @@ type Sample struct {
 	Value     float64
 }
 
-// WALHandler processes replayed WAL entries.
+// WALHandler processes replayed WAL entries. HandleSamples replays live (in-order)
+// sample frames; HandleBackfill replays out-of-order catch-up frames written by the
+// hinted-handoff backfill path (ADR-029), applied through the out-of-order-tolerant
+// insert so the recovered head matches the live head exactly.
 type WALHandler interface {
 	HandleSeries(id uint64, name string, labels map[string]string) error
 	HandleSamples(samples []Sample) error
+	HandleBackfill(samples []Sample) error
 }
 
 // WAL is an append-only write-ahead log with CRC32-framed entries.
@@ -203,8 +214,22 @@ func (w *WAL) LogSeries(id uint64, name string, labels map[string]string) error 
 	return w.writeFrame(buf)
 }
 
-// LogSamples writes a batch of samples to the WAL.
+// LogSamples writes a batch of live (in-order) samples to the WAL.
 func (w *WAL) LogSamples(samples []Sample) error {
+	return w.logSamples(walEntrySamples, samples)
+}
+
+// LogBackfillSamples writes a batch of out-of-order catch-up samples under the backfill
+// frame type, so replay applies them through the out-of-order-tolerant backfill path
+// (HandleBackfill) instead of the strict in-order sample path. See ADR-029.
+func (w *WAL) LogBackfillSamples(samples []Sample) error {
+	return w.logSamples(walEntryBackfill, samples)
+}
+
+// logSamples encodes and writes a sample batch under the given entry type. The on-disk
+// layout is identical for live and backfill frames — only the type byte differs — so
+// the two share one encoder.
+func (w *WAL) logSamples(entryType byte, samples []Sample) error {
 	if len(samples) == 0 {
 		return nil
 	}
@@ -213,7 +238,7 @@ func (w *WAL) LogSamples(samples []Sample) error {
 	size := 1 + 4 + len(samples)*24
 	buf := make([]byte, size)
 	off := 0
-	buf[off] = walEntrySamples
+	buf[off] = entryType
 	off++
 	binary.LittleEndian.PutUint32(buf[off:], uint32(len(samples)))
 	off += 4
@@ -655,7 +680,17 @@ func (w *WAL) decodeEntry(payload []byte, handler WALHandler) error {
 	case walEntrySeries:
 		return w.decodeSeries(payload[1:], handler)
 	case walEntrySamples:
-		return w.decodeSamples(payload[1:], handler)
+		samples, err := decodeSamplePayload(payload[1:])
+		if err != nil {
+			return err
+		}
+		return handler.HandleSamples(samples)
+	case walEntryBackfill:
+		samples, err := decodeSamplePayload(payload[1:])
+		if err != nil {
+			return err
+		}
+		return handler.HandleBackfill(samples)
 	default:
 		return fmt.Errorf("unknown entry type: %x", payload[0])
 	}
@@ -712,16 +747,19 @@ func (w *WAL) decodeSeries(data []byte, handler WALHandler) error {
 	return handler.HandleSeries(id, name, labels)
 }
 
-func (w *WAL) decodeSamples(data []byte, handler WALHandler) error {
+// decodeSamplePayload parses a sample batch (the body after the type byte). It backs
+// both the live (walEntrySamples) and backfill (walEntryBackfill) frames, which share
+// the same on-disk layout; decodeEntry routes the parsed batch to the matching handler.
+func decodeSamplePayload(data []byte) ([]Sample, error) {
 	if len(data) < 4 {
-		return fmt.Errorf("samples entry too short")
+		return nil, fmt.Errorf("samples entry too short")
 	}
 	count := int(binary.LittleEndian.Uint32(data[0:4]))
 	off := 4
 	// Validate count against the available bytes BEFORE multiplying, so count*24
 	// cannot overflow a 32-bit int on 32-bit builds.
 	if maxCount := (len(data) - off) / 24; count > maxCount {
-		return fmt.Errorf("samples data truncated: count %d exceeds capacity %d", count, maxCount)
+		return nil, fmt.Errorf("samples data truncated: count %d exceeds capacity %d", count, maxCount)
 	}
 
 	samples := make([]Sample, count)
@@ -734,5 +772,5 @@ func (w *WAL) decodeSamples(data []byte, handler WALHandler) error {
 		off += 8
 	}
 
-	return handler.HandleSamples(samples)
+	return samples, nil
 }

@@ -47,10 +47,13 @@ services:
     entrypoint: ["/app/ingestor"]
     ports:
       - "9090:9090"
+    volumes:
+      - ingestor-1-data:/app/data
     environment:
       INGESTOR_HTTP_ADDR: ":8080"
       INGESTOR_TCP_ADDR: ":9090"
       INGESTOR_NODE_ID: "ingestor-1"
+      INGESTOR_DATA_DIR: "/app/data"
       STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
     depends_on:
       storage-1:
@@ -75,10 +78,13 @@ services:
     entrypoint: ["/app/ingestor"]
     ports:
       - "9091:9090"
+    volumes:
+      - ingestor-2-data:/app/data
     environment:
       INGESTOR_HTTP_ADDR: ":8080"
       INGESTOR_TCP_ADDR: ":9090"
       INGESTOR_NODE_ID: "ingestor-2"
+      INGESTOR_DATA_DIR: "/app/data"
       STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
     depends_on:
       storage-1:
@@ -223,6 +229,8 @@ volumes:
   storage-1-data:
   storage-2-data:
   storage-3-data:
+  ingestor-1-data: # buffered hinted-handoff hints (ADR-029), durable across restarts
+  ingestor-2-data:
 
 networks:
   meridian-net:

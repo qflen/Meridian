@@ -149,6 +149,42 @@ func WriteAdmissionMetrics(w io.Writer, node, role string, st backpressure.Shape
 	}
 }
 
+// HandoffStats is a snapshot of the hinted-handoff hint store for metrics (ADR-029).
+// The ingestor builds it from its service.HintStore.
+type HandoffStats struct {
+	// PendingSamples is the samples currently buffered as hints for unreachable replicas.
+	PendingSamples int64
+	// PendingHints is the buffered hint records (each is one missed write batch).
+	PendingHints int64
+	// ReplayedSamples is the cumulative samples replayed to recovered replicas.
+	ReplayedSamples int64
+	// DroppedSamples is the cumulative samples dropped because a target hit its buffer cap.
+	DroppedSamples int64
+}
+
+// WriteHandoffMetrics writes the hinted-handoff metrics for one node/role (ADR-029): the
+// pending-hint gauges (buffered samples and records awaiting a recovered replica) and the
+// cumulative replayed/dropped sample counters. It is emitted by the write path (the
+// ingestor) that owns the hint store; a scraper derives a replay or drop rate with
+// rate(). The counters are cumulative (Prometheus-correct).
+func WriteHandoffMetrics(w io.Writer, node, role string, st HandoffStats) {
+	fmt.Fprintf(w, "# HELP meridian_handoff_pending_samples Samples currently buffered as hints for unreachable replicas.\n")
+	fmt.Fprintf(w, "# TYPE meridian_handoff_pending_samples gauge\n")
+	fmt.Fprintf(w, "meridian_handoff_pending_samples{node=%q,role=%q} %d\n", node, role, st.PendingSamples)
+
+	fmt.Fprintf(w, "# HELP meridian_handoff_pending_hints Buffered hint records awaiting replay to a recovered replica.\n")
+	fmt.Fprintf(w, "# TYPE meridian_handoff_pending_hints gauge\n")
+	fmt.Fprintf(w, "meridian_handoff_pending_hints{node=%q,role=%q} %d\n", node, role, st.PendingHints)
+
+	fmt.Fprintf(w, "# HELP meridian_handoff_replayed_samples_total Samples replayed to recovered replicas via hinted handoff.\n")
+	fmt.Fprintf(w, "# TYPE meridian_handoff_replayed_samples_total counter\n")
+	fmt.Fprintf(w, "meridian_handoff_replayed_samples_total{node=%q,role=%q} %d\n", node, role, st.ReplayedSamples)
+
+	fmt.Fprintf(w, "# HELP meridian_handoff_dropped_samples_total Hint samples dropped because a target's buffer hit its cap.\n")
+	fmt.Fprintf(w, "# TYPE meridian_handoff_dropped_samples_total counter\n")
+	fmt.Fprintf(w, "meridian_handoff_dropped_samples_total{node=%q,role=%q} %d\n", node, role, st.DroppedSamples)
+}
+
 // WriteAnomalyMetrics writes the streaming-anomaly-detector metrics for one
 // node/role: the cumulative count of alerts raised (a counter) and the number of
 // series currently firing (a gauge). Shared by the monolith and the gateway so

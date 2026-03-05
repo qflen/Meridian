@@ -221,6 +221,54 @@ func (h *HeadBlock) Ingest(seriesID uint64, ts int64, val float64) ingestResult 
 	return ingestAccepted
 }
 
+// Backfill inserts a sample into the head out of order, tolerating a timestamp older
+// than the series' last — the catch-up path hinted-handoff replay applies through
+// (ADR-029). Where Ingest enforces the live in-order policy of ADR-015 (an older sample
+// is rejected and counted), Backfill binary-searches the insertion point so the series'
+// timestamps stay sorted, and fills only gaps: a timestamp already present is left
+// untouched (idempotent convergence), never overwritten. This is exactly the interior
+// gap read-repair cannot fill — read-repair writes through the in-order Ingest path, so
+// a point older than a replica's last is rejected there. Returns ingestAccepted on
+// insert, ingestDuplicate when the timestamp was already present.
+func (h *HeadBlock) Backfill(seriesID uint64, ts int64, val float64) ingestResult {
+	h.mu.RLock()
+	s, ok := h.series[seriesID]
+	h.mu.RUnlock()
+	if !ok {
+		return ingestOutOfOrder // unknown series id; the caller creates the series first
+	}
+
+	s.mu.Lock()
+	n := len(s.Timestamps)
+	// Fast path: at or newer than the last sample appends, exactly like Ingest.
+	if n == 0 || ts > s.Timestamps[n-1] {
+		s.Timestamps = append(s.Timestamps, ts)
+		s.Values = append(s.Values, val)
+		s.mu.Unlock()
+		h.updateBounds(ts)
+		h.numSamples.Add(1)
+		return ingestAccepted
+	}
+	// Interior (or leading) position: find where ts belongs.
+	i := sort.Search(n, func(i int) bool { return s.Timestamps[i] >= ts })
+	if i < n && s.Timestamps[i] == ts {
+		s.mu.Unlock()
+		return ingestDuplicate // gap-fill only: never overwrite an existing point
+	}
+	// Insert at i, keeping the timestamp and value slices sorted and aligned.
+	s.Timestamps = append(s.Timestamps, 0)
+	copy(s.Timestamps[i+1:], s.Timestamps[i:])
+	s.Timestamps[i] = ts
+	s.Values = append(s.Values, 0)
+	copy(s.Values[i+1:], s.Values[i:])
+	s.Values[i] = val
+	s.mu.Unlock()
+
+	h.updateBounds(ts)
+	h.numSamples.Add(1)
+	return ingestAccepted
+}
+
 // updateBounds widens the head's [min,max] timestamp range to include ts.
 func (h *HeadBlock) updateBounds(ts int64) {
 	for {

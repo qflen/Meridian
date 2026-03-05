@@ -134,6 +134,7 @@ func (l localIngest) Write(_ context.Context, req service.WriteRequest) (*servic
 func (s *storageServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/internal/write", s.handleWrite)
+	mux.HandleFunc("/api/internal/backfill", s.handleBackfill)
 	mux.HandleFunc("/api/internal/query", s.handleQuery)
 	mux.HandleFunc("/api/internal/resolutions", s.handleResolutions)
 	mux.HandleFunc("/api/internal/series", s.handleSeries)
@@ -191,6 +192,48 @@ func (s *storageServer) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, resp)
+}
+
+// handleBackfill applies historical samples through the out-of-order-tolerant catch-up
+// path (hinted-handoff replay, ADR-029). Unlike /api/internal/write it bypasses the
+// bounded accept queue and the strict in-order policy of ADR-015: it is a recovery path
+// that must accept samples older than a series' last to fill the gap a replica missed
+// while down. Replay is serialized per target, so it does not need the queue's
+// concurrency bound. The body reuses the write wire shape.
+func (s *storageServer) handleBackfill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req service.WriteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	var samples []storage.IngestSample
+	for _, ts := range req.TimeSeries {
+		labels := make(map[string]string, len(ts.Labels))
+		for _, lb := range ts.Labels {
+			labels[lb.Name] = lb.Value
+		}
+		for _, sm := range ts.Samples {
+			samples = append(samples, storage.IngestSample{
+				Name:      ts.Name,
+				Labels:    labels,
+				Timestamp: sm.TimestampMs,
+				Value:     sm.Value,
+			})
+		}
+	}
+
+	applied, err := s.db.Backfill(samples)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, service.WriteResponse{SamplesIngested: int64(applied)})
 }
 
 func (s *storageServer) handleQuery(w http.ResponseWriter, r *http.Request) {

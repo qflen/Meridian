@@ -85,8 +85,8 @@ func (r *Ring) RemoveNode(id string) {
 }
 
 // SetState updates the lifecycle state of an already-registered node. It is the hook
-// the health monitor uses to mark nodes Active/Dead so routing excludes the dead.
-// Unknown node IDs are ignored.
+// the health monitor uses to mark nodes Active/Dead/Joining so routing excludes the
+// non-serving ones. Unknown node IDs are ignored.
 func (r *Ring) SetState(id string, state NodeState) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -96,11 +96,26 @@ func (r *Ring) SetState(id string, state NodeState) {
 	}
 }
 
+// State returns the lifecycle state of a registered node and whether it is registered.
+// It lets the health monitor and the hinted-handoff replay loop read a node's current
+// state to drive the Dead → Joining → Active catch-up transition. See ADR-029.
+func (r *Ring) State(id string) (NodeState, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n, ok := r.nodes[id]
+	if !ok {
+		return "", false
+	}
+	return n.State, true
+}
+
 // GetNodes returns up to replication distinct nodes responsible for the given key,
-// walking the ring clockwise from the key's hash. Nodes in the Dead or Leaving state
-// are skipped, so the result holds only replicas that can currently serve the key.
-// The returned slice can therefore be shorter than replication when fewer live nodes
-// exist — callers compare its length against the write/read quorum.
+// walking the ring clockwise from the key's hash. Nodes excluded from routing — Dead,
+// Leaving, or Joining (catching up via hinted handoff) — are skipped, so the result
+// holds only replicas that can currently serve the key. The returned slice can
+// therefore be shorter than replication when fewer live nodes exist — callers compare
+// its length against the write/read quorum. To find the natural preferred owners
+// including the excluded ones (so a missed owner can be hinted), use PreferenceList.
 func (r *Ring) GetNodes(key string, replication int) []Node {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -127,12 +142,49 @@ func (r *Ring) GetNodes(key string, replication int) []Node {
 		}
 		seen[entry.nodeID] = true
 		node, ok := r.nodes[entry.nodeID]
-		if !ok || node.State == NodeDead || node.State == NodeLeaving {
+		if !ok || node.State.excludedFromRouting() {
 			continue
 		}
 		result = append(result, node)
 	}
 
+	return result
+}
+
+// PreferenceList returns up to replication distinct nodes responsible for the key,
+// walking the ring clockwise from the key's hash WITHOUT skipping any state — the
+// natural preferred owners, including nodes that are Dead, Leaving, or Joining. It is
+// the counterpart to GetNodes (which returns only the live, routable replicas, possibly
+// substituting fallbacks for excluded owners): hinted handoff diffs the two to find a
+// natural owner a write could not reach and buffers a hint for it. See ADR-029.
+func (r *Ring) PreferenceList(key string, replication int) []Node {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if len(r.ring) == 0 || replication <= 0 {
+		return nil
+	}
+
+	hash := hashKey(key)
+	idx := sort.Search(len(r.ring), func(i int) bool {
+		return r.ring[i].hash >= hash
+	})
+	if idx >= len(r.ring) {
+		idx = 0
+	}
+
+	seen := make(map[string]bool)
+	var result []Node
+	for i := 0; i < len(r.ring) && len(result) < replication; i++ {
+		entry := r.ring[(idx+i)%len(r.ring)]
+		if seen[entry.nodeID] {
+			continue
+		}
+		seen[entry.nodeID] = true
+		if node, ok := r.nodes[entry.nodeID]; ok {
+			result = append(result, node)
+		}
+	}
 	return result
 }
 
@@ -157,15 +209,16 @@ func (r *Ring) Nodes() []Node {
 	return result
 }
 
-// LiveNodes returns every node that is neither Dead nor Leaving — the set a scatter
-// read may safely query. The order is unspecified.
+// LiveNodes returns every node eligible to serve live traffic — i.e. not Dead, Leaving,
+// or Joining (catching up) — the set a scatter read may safely query. The order is
+// unspecified.
 func (r *Ring) LiveNodes() []Node {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	result := make([]Node, 0, len(r.nodes))
 	for _, n := range r.nodes {
-		if n.State == NodeDead || n.State == NodeLeaving {
+		if n.State.excludedFromRouting() {
 			continue
 		}
 		result = append(result, n)

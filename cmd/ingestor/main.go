@@ -32,10 +32,38 @@ func main() {
 
 	sc := newStorageClient(storageAddrs)
 
-	// Drive ring node-state from /health so replicated writes route around dead nodes.
 	monitorCtx, stopMonitor := context.WithCancel(context.Background())
 	defer stopMonitor()
+
+	// Hinted handoff (ADR-029): buffer writes for a replica that is unreachable at write
+	// time and replay them on its return so it fully converges, including an interior gap
+	// read-repair cannot fix. Wire the hint store before the health monitor starts, so a
+	// replica returning with a backlog is routed through the catching-up (Joining) state
+	// rather than straight back into live write routing.
+	hc := config.HandoffConfig{
+		Enabled:           envBool("HINTED_HANDOFF_ENABLED", true),
+		Dir:               envOrDefault("HINT_DIR", envOrDefault("INGESTOR_DATA_DIR", "./data")+"/hints"),
+		MaxSamplesPerNode: envInt("HINT_MAX_SAMPLES_PER_NODE", 1_000_000),
+		ReplayInterval:    config.Duration(envDuration("HINT_REPLAY_INTERVAL", 5*time.Second)),
+	}
+	if err := hc.Validate(); err != nil {
+		log.Fatalf("invalid hinted-handoff config: %v", err)
+	}
+	if hc.Enabled {
+		store, err := service.NewHintStore(hc.Dir, hc.MaxSamplesPerNode)
+		if err != nil {
+			log.Fatalf("open hint store: %v", err)
+		}
+		sc.SetHintStore(store)
+		log.Printf("hinted handoff enabled: dir=%s max_samples_per_node=%d replay_interval=%s",
+			hc.Dir, hc.MaxSamplesPerNode, hc.ReplayInterval.Std())
+	}
+
+	// Drive ring node-state from /health so replicated writes route around dead nodes,
+	// and replay buffered hints to recovered replicas in the background (no-op if handoff
+	// is disabled).
 	sc.StartHealthMonitor(monitorCtx, 2*time.Second)
+	sc.StartHintReplay(monitorCtx, hc.ReplayInterval.Std())
 
 	// Bound in-flight writes: a worker pool drains a bounded queue to the quorum
 	// Write, so a stalled replica backpressures (then sheds → 429) the producer
@@ -133,6 +161,16 @@ func (s *ingestorServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if s.pool != nil {
 		server.WriteQueueMetrics(w, s.nodeID, "ingestor", s.pool.Stats())
 		server.WriteAdmissionMetrics(w, s.nodeID, "ingestor", s.pool.AdmissionStats())
+	}
+	if s.storage != nil {
+		if hs := s.storage.HintStore(); hs != nil {
+			server.WriteHandoffMetrics(w, s.nodeID, "ingestor", server.HandoffStats{
+				PendingSamples:  hs.PendingSamples(),
+				PendingHints:    hs.PendingRecords(),
+				ReplayedSamples: hs.Replayed(),
+				DroppedSamples:  hs.Dropped(),
+			})
+		}
 	}
 }
 
@@ -280,6 +318,19 @@ func envInt(key string, def int) int {
 			return n
 		}
 		log.Printf("invalid %s=%q, using default %d", key, v, def)
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+		log.Printf("invalid %s=%q, using default %v", key, v, def)
 	}
 	return def
 }

@@ -152,6 +152,43 @@ type ClusterConfig struct {
 	// ReadQuorum (R) is the number of replicas a read must hear from.
 	ReadQuorum   int `yaml:"read_quorum"`
 	VirtualNodes int `yaml:"virtual_nodes"`
+	// Handoff configures hinted handoff (ADR-029), which buffers writes for a replica
+	// that is unreachable at write time and replays them on its return.
+	Handoff HandoffConfig `yaml:"handoff"`
+}
+
+// HandoffConfig configures hinted handoff (ADR-029): durable, bounded buffering of
+// writes destined for a replica that was unreachable at write time, replayed on its
+// return so it fully converges — including an interior gap read-repair cannot fix.
+// Disabled, a missed write simply waits for read-repair (the ADR-022 behaviour).
+type HandoffConfig struct {
+	// Enabled turns hinted handoff on for the write path (the ingestor).
+	Enabled bool `yaml:"enabled"`
+	// Dir is where buffered hints are persisted (one crash-safe file per hint). The
+	// call site defaults it to "<data_dir>/hints" when empty.
+	Dir string `yaml:"dir"`
+	// MaxSamplesPerNode bounds the samples buffered per target replica; past the cap the
+	// oldest hints are dropped (counted), so a long outage cannot grow the buffer without
+	// bound while the most recent hint is always retained.
+	MaxSamplesPerNode int `yaml:"max_samples_per_node"`
+	// ReplayInterval is how often the replay loop scans for reachable targets to catch
+	// up. Zero uses the built-in default (5s).
+	ReplayInterval Duration `yaml:"replay_interval"`
+}
+
+// Validate checks the hinted-handoff tunables when enabled, so a misconfiguration is
+// caught at load time rather than producing a buffer that can never hold a hint.
+func (c HandoffConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.MaxSamplesPerNode < 1 {
+		return fmt.Errorf("cluster.handoff.max_samples_per_node must be >= 1, got %d", c.MaxSamplesPerNode)
+	}
+	if c.ReplayInterval < 0 {
+		return fmt.Errorf("cluster.handoff.replay_interval must be >= 0, got %s", time.Duration(c.ReplayInterval))
+	}
+	return nil
 }
 
 // Validate checks the replication parameters are internally consistent. It enforces
@@ -173,6 +210,9 @@ func (c ClusterConfig) Validate() error {
 	}
 	if c.VirtualNodes < 1 {
 		return fmt.Errorf("cluster.virtual_nodes must be >= 1, got %d", c.VirtualNodes)
+	}
+	if err := c.Handoff.Validate(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -514,6 +554,11 @@ func DefaultConfig() *Config {
 			WriteQuorum:       2,
 			ReadQuorum:        2,
 			VirtualNodes:      256,
+			Handoff: HandoffConfig{
+				Enabled:           true,
+				MaxSamplesPerNode: 1_000_000,
+				ReplayInterval:    Duration(5 * time.Second),
+			},
 		},
 		Downsampling: DownsamplingConfig{
 			Enabled:  true,

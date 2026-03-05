@@ -11,8 +11,9 @@ import (
 )
 
 type testWALHandler struct {
-	series  []walSeriesRecord
-	samples []Sample
+	series   []walSeriesRecord
+	samples  []Sample
+	backfill []Sample
 }
 
 type walSeriesRecord struct {
@@ -28,6 +29,11 @@ func (h *testWALHandler) HandleSeries(id uint64, name string, labels map[string]
 
 func (h *testWALHandler) HandleSamples(samples []Sample) error {
 	h.samples = append(h.samples, samples...)
+	return nil
+}
+
+func (h *testWALHandler) HandleBackfill(samples []Sample) error {
+	h.backfill = append(h.backfill, samples...)
 	return nil
 }
 

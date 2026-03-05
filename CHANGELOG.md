@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Replication & clustering
+- Hinted handoff (ADR-029): a write that can't reach a natural replica (it's down or
+  catching up) buffers a durable, bounded hint while quorum still succeeds on the
+  survivors, and replays it on the replica's return so it **fully converges** — including
+  an *interior* gap read-repair can't fill (read-repair only converges forward; storage
+  rejects out-of-order — ADR-015). Replay applies through a new out-of-order-tolerant
+  backfill path (`TSDB.Backfill` + a distinct WAL frame + `/api/internal/backfill`), and
+  a returning replica catches up in the reserved `joining` state — excluded from live
+  routing — before it is promoted to `active`, so it is made whole before it can strand a
+  gap. The hint store is per-target, capped in samples (drop-oldest past the cap), and
+  rebuilt from disk on restart; `meridian_handoff_*` exposes pending/replayed/dropped.
+  On by default for the cluster tier (`cluster.handoff`); disabled it is exactly ADR-022.
+
 ### Write path & flow control
 - Per-series fair-share / priority-class load shedding (ADR-027): an opt-in admission
   shaper in front of the bounded ingest queue makes overload shedding selective

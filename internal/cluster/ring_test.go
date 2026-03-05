@@ -292,6 +292,122 @@ func TestRingHash64Bit(t *testing.T) {
 	}
 }
 
+// TestRingPreferenceListIncludesDead proves PreferenceList returns the natural N owners
+// of a key INCLUDING ones that are Dead/Leaving/Joining — exactly where GetNodes would
+// substitute a live fallback — so hinted handoff can diff the two and hint the owner a
+// write could not reach. See ADR-029.
+func TestRingPreferenceListIncludesDead(t *testing.T) {
+	ring := NewRing(256)
+	ring.AddNode(Node{ID: "node-1", Addr: "host1:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-2", Addr: "host2:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-3", Addr: "host3:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-4", Addr: "host4:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-5", Addr: "host5:8080", State: NodeActive})
+
+	// Find a key whose natural 3-owner set includes node-2, then kill node-2.
+	var key string
+	for i := 0; i < 10000; i++ {
+		k := fmt.Sprintf("k_%d", i)
+		if containsNode(ring.PreferenceList(k, 3), "node-2") {
+			key = k
+			break
+		}
+	}
+	if key == "" {
+		t.Fatal("could not find a key whose preference list includes node-2")
+	}
+
+	pref := ring.PreferenceList(key, 3)
+	if !containsNode(pref, "node-2") {
+		t.Fatalf("preference list must contain node-2 while it is active, got %v", pref)
+	}
+
+	ring.SetState("node-2", NodeDead)
+
+	// PreferenceList still returns the natural owners (incl. the now-dead node-2)...
+	pref = ring.PreferenceList(key, 3)
+	if len(pref) != 3 || !containsNode(pref, "node-2") {
+		t.Fatalf("preference list must still include dead node-2 (natural owner), got %v", pref)
+	}
+	// ...while GetNodes drops node-2 and substitutes a live fallback (still 3 live).
+	live := ring.GetNodes(key, 3)
+	if containsNode(live, "node-2") {
+		t.Fatalf("GetNodes must not route to dead node-2, got %v", live)
+	}
+	if len(live) != 3 {
+		t.Fatalf("GetNodes should fill 3 live replicas (a fallback for node-2), got %d", len(live))
+	}
+
+	// The hint target is exactly the natural owner GetNodes skipped: pref \ live.
+	liveSet := map[string]bool{}
+	for _, n := range live {
+		liveSet[n.ID] = true
+	}
+	var missed []string
+	for _, n := range pref {
+		if !liveSet[n.ID] {
+			missed = append(missed, n.ID)
+		}
+	}
+	if len(missed) != 1 || missed[0] != "node-2" {
+		t.Fatalf("expected the single missed owner to be node-2, got %v", missed)
+	}
+}
+
+// TestRingExcludesJoining proves a node in the Joining (catching-up) state is kept out
+// of both live write routing (GetNodes) and read scatter (LiveNodes) but remains a
+// natural owner in PreferenceList — so a catching-up node receives no live traffic yet
+// still accrues hints until it is promoted to Active. See ADR-029.
+func TestRingExcludesJoining(t *testing.T) {
+	ring := NewRing(256)
+	ring.AddNode(Node{ID: "node-1", Addr: "host1:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-2", Addr: "host2:8080", State: NodeActive})
+	ring.AddNode(Node{ID: "node-3", Addr: "host3:8080", State: NodeActive})
+
+	ring.SetState("node-2", NodeJoining)
+
+	for i := 0; i < 2000; i++ {
+		key := fmt.Sprintf("series_%d", i)
+		if containsNode(ring.GetNodes(key, 3), "node-2") {
+			t.Fatalf("joining node-2 must not be routed for live writes (key %q)", key)
+		}
+	}
+	for _, n := range ring.LiveNodes() {
+		if n.ID == "node-2" {
+			t.Fatal("joining node-2 must not appear in LiveNodes")
+		}
+	}
+	// But it is still a natural owner for hinting.
+	includes := false
+	for i := 0; i < 2000; i++ {
+		if containsNode(ring.PreferenceList(fmt.Sprintf("series_%d", i), 3), "node-2") {
+			includes = true
+			break
+		}
+	}
+	if !includes {
+		t.Fatal("joining node-2 must still be a natural owner in PreferenceList")
+	}
+}
+
+// TestRingState exercises the State getter that drives the Dead → Joining → Active
+// catch-up transition.
+func TestRingState(t *testing.T) {
+	ring := NewRing(256)
+	ring.AddNode(Node{ID: "node-1", Addr: "host1:8080", State: NodeActive})
+
+	if st, ok := ring.State("node-1"); !ok || st != NodeActive {
+		t.Fatalf("expected (active,true), got (%q,%v)", st, ok)
+	}
+	ring.SetState("node-1", NodeJoining)
+	if st, _ := ring.State("node-1"); st != NodeJoining {
+		t.Fatalf("expected joining, got %q", st)
+	}
+	if _, ok := ring.State("ghost"); ok {
+		t.Fatal("unregistered node must report ok=false")
+	}
+}
+
 func containsNode(nodes []Node, id string) bool {
 	for _, n := range nodes {
 		if n.ID == id {

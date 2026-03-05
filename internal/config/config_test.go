@@ -50,8 +50,8 @@ func TestParseDurationErrors(t *testing.T) {
 func TestClusterConfigValidate(t *testing.T) {
 	valid := []ClusterConfig{
 		{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 256}, // default
-		{ReplicationFactor: 1, WriteQuorum: 1, ReadQuorum: 1, VirtualNodes: 64},   // single node
-		{ReplicationFactor: 3, WriteQuorum: 3, ReadQuorum: 1, VirtualNodes: 8},    // write-all/read-one
+		{ReplicationFactor: 1, WriteQuorum: 1, ReadQuorum: 1, VirtualNodes: 64},  // single node
+		{ReplicationFactor: 3, WriteQuorum: 3, ReadQuorum: 1, VirtualNodes: 8},   // write-all/read-one
 		{ReplicationFactor: 5, WriteQuorum: 3, ReadQuorum: 3, VirtualNodes: 256},
 	}
 	for _, c := range valid {
@@ -61,13 +61,13 @@ func TestClusterConfigValidate(t *testing.T) {
 	}
 
 	invalid := []ClusterConfig{
-		{ReplicationFactor: 0, WriteQuorum: 1, ReadQuorum: 1, VirtualNodes: 1},  // N<1
-		{ReplicationFactor: 3, WriteQuorum: 0, ReadQuorum: 2, VirtualNodes: 1},  // W<1
-		{ReplicationFactor: 3, WriteQuorum: 4, ReadQuorum: 2, VirtualNodes: 1},  // W>N
-		{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 4, VirtualNodes: 1},  // R>N
-		{ReplicationFactor: 3, WriteQuorum: 1, ReadQuorum: 2, VirtualNodes: 1},  // W+R == N (no read-your-writes)
-		{ReplicationFactor: 4, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 1},  // W+R == N
-		{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 0},  // virtual nodes < 1
+		{ReplicationFactor: 0, WriteQuorum: 1, ReadQuorum: 1, VirtualNodes: 1}, // N<1
+		{ReplicationFactor: 3, WriteQuorum: 0, ReadQuorum: 2, VirtualNodes: 1}, // W<1
+		{ReplicationFactor: 3, WriteQuorum: 4, ReadQuorum: 2, VirtualNodes: 1}, // W>N
+		{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 4, VirtualNodes: 1}, // R>N
+		{ReplicationFactor: 3, WriteQuorum: 1, ReadQuorum: 2, VirtualNodes: 1}, // W+R == N (no read-your-writes)
+		{ReplicationFactor: 4, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 1}, // W+R == N
+		{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 0}, // virtual nodes < 1
 	}
 	for _, c := range invalid {
 		if err := c.Validate(); err == nil {
@@ -79,6 +79,36 @@ func TestClusterConfigValidate(t *testing.T) {
 func TestDefaultConfigClusterValid(t *testing.T) {
 	if err := DefaultConfig().Cluster.Validate(); err != nil {
 		t.Fatalf("default cluster config must validate: %v", err)
+	}
+}
+
+func TestHandoffConfigValidate(t *testing.T) {
+	valid := []HandoffConfig{
+		{Enabled: false}, // disabled needs no tunables
+		{Enabled: true, MaxSamplesPerNode: 1, ReplayInterval: 0},
+		{Enabled: true, MaxSamplesPerNode: 1_000_000, ReplayInterval: Duration(5 * time.Second)},
+	}
+	for _, c := range valid {
+		if err := c.Validate(); err != nil {
+			t.Errorf("expected %+v to be valid, got %v", c, err)
+		}
+	}
+
+	invalid := []HandoffConfig{
+		{Enabled: true, MaxSamplesPerNode: 0},                                          // cap < 1
+		{Enabled: true, MaxSamplesPerNode: 10, ReplayInterval: Duration(-time.Second)}, // negative interval
+	}
+	for _, c := range invalid {
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected %+v to be invalid", c)
+		}
+	}
+
+	// A bad handoff block must fail cluster validation (it is nested).
+	cc := ClusterConfig{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 256,
+		Handoff: HandoffConfig{Enabled: true, MaxSamplesPerNode: 0}}
+	if err := cc.Validate(); err == nil {
+		t.Error("cluster validate must reject an invalid nested handoff config")
 	}
 }
 
@@ -94,11 +124,11 @@ func TestIngestionConfigValidate(t *testing.T) {
 	}
 
 	invalid := []IngestionConfig{
-		{BatchSize: 0, MaxConcurrentWrites: 1, QueueCapacity: 10, QueueHighWatermark: 5},        // batch_size < 1
-		{BatchSize: 1000, MaxConcurrentWrites: 0, QueueCapacity: 10000, QueueHighWatermark: 5},  // workers < 1
-		{BatchSize: 1000, MaxConcurrentWrites: 1, QueueCapacity: 500, QueueHighWatermark: 400},  // capacity < batch_size
-		{BatchSize: 100, MaxConcurrentWrites: 1, QueueCapacity: 1000, QueueHighWatermark: 0},    // hw < 1
-		{BatchSize: 100, MaxConcurrentWrites: 1, QueueCapacity: 1000, QueueHighWatermark: 2000}, // hw > capacity
+		{BatchSize: 0, MaxConcurrentWrites: 1, QueueCapacity: 10, QueueHighWatermark: 5},                                              // batch_size < 1
+		{BatchSize: 1000, MaxConcurrentWrites: 0, QueueCapacity: 10000, QueueHighWatermark: 5},                                        // workers < 1
+		{BatchSize: 1000, MaxConcurrentWrites: 1, QueueCapacity: 500, QueueHighWatermark: 400},                                        // capacity < batch_size
+		{BatchSize: 100, MaxConcurrentWrites: 1, QueueCapacity: 1000, QueueHighWatermark: 0},                                          // hw < 1
+		{BatchSize: 100, MaxConcurrentWrites: 1, QueueCapacity: 1000, QueueHighWatermark: 2000},                                       // hw > capacity
 		{BatchSize: 100, MaxConcurrentWrites: 1, QueueCapacity: 1000, QueueHighWatermark: 500, BlockDeadline: Duration(-time.Second)}, // negative deadline
 	}
 	for _, c := range invalid {
@@ -118,7 +148,7 @@ func TestAnomalyConfigValidate(t *testing.T) {
 	valid := []AnomalyConfig{
 		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 3},
 		{Enabled: true, Threshold: 0.5, Alpha: 1, Warmup: 2, DebounceK: 1}, // boundary values
-		{Enabled: false},                                                   // tunables irrelevant when disabled
+		{Enabled: false}, // tunables irrelevant when disabled
 	}
 	for _, c := range valid {
 		if err := c.Validate(); err != nil {

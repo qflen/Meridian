@@ -239,6 +239,18 @@ func (db *TSDB) HandleSamples(samples []Sample) error {
 	return nil
 }
 
+// HandleBackfill implements WALHandler for replay of catch-up frames (ADR-029). It
+// applies samples through the same out-of-order-tolerant insert the live backfill path
+// uses, so a head recovered from the WAL is identical to the pre-crash head even where
+// backfill filled an interior gap. The strict in-order replay of normal sample frames
+// (HandleSamples) is unchanged.
+func (db *TSDB) HandleBackfill(samples []Sample) error {
+	for _, s := range samples {
+		db.head.Backfill(s.SeriesID, s.Timestamp, s.Value)
+	}
+	return nil
+}
+
 // maxCoveredWAL returns the highest WAL low-water-mark durably covered by a loaded
 // block. Replay skips segments at or below it. Blocks predating the field report 0,
 // which conservatively replays the whole WAL.
@@ -334,6 +346,57 @@ func (db *TSDB) IngestBatch(samples []IngestSample) error {
 	db.ingested.Add(accepted)
 	db.outOfOrder.Add(ooo)
 	return nil
+}
+
+// Backfill applies historical samples through the out-of-order-tolerant head path,
+// used only by the hinted-handoff catch-up path (ADR-029) — never live ingest, which
+// keeps the strict in-order policy of ADR-015. It logs the batch to the WAL under a
+// distinct backfill frame so the samples are crash-durable AND replay through the same
+// out-of-order-tolerant insert (a crash mid-catch-up recovers identically); a series
+// the node has never seen is created first. Out-of-order is expected here, so nothing is
+// counted against the out-of-order metric; accepted samples count toward the ingested
+// total like any other stored sample. Returns the number of samples applied (an exact
+// duplicate of an existing point is skipped).
+func (db *TSDB) Backfill(samples []IngestSample) (int, error) {
+	for i := range samples {
+		if err := validateSeriesLabels(samples[i].Name, samples[i].Labels); err != nil {
+			return 0, err
+		}
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	head := db.head
+
+	walSamples := make([]Sample, 0, len(samples))
+	ids := make([]uint64, len(samples))
+	for i, s := range samples {
+		series, created := head.GetOrCreateSeries(s.Name, s.Labels)
+		if created {
+			if err := db.wal.LogSeries(series.ID, s.Name, s.Labels); err != nil {
+				return 0, fmt.Errorf("WAL log series: %w", err)
+			}
+		}
+		ids[i] = series.ID
+		walSamples = append(walSamples, Sample{
+			SeriesID:  series.ID,
+			Timestamp: s.Timestamp,
+			Value:     s.Value,
+		})
+	}
+
+	if err := db.wal.LogBackfillSamples(walSamples); err != nil {
+		return 0, fmt.Errorf("WAL log backfill: %w", err)
+	}
+
+	applied := 0
+	for i, s := range samples {
+		if head.Backfill(ids[i], s.Timestamp, s.Value) == ingestAccepted {
+			applied++
+		}
+	}
+	db.ingested.Add(int64(applied))
+	return applied, nil
 }
 
 // Query executes a query against the head block and all persistent blocks.

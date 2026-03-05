@@ -201,8 +201,11 @@ late-joining clients; the dashboard's Anomalies strip lists them most-recent-fir
 **Hash Ring** (`internal/cluster/ring.go`): a 64-bit SHA-256 consistent hash ring
 with configurable virtual nodes and a deterministic nodeID tie-break, so a key's
 replica set is a function of membership rather than of node-join order. `GetNodes`
-returns the first N distinct replicas walking the ring, skipping nodes in the Dead or
-Leaving state; `SetState`/`LiveNodes` are the hooks the health monitor drives.
+returns the first N distinct **routable** replicas walking the ring, skipping nodes in
+the Dead, Leaving, or Joining (catching-up) state; `PreferenceList` returns the natural
+N owners *including* the skipped ones, so hinted handoff can tell which owner a write
+missed. `SetState`/`State`/`LiveNodes` are the hooks the health monitor and replay loop
+drive.
 
 **Replicated storage client** (`internal/service/client.go`): the live routing
 source. It seeds a ring from the configured storage addresses and applies the
@@ -210,20 +213,42 @@ quorum model (ADR-022):
 
 - **Write** — for each series, `replicas = ring.GetNodes(key, N)`; the series is sent
   to all live replicas (batched per node) and the write succeeds only at ≥W acks.
-  Too few live replicas or acks is a quorum error, not a partial write.
+  Too few live replicas or acks is a quorum error, not a partial write. With hinted
+  handoff on, a natural owner the write missed (down, catching up, or its write failed)
+  has the series buffered as a durable hint (below).
 - **Read** — a label-matcher query scatters to all live nodes (a superset of any
   matched series' replicas), merges and dedupes by (series, timestamp), enforces read
   quorum R globally and per series, and asynchronously **read-repairs** any responding
   replica missing points relative to the merged truth.
 - **Health** — a background `/health` monitor (`StartHealthMonitor`) sets ring node
-  state Active/Dead, so routing excludes dead nodes and re-includes recovered ones; a
-  revived node is caught up by read-repair. The same refresh discovers each live node's
-  rollup tier availability, which the resolution planner intersects across live nodes.
+  state, so routing excludes dead nodes and re-includes recovered ones. The same refresh
+  discovers each live node's rollup tier availability, which the resolution planner
+  intersects across live nodes. With hinted handoff on, a node returning with a hint
+  backlog is routed through `joining` (catching up) before `active`.
+
+**Hinted handoff** (`internal/service/handoff.go`, `hints.go`; ADR-029): the ingestor
+buffers writes a replica misses while down and replays them on its return, closing the
+interior-gap case read-repair cannot reach.
+
+- **Buffer** — `Write` diffs `PreferenceList` (natural owners, incl. down) against the
+  live replicas it reached and, once every series met quorum, records a durable hint per
+  missed owner in a bounded, per-target `HintStore` (one crash-safe file per hint, FIFO,
+  capped in samples per target with drop-oldest, rebuilt from disk on restart).
+- **Replay** — a background loop drains each reachable target's hints in order through
+  the storage node's out-of-order-tolerant `/api/internal/backfill` endpoint
+  (`TSDB.Backfill`), deleting each on ack. Backfill inserts historical samples in sorted
+  position (gap-fill only) and logs them under a distinct WAL frame, so they survive a
+  storage crash while the live in-order policy (ADR-015) is untouched.
+- **Catch-up lifecycle** — a replica returning from Dead with a backlog enters `joining`
+  (excluded from live read/write routing) and is promoted to `active` only once its hints
+  drain, so it is made whole before it can take a fresh write that would strand an
+  interior gap. An already-Active node is never demoted by a transient hint.
 
 The ingestor and querier each build this client from `REPLICATION_FACTOR`/
-`WRITE_QUORUM`/`READ_QUORUM` and run the health monitor. The `Coordinator`
-(`internal/cluster/coordinator.go`) wraps the same ring with `RouteWrite`/`RouteRead`
-helpers. Hinted handoff and rebalancing are future work; the monolith `serve` path is
+`WRITE_QUORUM`/`READ_QUORUM` and run the health monitor; only the ingestor wires the
+hint store (the write owner). The `Coordinator` (`internal/cluster/coordinator.go`)
+wraps the same ring with `RouteWrite`/`RouteRead` helpers. Cross-node anti-entropy and
+rebalancing on membership change are future work; the monolith `serve` path is
 single-node and does not use the ring.
 
 ### Retention & Downsampling

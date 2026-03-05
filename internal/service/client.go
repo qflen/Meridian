@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"sync"
@@ -33,6 +34,12 @@ type StorageClient struct {
 	// resolution planner only picks a tier the cluster can serve. Guarded by resMu.
 	resMu   sync.RWMutex
 	nodeRes map[string]ResolutionsResponse
+
+	// hints, when non-nil, enables hinted handoff (ADR-029): a write that cannot reach
+	// a natural replica buffers a durable hint replayed on the replica's return. Set
+	// once at startup via SetHintStore; nil leaves the ADR-022 behaviour unchanged. The
+	// handoff methods live in handoff.go.
+	hints *HintStore
 }
 
 // ReplicationOptions configures the replication behaviour of a StorageClient.
@@ -123,11 +130,14 @@ func (c *StorageClient) Replicas(name string, labels map[string]string) []string
 	return addrs
 }
 
-// RefreshHealth probes every storage node's /health once and updates its ring state
-// to Active or Dead, so routing immediately excludes nodes that have gone away and
-// re-includes ones that have returned. For a healthy node it also refreshes the cached
-// rollup tier availability used by the resolution planner, so discovery rides the same
-// cycle as liveness and never lags it. Probes run concurrently.
+// RefreshHealth probes every storage node's /health once and updates its ring state so
+// routing immediately excludes nodes that have gone away and re-includes ones that have
+// returned. An unreachable node is marked Dead; a reachable one is resolved by
+// applyReachable, which — when hinted handoff is on — routes a node returning with a
+// backlog through the Joining (catching-up) state before Active (ADR-029), and otherwise
+// just marks it Active (ADR-022). For a healthy node it also refreshes the cached rollup
+// tier availability used by the resolution planner, so discovery rides the same cycle as
+// liveness and never lags it. Probes run concurrently.
 func (c *StorageClient) RefreshHealth() {
 	var wg sync.WaitGroup
 	for _, addr := range c.addrs {
@@ -135,7 +145,7 @@ func (c *StorageClient) RefreshHealth() {
 		go func(addr string) {
 			defer wg.Done()
 			if _, ok := HealthCheck(addr); ok {
-				c.ring.SetState(addr, cluster.NodeActive)
+				c.applyReachable(addr)
 				if res, ok := c.fetchResolutions(addr); ok {
 					c.resMu.Lock()
 					c.nodeRes[addr] = res
@@ -218,10 +228,14 @@ func statusError(resp *http.Response, action string) error {
 // via the ring, batches the series destined for each node into one request, fans the
 // batches out concurrently, and then verifies each series collected at least W acks.
 // Fewer than W live replicas (or W acks) is a quorum failure surfaced as an error, not
-// a silent partial write — a replica that was down stays stale until read-repair. The
-// returned SamplesIngested counts logical samples that met quorum (once, not per
-// replica). The request is all-or-nothing: if any series cannot reach quorum the whole
-// call errors and nothing is sent.
+// a silent partial write. The returned SamplesIngested counts logical samples that met
+// quorum (once, not per replica). The request is all-or-nothing: if any series cannot
+// reach quorum the whole call errors and nothing is sent.
+//
+// When hinted handoff is enabled (SetHintStore), a natural owner the write could not
+// reach — it is down, catching up, or its write failed — has the series buffered as a
+// durable hint and replayed on its return, so it fully converges (including an interior
+// gap read-repair cannot fix) rather than staying stale until the next read. See ADR-029.
 func (c *StorageClient) Write(ctx context.Context, req WriteRequest) (*WriteResponse, error) {
 	if len(req.TimeSeries) == 0 {
 		return &WriteResponse{}, nil
@@ -230,7 +244,9 @@ func (c *StorageClient) Write(ctx context.Context, req WriteRequest) (*WriteResp
 	type seriesPlan struct {
 		key      string
 		samples  int
-		replicas []string // live replica addresses for this series
+		replicas []string   // live replica addresses this series was sent to
+		ts       TimeSeries // retained to hint a natural owner that missed the write
+		pref     []string   // natural owner addresses (incl. down) for hint targeting; nil if handoff off
 	}
 
 	// Plan placement for every series first; bail before sending if any series lacks
@@ -248,7 +264,20 @@ func (c *StorageClient) Write(ctx context.Context, req WriteRequest) (*WriteResp
 			addrs[j] = n.Addr
 			perNode[n.Addr] = append(perNode[n.Addr], ts)
 		}
-		plans[i] = seriesPlan{key: key, samples: len(ts.Samples), replicas: addrs}
+		plan := seriesPlan{key: key, samples: len(ts.Samples), replicas: addrs}
+		// For hinted handoff, also record the natural owners (including any that are down
+		// or catching up) so a write that quorum reached on the live set can still hint the
+		// owners it missed. GetNodes already substituted live fallbacks for those owners.
+		if c.hints != nil {
+			plan.ts = ts
+			pref := c.ring.PreferenceList(key, c.rf)
+			pa := make([]string, len(pref))
+			for j, n := range pref {
+				pa[j] = n.Addr
+			}
+			plan.pref = pa
+		}
+		plans[i] = plan
 	}
 
 	// Fan out one batched write per target node, concurrently.
@@ -272,6 +301,7 @@ func (c *StorageClient) Write(ctx context.Context, req WriteRequest) (*WriteResp
 
 	// Require W acks per series.
 	var ingested int64
+	var hintsByTarget map[string][]TimeSeries
 	for _, p := range plans {
 		acks := 0
 		for _, addr := range p.replicas {
@@ -283,6 +313,28 @@ func (c *StorageClient) Write(ctx context.Context, req WriteRequest) (*WriteResp
 			return nil, fmt.Errorf("write quorum not met for series %q: %d/%d replica acks < W=%d", p.key, acks, len(p.replicas), c.w)
 		}
 		ingested += int64(p.samples)
+		// Hinted handoff: any natural owner the write did not reach (it is down, catching
+		// up, or its write failed) needs the series buffered so it converges on return.
+		// A natural owner that acked is in okNodes; everything else in the preference list
+		// is a missed owner. Collected now, flushed only after every series met quorum.
+		for _, owner := range p.pref {
+			if !okNodes[owner] {
+				if hintsByTarget == nil {
+					hintsByTarget = make(map[string][]TimeSeries)
+				}
+				hintsByTarget[owner] = append(hintsByTarget[owner], p.ts)
+			}
+		}
+	}
+
+	// Buffer hints only after confirming quorum for every series: the write is
+	// all-or-nothing, so a quorum failure returns above and buffers nothing. Buffering
+	// is best-effort — a failed hint write is logged, not surfaced, since the quorum
+	// write already succeeded and the gap is recoverable later by read-repair. (ADR-029.)
+	for target, series := range hintsByTarget {
+		if err := c.hints.Add(target, series); err != nil {
+			log.Printf("hinted handoff: buffering hint for %s failed: %v", target, err)
+		}
 	}
 
 	return &WriteResponse{SamplesIngested: ingested}, nil

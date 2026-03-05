@@ -388,6 +388,29 @@ func replMux(n *replNode) http.Handler {
 		}
 		json.NewEncoder(w).Encode(service.WriteResponse{SamplesIngested: count})
 	})
+	mux.HandleFunc("/api/internal/backfill", func(w http.ResponseWriter, r *http.Request) {
+		var req service.WriteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var samples []storage.IngestSample
+		for _, ts := range req.TimeSeries {
+			labels := make(map[string]string, len(ts.Labels))
+			for _, l := range ts.Labels {
+				labels[l.Name] = l.Value
+			}
+			for _, s := range ts.Samples {
+				samples = append(samples, storage.IngestSample{Name: ts.Name, Labels: labels, Timestamp: s.TimestampMs, Value: s.Value})
+			}
+		}
+		applied, err := n.db.Backfill(samples)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(service.WriteResponse{SamplesIngested: int64(applied)})
+	})
 	mux.HandleFunc("/api/internal/query", func(w http.ResponseWriter, r *http.Request) {
 		var req service.QueryRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

@@ -1096,3 +1096,108 @@ never shed); the config validation; and the metric families.
   low-priority and over-budget traffic, any remaining hard-capacity block-then-shed
   drop (rare under the new policy) is counted in the grand total but not broken down
   by class — the breakdown covers the admission-stage decisions.
+
+## ADR-029: Hinted Handoff — Buffer Writes for a Down Replica, Replay on Return
+
+**Status**: Accepted
+**Context**: ADR-022 made replication real but explicitly deferred hinted handoff, and
+that gap has a sharp edge. Two mechanisms were supposed to keep a replica consistent
+through downtime, and neither closes the hole:
+
+- **The ring silently re-routes around a down owner.** `GetNodes` walks the ring
+  clockwise and skips Dead/Leaving nodes, filling W from the next *live* nodes. So a
+  write whose natural owner is down is routed to a live fallback, quorum succeeds, and
+  the down owner is **never attempted and never recorded** anywhere. When it returns it
+  has no idea it missed anything.
+- **Read-repair only converges forward.** A read repairs a stale replica by writing the
+  missing points back through the normal ingest path — which enforces the in-order policy
+  of ADR-015 (a sample older than the series' last is dropped, counted out-of-order). So
+  read-repair can fill points *newer* than the replica's last (the usual contiguous
+  down-window) but can **never** fill an **interior** gap: once the replica takes any
+  newer sample, an older missing point is rejected as out-of-order forever. A replica
+  that was down for an interior window stays permanently holed on that replica; the data
+  survives only on the other replicas until they too fail.
+
+The goal: buffer the writes a down replica misses as durable, bounded **hints**, and
+replay them on its return through a path that tolerates historical timestamps, so the
+replica fully converges — interior gaps included.
+
+**Decision**: Adopt Dynamo-style hinted handoff on the existing quorum write path,
+driven by the ingestor (the write owner); the querier's read path is unchanged.
+
+- **Find the missed owner — preference list vs live replicas.** Add
+  `ring.PreferenceList(key, N)`, which walks the ring clockwise *without* skipping any
+  state — the natural N owners, **including** Dead/Leaving/Joining ones. `Write` diffs it
+  against the live replicas it actually reached (`GetNodes`, which substituted fallbacks):
+  any natural owner not in the ack set — it is down, catching up, or its live write
+  failed — is a **missed owner**. Hints are buffered only *after* every series met
+  quorum, so the write stays all-or-nothing (a quorum failure buffers nothing).
+- **Durable, bounded hint store.** `service.HintStore` persists one hint per crash-safe
+  file (temp-write + fsync + atomic rename) under a per-target sequence, so replay is
+  FIFO and a hint is deleted only after the target acknowledges its backfill. Each target
+  is bounded to `max_samples_per_node` buffered samples — **drop-oldest past the cap,
+  counted** — so a long outage cannot grow the buffer without bound, while the most recent
+  hint is always kept. The index is rebuilt from disk on restart, so a process bounce
+  resumes replaying.
+- **Out-of-order-tolerant backfill — the crux.** Naive replay through
+  `/api/internal/write` would mostly vanish (ADR-015 rejects the historical timestamps),
+  so replay uses a **new catch-up path**: `TSDB.Backfill` → `HeadBlock.Backfill`
+  binary-searches the insertion point and inserts in sorted position, **filling only
+  gaps** (an existing timestamp is left untouched — idempotent, never overwritten). It is
+  reached over a dedicated `/api/internal/backfill` endpoint that bypasses the in-order
+  accept queue. Crucially this is **separate** from the live path: the in-order policy of
+  ADR-015 is untouched for normal writes; only the catch-up path tolerates out-of-order,
+  and only the previously-down replica uses it while catching up.
+- **Durable backfill across a storage crash.** Backfill samples are logged to the WAL
+  under a **distinct frame type** (`walEntryBackfill`) and replayed through a new
+  `HandleBackfill` handler that applies them via the same out-of-order-tolerant insert.
+  So a storage node that crashes mid-catch-up recovers the backfilled data identically,
+  while live sample frames keep replaying under the strict in-order policy — the recovered
+  head matches the live head exactly, interior fills and all. (Without this, a hint
+  deleted after a `200` could be lost to a storage crash before the next flush.)
+- **Catching-up lifecycle — the reserved Joining state, finally used.** A node returning
+  from Dead with a backlog must *not* immediately rejoin live routing: if it took a fresh
+  (high-timestamp) write before its older hints replayed, those hints would become
+  unfillable interior gaps — the very failure handoff exists to prevent. So the health
+  monitor routes such a node through **Joining** (catching up): `GetNodes` and `LiveNodes`
+  now exclude Joining alongside Dead/Leaving, so it receives no live writes and serves no
+  reads. The background replay loop drains its hints through backfill and **promotes it to
+  Active** once a pass drains cleanly. A backlog-free return goes straight to Active, and
+  an already-Active node is never demoted by a transient hint (its hint just replays in
+  the background while it keeps serving). The querier holds no hints, so its ring only
+  ever sees Active/Dead — reads stay correct throughout because the quorum merge already
+  covers a still-converging replica.
+
+Why this shape: it complements rather than replaces the existing machinery. Quorum still
+guarantees no acknowledged write is lost and reads stay complete during a failure;
+read-repair still handles the forward-converging common case cheaply on the read path;
+hinted handoff adds the one thing neither could do — guaranteed convergence of an interior
+gap — and the Joining state is what makes that guarantee hold (a replica is made whole
+*before* it rejoins, so it can never strand a gap).
+
+**Consequences**: A replica down for an interior window converges fully on return,
+proven end-to-end (kill a replica, write past it at quorum, restart, replay → the replica
+holds exactly the union including a point an in-order re-apply is shown to reject) and at
+the storage layer (Backfill fills a gap Ingest rejects; durable across reopen). Hints are
+bounded per target and survive an ingestor restart; backfill survives a storage restart.
+Observability: `meridian_handoff_pending_samples` / `_pending_hints` gauges and
+`meridian_handoff_replayed_samples_total` / `_dropped_samples_total` counters on the
+ingestor. Opt-in and on by default for the cluster tier; disabled, the client behaves
+byte-for-byte as ADR-022.
+
+**Deferred (honest scope)**:
+- **Hints are ingestor-local.** The buffer lives on the ingestor that took the write; a
+  different ingestor instance does not share it. Fine for the one-ingestor-per-shard
+  compose tier, but a multi-ingestor deployment would want the hint store on shared/owned
+  storage or sharded by target. The durable on-disk store already survives a restart of
+  *that* ingestor.
+- **No proactive anti-entropy.** Convergence is still write-triggered (hints) and
+  read-triggered (read-repair); a Merkle/range anti-entropy sweep for data older than the
+  hint cap, or for a series no longer written, remains future work (as in ADR-022).
+- **Over-replication is still not GC'd.** A fallback that held a missed owner's write
+  during the outage keeps that copy after the owner catches up (ADR-022's deferred
+  rebalancing/GC is unchanged).
+- **Cap drops are silent data loss by design.** Past `max_samples_per_node` the oldest
+  hints are dropped and counted; that replica then relies on read-repair for the forward
+  part and stays holed on the dropped interior window. The cap is the memory/disk bound;
+  raising it trades durability headroom for footprint.

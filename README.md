@@ -103,10 +103,18 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   surviving replicas serve complete reads, and a recovered node is caught up by
   read-repair. Too few live replicas returns a clear quorum error, never silent
   partial data. (ADR-022.)
+- **Hinted handoff**: a write that can't reach a natural replica (it's down or
+  catching up) buffers a durable, bounded **hint** while quorum still succeeds on the
+  survivors, and replays it on the replica's return so it **fully converges** —
+  including an *interior* gap read-repair can't fill (read-repair only converges points
+  newer than a replica's last; storage rejects out-of-order). Replay goes through an
+  out-of-order-tolerant backfill path, and a returning replica catches up in the
+  `joining` state before it rejoins live routing. (ADR-029.)
 - **Health-driven membership**: a background `/health` monitor marks nodes
-  active/dead so routing excludes the dead and re-includes the recovered. Graceful
-  `joining`/`leaving` with hinted handoff and rebalancing are future work — the ring
-  reserves those states but nothing assigns them yet.
+  active/dead so routing excludes the dead and re-includes the recovered; a node that
+  returns with a hint backlog passes through `joining` (catching up) before `active`.
+  Graceful `leaving` and rebalancing on membership change remain future work — the ring
+  reserves that state but nothing assigns it yet.
 - **Scope**: this applies to the docker-compose tier (ingestor/storage/querier). The
   single-binary `serve` is genuinely single-node.
 
@@ -298,6 +306,10 @@ cluster:                  # microservices tier only; W+R must exceed N
   write_quorum:       2   # W — acks required for a write
   read_quorum:        2   # R — replicas a read must hear from
   virtual_nodes:      256 # ring virtual nodes per physical node
+  handoff:                # hinted handoff (ADR-029); on by default for the tier
+    enabled:             true
+    max_samples_per_node: 1000000  # per-target hint buffer cap (samples); drop-oldest past it
+    replay_interval:    "5s"       # how often buffered hints are replayed to recovered replicas
 ingestion:                # write-path backpressure (ADR-023)
   queue_capacity:       50000   # hard ingest-queue cap in samples (memory bound)
   queue_high_watermark: 40000   # depth at which producers are flagged to throttle
@@ -321,7 +333,9 @@ anomaly:                  # streaming anomaly detection (ADR-024)
 
 The microservice binaries read the same knobs from the environment: replication
 (`REPLICATION_FACTOR`, `WRITE_QUORUM`, `READ_QUORUM`, `VIRTUAL_NODES`) — clamped to
-the live node count so a cluster smaller than N still works — backpressure
+the live node count so a cluster smaller than N still works — hinted handoff on the
+ingestor (`HINTED_HANDOFF_ENABLED`, `HINT_DIR`, `HINT_MAX_SAMPLES_PER_NODE`,
+`HINT_REPLAY_INTERVAL`) — backpressure
 (`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
 `MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents) — and the
 gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`). The storage node also reads its

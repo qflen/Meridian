@@ -111,6 +111,27 @@ func TestWriteAdmissionMetricsDisabledEmpty(t *testing.T) {
 	}
 }
 
+func TestWriteHandoffMetricsFamilies(t *testing.T) {
+	var buf bytes.Buffer
+	WriteHandoffMetrics(&buf, "ingestor-1", "ingestor", HandoffStats{
+		PendingSamples: 1200, PendingHints: 3, ReplayedSamples: 9000, DroppedSamples: 42,
+	})
+	body := buf.String()
+	for _, want := range []string{
+		`meridian_handoff_pending_samples{node="ingestor-1",role="ingestor"} 1200`,
+		`meridian_handoff_pending_hints{node="ingestor-1",role="ingestor"} 3`,
+		`meridian_handoff_replayed_samples_total{node="ingestor-1",role="ingestor"} 9000`,
+		`meridian_handoff_dropped_samples_total{node="ingestor-1",role="ingestor"} 42`,
+		"# TYPE meridian_handoff_pending_samples gauge",
+		"# TYPE meridian_handoff_replayed_samples_total counter",
+		"# TYPE meridian_handoff_dropped_samples_total counter",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("handoff metrics missing %q\n%s", want, body)
+		}
+	}
+}
+
 // TestMonolithMetricsAndStatsIncludeQueue proves the wired ingest stats source
 // surfaces the bounded-queue families on /metrics and the fields on /api/v1/stats.
 func TestMonolithMetricsAndStatsIncludeQueue(t *testing.T) {

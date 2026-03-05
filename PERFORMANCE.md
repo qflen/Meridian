@@ -124,3 +124,10 @@ numbers, here are the cost characteristics and where to read the real signal liv
   the inverted index. It is bounded over time by flush-to-block plus retention, and
   bounded under overload by the ingest queue capacity (depth ≤ capacity — ADR-023).
   Persisted blocks store ~4.5 bits/sample for regular gauges (see above).
+- **Hinted handoff** (ADR-029): off the live write path. A normal write adds, per missed
+  replica, one ring `PreferenceList` walk plus one durable hint file (fsync + rename) on
+  the ingestor — and only while a replica is actually down. Replay and backfill are a
+  background recovery path (one target at a time, FIFO), not the hot path. The buffer is
+  bounded per target by `max_samples_per_node` (drop-oldest past it), so a long outage
+  caps hint disk/memory rather than growing without bound; `meridian_handoff_pending_*`
+  shows the live backlog and `_replayed_/_dropped_samples_total` the catch-up progress.

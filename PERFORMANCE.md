@@ -144,3 +144,18 @@ numbers, here are the cost characteristics and where to read the real signal liv
   `meridian_anti_entropy_repairs_total` / `_transferred_samples_total`; `_divergent_windows_total`
   climbing while `_repairs_total` does not flags an unresolvable difference (a same-timestamp
   value conflict, which gap-fill does not overwrite).
+- **Rebalancing on membership change** (ADR-031): off the live read and write path — it runs
+  only when a node is explicitly joined or left, and the work is proportional to the data that
+  actually moved, not the dataset. The owner-set diff is `O(vnodes × nodes)` over two ring
+  snapshots (no I/O); migration cost is one range read from a current owner plus one backfill
+  push per new owner, per moved arc-group, processed **sequentially** (no thundering herd) with
+  an optional `max_bytes_per_round` to spread a large move across passes. GC is a per-node drop
+  of the shed arcs: the head is flushed once, then only the blocks holding un-owned series are
+  rewritten (decode + re-encode of the kept series) — fully-owned blocks are untouched and
+  fully-un-owned blocks are deleted, so a node that loses a fraction of the keyspace pays for
+  rewriting only the blocks that mix owned and un-owned series. A joining node stays out of
+  routing until its data has arrived, so the migration adds no read-path latency; reads stay
+  complete throughout because the old owners keep their copy until the new owners are confirmed
+  at quorum. `meridian_rebalance_*` shows migrations/bytes moved and GC series/samples
+  reclaimed; `_skipped_total` climbing without `_migrations_total` flags a move that cannot
+  reach a source or a quorum.

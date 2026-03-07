@@ -263,12 +263,35 @@ data, an unobserved partial write, a hint dropped past the cap, a series no long
 - **Scoped to shared arcs** — comparison runs per replica group, so a node's data outside
   an arc it actually shares with the peer is never mistaken for divergence and re-shipped.
 
+**Rebalancing on membership change** (`internal/cluster/rebalance.go`,
+`internal/service/rebalance.go`, `internal/storage/rebalance.go`; ADR-031): adding or
+removing a storage node re-derives placement *and moves the data*. Where read-repair, hinted
+handoff, and anti-entropy all converge nodes that *share* an owner set, rebalancing **moves**
+the owner set — the piece those layers assume but never provide.
+
+- **Diff** — `cluster.PlacementDelta` diffs two ring snapshots (before/after the change) at
+  the union of their virtual-node boundaries and groups the arcs whose owner set changed into
+  `OwnershipChange{Before, After, Added, Removed, Arcs}`. A joining node is already a target
+  owner; a leaving/dead node is excluded as a target but still a source.
+- **Migrate** — for each change the coordinator reads the moved arcs from a current owner
+  (`/api/internal/antientropy/range`) and pushes them to each new owner through the same
+  `/api/internal/backfill` apply handoff and anti-entropy use; a new owner is confirmed only
+  on its ack.
+- **GC** — once data has moved and the ring is flipped to the target placement (so read-repair
+  cannot re-add it), the old owner drops the arcs it no longer owns
+  (`TSDB.DropSeriesInRanges` via `/api/internal/rebalance/drop`): head flushed, then each
+  block left, deleted whole, or rewritten to keep only its owned series. GC runs only after
+  the new owners are confirmed at quorum and never drops the last copy.
+- **Lifecycle** — a join catches up out of routing (`joining`) then promotes to `active` then
+  GCs the displaced owner; a leave migrates while still `active` (reads stay complete), then
+  goes `leaving` → removed. A node returning from `dead` has the over-replication its absence
+  created reclaimed off the fallbacks. Driven by `POST /api/internal/cluster/{join,leave}`.
+
 The ingestor and querier each build this client from `REPLICATION_FACTOR`/
 `WRITE_QUORUM`/`READ_QUORUM` and run the health monitor; only the ingestor wires the
-hint store (the write owner). The `Coordinator` (`internal/cluster/coordinator.go`)
-wraps the same ring with `RouteWrite`/`RouteRead` helpers. Proactive cross-node
-anti-entropy is now in place (ADR-030, above); rebalancing/GC on membership change remains
-future work (ADR-022). The monolith `serve` path is single-node and does not use the ring.
+hint store and the rebalance coordinator (the write owner). The `Coordinator`
+(`internal/cluster/coordinator.go`) wraps the same ring with `RouteWrite`/`RouteRead`
+helpers. The monolith `serve` path is single-node and does not use the ring.
 
 ### Retention & Downsampling
 

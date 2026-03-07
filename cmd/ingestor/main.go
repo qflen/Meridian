@@ -92,6 +92,20 @@ func main() {
 			aec.Interval.Std(), aec.Window.Std(), aec.Lookback.Std(), aec.Jitter.Std(), aec.GroupsPerRound)
 	}
 
+	// Rebalancing on membership change (ADR-031): when a storage node joins or leaves via the
+	// admin endpoint, the ranges that changed owners are migrated to their new owners (reusing
+	// the backfill transfer) and the data a node no longer owns is GC'd once the new owners
+	// confirm receipt at quorum. Disabled, the admin endpoint returns 503 and a membership
+	// change would re-derive routing without moving data.
+	rbc := config.RebalanceConfig{
+		Enabled:          envBool("REBALANCE_ENABLED", true),
+		Lookback:         config.Duration(envDuration("REBALANCE_LOOKBACK", 0)),
+		MaxBytesPerRound: int64(envInt("REBALANCE_MAX_BYTES_PER_ROUND", 0)),
+	}
+	if err := rbc.Validate(); err != nil {
+		log.Fatalf("invalid rebalance config: %v", err)
+	}
+
 	// Bound in-flight writes: a worker pool drains a bounded queue to the quorum
 	// Write, so a stalled replica backpressures (then sheds → 429) the producer
 	// instead of piling up unbounded concurrent writes. See ADR-023.
@@ -111,10 +125,15 @@ func main() {
 	defer pool.Close()
 
 	srv := &ingestorServer{
-		nodeID:    nodeID,
-		storage:   sc,
-		pool:      pool,
-		startTime: time.Now(),
+		nodeID:       nodeID,
+		storage:      sc,
+		pool:         pool,
+		startTime:    time.Now(),
+		rebalance:    rbc.Enabled,
+		rebalanceOpt: service.RebalanceOptions{Lookback: rbc.Lookback.Std(), MaxBytesPerRound: rbc.MaxBytesPerRound},
+	}
+	if rbc.Enabled {
+		log.Printf("rebalancing enabled: lookback=%s max_bytes_per_round=%d", rbc.Lookback.Std(), rbc.MaxBytesPerRound)
 	}
 
 	// Start TCP listener for simulator
@@ -150,17 +169,61 @@ func main() {
 }
 
 type ingestorServer struct {
-	nodeID    string
-	storage   *service.StorageClient
-	pool      *service.WritePool
-	startTime time.Time
+	nodeID       string
+	storage      *service.StorageClient
+	pool         *service.WritePool
+	startTime    time.Time
+	rebalance    bool
+	rebalanceOpt service.RebalanceOptions
 }
 
 func (s *ingestorServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/internal/ingest", s.handleHTTPIngest)
 	mux.HandleFunc("/api/internal/ingest_stats", s.handleIngestStats)
+	mux.HandleFunc("/api/internal/cluster/join", s.handleClusterJoin)
+	mux.HandleFunc("/api/internal/cluster/leave", s.handleClusterLeave)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+}
+
+// handleClusterJoin brings a storage node into the cluster and rebalances data onto it
+// (ADR-031). Body: {"addr":"host:port"}. The migration runs synchronously, so the response
+// reports what moved. Returns 503 when rebalancing is disabled.
+func (s *ingestorServer) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
+	s.handleClusterChange(w, r, true)
+}
+
+// handleClusterLeave gracefully removes a storage node, re-homing its ranges to the survivors
+// first (ADR-031). Body: {"addr":"host:port"}.
+func (s *ingestorServer) handleClusterLeave(w http.ResponseWriter, r *http.Request) {
+	s.handleClusterChange(w, r, false)
+}
+
+func (s *ingestorServer) handleClusterChange(w http.ResponseWriter, r *http.Request, join bool) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.rebalance {
+		http.Error(w, "rebalancing disabled", http.StatusServiceUnavailable)
+		return
+	}
+	var req struct {
+		Addr string `json:"addr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Addr == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "body must be {\"addr\":\"host:port\"}"})
+		return
+	}
+	var stats service.RebalanceStats
+	if join {
+		stats = s.storage.JoinNode(r.Context(), req.Addr, s.rebalanceOpt)
+	} else {
+		stats = s.storage.LeaveNode(r.Context(), req.Addr, s.rebalanceOpt)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
 }
 
 // handleIngestStats reports the bounded ingest queue snapshot as JSON so the
@@ -205,6 +268,18 @@ func (s *ingestorServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			Repairs:            ae.Repairs,
 			SamplesTransferred: ae.SamplesTransferred,
 			BytesTransferred:   ae.BytesTransferred,
+		})
+		rb := s.storage.RebalanceStats()
+		server.WriteRebalanceMetrics(w, s.nodeID, "ingestor", server.RebalanceStats{
+			Migrations:    rb.Migrations,
+			SamplesMoved:  rb.SamplesMoved,
+			BytesMoved:    rb.BytesMoved,
+			GCRuns:        rb.GCRuns,
+			SeriesDropped: rb.SeriesDropped,
+			SamplesGCed:   rb.SamplesGCed,
+			NodesJoined:   rb.NodesJoined,
+			NodesLeft:     rb.NodesLeft,
+			Skipped:       rb.Skipped,
 		})
 	}
 }

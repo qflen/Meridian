@@ -41,6 +41,12 @@ func (c *StorageClient) NodeState(addr string) string {
 // background while it keeps serving), and a Joining node whose backlog has drained is
 // promoted. See ADR-029.
 func (c *StorageClient) applyReachable(addr string) {
+	// The rebalancer owns the Joining→Active promotion for a node it is migrating into, so
+	// liveness must not promote it early (it would route reads/writes to a node that does not
+	// yet hold its ranges). See ADR-031.
+	if c.isMigrating(addr) {
+		return
+	}
 	if c.hints == nil {
 		c.ring.SetState(addr, cluster.NodeActive)
 		return

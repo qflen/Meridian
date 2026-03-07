@@ -145,6 +145,7 @@ func (s *storageServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/internal/blocks", s.handleBlocks)
 	mux.HandleFunc("/api/internal/antientropy/digest", s.handleAntiEntropyDigest)
 	mux.HandleFunc("/api/internal/antientropy/range", s.handleAntiEntropyRange)
+	mux.HandleFunc("/api/internal/rebalance/drop", s.handleRebalanceDrop)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	// DELETE for specific block: /api/internal/blocks/{ulid}
 }
@@ -429,6 +430,35 @@ func (s *storageServer) handleAntiEntropyRange(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, exportToWriteRequest(series))
+}
+
+// handleRebalanceDrop drops every series whose ring position falls in the requested hash arcs
+// — the data this node no longer owns after a membership change (ADR-031). The arcs come from
+// the migration coordinator, which only issues the drop once the new owners have confirmed
+// receipt at quorum; cluster.HashKey classifies series here exactly as writes were routed, so
+// this node stays ring-agnostic. The body reuses the anti-entropy arc wire shape.
+func (s *storageServer) handleRebalanceDrop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req service.DropRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	res, err := s.db.DropSeriesInRanges(wireRanges(req.Ranges), cluster.HashKey)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, service.DropResponse{
+		SeriesDropped:   res.SeriesDropped,
+		SamplesDropped:  res.SamplesDropped,
+		RollupWindows:   res.RollupWindows,
+		BlocksRewritten: res.BlocksRewritten,
+		BlocksDeleted:   res.BlocksDeleted,
+	})
 }
 
 // wireRanges converts the wire [lo,hi] arc pairs to storage hash ranges.

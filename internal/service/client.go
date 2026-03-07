@@ -21,7 +21,13 @@ import (
 // a series is written to its N ring replicas and succeeds at W acks; reads take R
 // responses, merge, and asynchronously read-repair stale replicas. See ADR-022.
 type StorageClient struct {
-	addrs  []string
+	// membMu guards addrs and migrating, both mutated at runtime by the rebalancer when a
+	// node joins or leaves (ADR-031); every scatter that ranges addrs snapshots it first so
+	// a membership change cannot race a fan-out. The ring has its own lock.
+	membMu    sync.RWMutex
+	addrs     []string
+	migrating map[string]bool // nodes the rebalancer is migrating into; health must not promote them
+
 	client *http.Client
 
 	ring *cluster.Ring
@@ -47,6 +53,10 @@ type StorageClient struct {
 	// anti-entropy methods live in antientropy.go.
 	ae       aeStats
 	aeCursor int
+
+	// rebal holds the rebalance counters (ADR-031). The membership-change migration/GC
+	// methods live in rebalance.go.
+	rebal rebalStats
 }
 
 // ReplicationOptions configures the replication behaviour of a StorageClient.
@@ -97,14 +107,24 @@ func NewReplicatedStorageClient(addrs []string, opts ReplicationOptions) *Storag
 		n = 1
 	}
 	return &StorageClient{
-		addrs:   addrs,
-		client:  &http.Client{Timeout: 30 * time.Second},
-		ring:    ring,
-		rf:      n,
-		w:       clampInt(opts.WriteQuorum, 1, n),
-		r:       clampInt(opts.ReadQuorum, 1, n),
-		nodeRes: make(map[string]ResolutionsResponse),
+		addrs:     append([]string(nil), addrs...),
+		migrating: make(map[string]bool),
+		client:    &http.Client{Timeout: 30 * time.Second},
+		ring:      ring,
+		rf:        n,
+		w:         clampInt(opts.WriteQuorum, 1, n),
+		r:         clampInt(opts.ReadQuorum, 1, n),
+		nodeRes:   make(map[string]ResolutionsResponse),
 	}
+}
+
+// snapshotAddrs returns a copy of the configured storage addresses under the membership
+// lock, so a scatter fan-out reads a stable list even as the rebalancer adds or removes a
+// node concurrently (ADR-031).
+func (c *StorageClient) snapshotAddrs() []string {
+	c.membMu.RLock()
+	defer c.membMu.RUnlock()
+	return append([]string(nil), c.addrs...)
 }
 
 func clampInt(v, lo, hi int) int {
@@ -147,7 +167,7 @@ func (c *StorageClient) Replicas(name string, labels map[string]string) []string
 // liveness and never lags it. Probes run concurrently.
 func (c *StorageClient) RefreshHealth() {
 	var wg sync.WaitGroup
-	for _, addr := range c.addrs {
+	for _, addr := range c.snapshotAddrs() {
 		wg.Add(1)
 		go func(addr string) {
 			defer wg.Done()
@@ -214,9 +234,10 @@ func (c *StorageClient) StartHealthMonitor(ctx context.Context, interval time.Du
 	}()
 }
 
-// Addrs returns the configured storage node addresses.
+// Addrs returns the configured storage node addresses (a snapshot, since membership can
+// change at runtime via the rebalancer).
 func (c *StorageClient) Addrs() []string {
-	return c.addrs
+	return c.snapshotAddrs()
 }
 
 // statusError drains resp.Body and returns a non-nil error when the response is not
@@ -759,8 +780,9 @@ func (c *StorageClient) FetchBlocks(ctx context.Context) ([]BlockInfo, error) {
 		blocks []BlockInfo
 		err    error
 	}
-	results := make(chan result, len(c.addrs))
-	for _, addr := range c.addrs {
+	addrs := c.snapshotAddrs()
+	results := make(chan result, len(addrs))
+	for _, addr := range addrs {
 		go func(addr string) {
 			url := fmt.Sprintf("http://%s/api/internal/blocks", addr)
 			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -788,7 +810,7 @@ func (c *StorageClient) FetchBlocks(ctx context.Context) ([]BlockInfo, error) {
 	}
 
 	var all []BlockInfo
-	for range c.addrs {
+	for range addrs {
 		r := <-results
 		if r.err == nil {
 			all = append(all, r.blocks...)
@@ -803,8 +825,9 @@ func (c *StorageClient) FetchStats(ctx context.Context) (*AggregatedStats, error
 		stats StatsResponse
 		err   error
 	}
-	results := make(chan result, len(c.addrs))
-	for _, addr := range c.addrs {
+	addrs := c.snapshotAddrs()
+	results := make(chan result, len(addrs))
+	for _, addr := range addrs {
 		go func(addr string) {
 			url := fmt.Sprintf("http://%s/api/internal/stats", addr)
 			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -832,7 +855,7 @@ func (c *StorageClient) FetchStats(ctx context.Context) (*AggregatedStats, error
 	}
 
 	agg := &AggregatedStats{}
-	for range c.addrs {
+	for range addrs {
 		r := <-results
 		if r.err != nil {
 			continue
@@ -892,8 +915,9 @@ func (c *StorageClient) FetchSeries(ctx context.Context) ([]SeriesInfo, error) {
 		series []SeriesInfo
 		err    error
 	}
-	results := make(chan result, len(c.addrs))
-	for _, addr := range c.addrs {
+	addrs := c.snapshotAddrs()
+	results := make(chan result, len(addrs))
+	for _, addr := range addrs {
 		go func(addr string) {
 			url := fmt.Sprintf("http://%s/api/internal/series", addr)
 			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -925,7 +949,7 @@ func (c *StorageClient) FetchSeries(ctx context.Context) ([]SeriesInfo, error) {
 	}
 
 	var all []SeriesInfo
-	for range c.addrs {
+	for range addrs {
 		r := <-results
 		if r.err == nil {
 			all = append(all, r.series...)
@@ -951,8 +975,9 @@ func (c *StorageClient) FetchLabels(ctx context.Context) ([]string, error) {
 		labels []string
 		err    error
 	}
-	results := make(chan result, len(c.addrs))
-	for _, addr := range c.addrs {
+	addrs := c.snapshotAddrs()
+	results := make(chan result, len(addrs))
+	for _, addr := range addrs {
 		go func(addr string) {
 			url := fmt.Sprintf("http://%s/api/internal/labels", addr)
 			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -979,7 +1004,7 @@ func (c *StorageClient) FetchLabels(ctx context.Context) ([]string, error) {
 	}
 
 	seen := make(map[string]bool)
-	for range c.addrs {
+	for range addrs {
 		r := <-results
 		if r.err == nil {
 			for _, l := range r.labels {
@@ -1001,8 +1026,9 @@ func (c *StorageClient) FetchLabelValues(ctx context.Context, name string) ([]st
 		values []string
 		err    error
 	}
-	results := make(chan result, len(c.addrs))
-	for _, addr := range c.addrs {
+	addrs := c.snapshotAddrs()
+	results := make(chan result, len(addrs))
+	for _, addr := range addrs {
 		go func(addr string) {
 			url := fmt.Sprintf("http://%s/api/internal/label/%s/values", addr, name)
 			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -1029,7 +1055,7 @@ func (c *StorageClient) FetchLabelValues(ctx context.Context, name string) ([]st
 	}
 
 	seen := make(map[string]bool)
-	for range c.addrs {
+	for range addrs {
 		r := <-results
 		if r.err == nil {
 			for _, v := range r.values {

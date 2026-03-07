@@ -146,6 +146,38 @@ func TestAntiEntropyConfigValidate(t *testing.T) {
 	}
 }
 
+func TestRebalanceConfigValidate(t *testing.T) {
+	valid := []RebalanceConfig{
+		{Enabled: false},                                              // disabled needs no tunables
+		{Enabled: false, Lookback: Duration(-time.Second)},            // disabled: tunables ignored
+		{Enabled: true},                                               // zero lookback (all history) + unlimited bytes
+		{Enabled: true, Lookback: Duration(time.Hour), MaxBytesPerRound: 1 << 20},
+		DefaultConfig().Cluster.Rebalance, // the shipped default must be valid
+	}
+	for _, c := range valid {
+		if err := c.Validate(); err != nil {
+			t.Errorf("expected %+v to be valid, got %v", c, err)
+		}
+	}
+
+	invalid := []RebalanceConfig{
+		{Enabled: true, Lookback: Duration(-time.Second)}, // negative lookback
+		{Enabled: true, MaxBytesPerRound: -1},             // negative byte cap
+	}
+	for _, c := range invalid {
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected %+v to be invalid", c)
+		}
+	}
+
+	// A bad rebalance block must fail cluster validation (it is nested).
+	cc := ClusterConfig{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 256,
+		Rebalance: RebalanceConfig{Enabled: true, MaxBytesPerRound: -1}}
+	if err := cc.Validate(); err == nil {
+		t.Error("cluster validate must reject an invalid nested rebalance config")
+	}
+}
+
 func TestIngestionConfigValidate(t *testing.T) {
 	valid := []IngestionConfig{
 		{BatchSize: 1000, MaxConcurrentWrites: 64, QueueCapacity: 50000, QueueHighWatermark: 40000, BlockDeadline: Duration(250 * time.Millisecond)},

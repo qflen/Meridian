@@ -27,6 +27,13 @@ cluster:
   join: []
   replication_factor: 3
   virtual_nodes: 256
+  # Rebalancing on membership change (ADR-031): when a storage node joins or leaves,
+  # the ranges that changed owners are migrated to their new owners and the data a node
+  # no longer owns is GC'd once the new owners confirm receipt at quorum.
+  rebalance:
+    enabled: true
+    lookback: "0s"            # 0 = migrate all history
+    max_bytes_per_round: 0    # 0 = unlimited (migrate a change in one pass)
 
 downsampling:
   # Automatic rollup cascade (ADR-011). On each pass, raw blocks are rolled up to

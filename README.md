@@ -116,11 +116,18 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   partial write, a series no longer written. Equal digest roots transfer nothing; a
   differing root ships only the differing window's missing points, back through the same
   backfill path. (ADR-030.)
+- **Rebalancing on membership change**: adding or removing a storage node re-derives
+  placement *and moves the data*. The coordinator diffs the owner sets before/after the
+  change, **migrates** each moved range to its new owners (reusing the anti-entropy range
+  read + handoff backfill apply), then **GCs** the data a node no longer owns — only after
+  the new owners confirm receipt at quorum, and never the last copy. A joining node catches
+  up out of routing before it serves; a leaving node re-homes its ranges before it is
+  removed; degraded-window over-replication is reclaimed when an owner returns. Reads stay
+  complete throughout. Driven by `POST /api/internal/cluster/{join,leave}`. (ADR-031.)
 - **Health-driven membership**: a background `/health` monitor marks nodes
   active/dead so routing excludes the dead and re-includes the recovered; a node that
-  returns with a hint backlog passes through `joining` (catching up) before `active`.
-  Graceful `leaving` and rebalancing on membership change remain future work — the ring
-  reserves that state but nothing assigns it yet.
+  returns with a hint backlog passes through `joining` (catching up) before `active`, and
+  the `leaving` state drives graceful departure during a rebalance.
 - **Scope**: this applies to the docker-compose tier (ingestor/storage/querier). The
   single-binary `serve` is genuinely single-node.
 
@@ -323,6 +330,10 @@ cluster:                  # microservices tier only; W+R must exceed N
     lookback:         "0s"   # how far back to reconcile; 0 = all history
     jitter:           "10s"  # random delay added per round so coordinators don't sweep in lockstep
     groups_per_round: 16     # replica groups reconciled per round (spatial rate limit)
+  rebalance:              # rebalancing on membership change (ADR-031); on by default for the tier
+    enabled:             true
+    lookback:           "0s" # how far back to migrate/GC; 0 = all history
+    max_bytes_per_round: 0   # soft cap on bytes moved per pass; 0 = unlimited (one pass)
 ingestion:                # write-path backpressure (ADR-023)
   queue_capacity:       50000   # hard ingest-queue cap in samples (memory bound)
   queue_high_watermark: 40000   # depth at which producers are flagged to throttle
@@ -351,7 +362,8 @@ ingestor (`HINTED_HANDOFF_ENABLED`, `HINT_DIR`, `HINT_MAX_SAMPLES_PER_NODE`,
 `HINT_REPLAY_INTERVAL`) — proactive anti-entropy on the ingestor
 (`ANTI_ENTROPY_ENABLED`, `ANTI_ENTROPY_INTERVAL`, `ANTI_ENTROPY_WINDOW`,
 `ANTI_ENTROPY_LOOKBACK`, `ANTI_ENTROPY_JITTER`, `ANTI_ENTROPY_GROUPS_PER_ROUND`) —
-backpressure
+rebalancing on the ingestor (`REBALANCE_ENABLED`, `REBALANCE_LOOKBACK`,
+`REBALANCE_MAX_BYTES_PER_ROUND`) — backpressure
 (`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
 `MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents) — and the
 gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`). The storage node also reads its

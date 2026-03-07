@@ -227,6 +227,68 @@ func WriteAntiEntropyMetrics(w io.Writer, node, role string, st AntiEntropyStats
 	fmt.Fprintf(w, "meridian_anti_entropy_transferred_bytes_total{node=%q,role=%q} %d\n", node, role, st.BytesTransferred)
 }
 
+// RebalanceStats is a snapshot of the rebalance coordinator counters for metrics (ADR-031).
+// The coordinator (the ingestor) builds it from its StorageClient.
+type RebalanceStats struct {
+	// Migrations is the cumulative arc-group → new-owner transfers acknowledged.
+	Migrations int64
+	// SamplesMoved is the cumulative samples migrated to new owners.
+	SamplesMoved int64
+	// BytesMoved is the cumulative bytes of those migration transfers.
+	BytesMoved int64
+	// GCRuns is the cumulative drop-range calls a losing owner acknowledged.
+	GCRuns int64
+	// SeriesDropped / SamplesGCed are the cumulative series / samples reclaimed by those drops.
+	SeriesDropped int64
+	SamplesGCed   int64
+	// NodesJoined / NodesLeft are the cumulative membership changes processed.
+	NodesJoined int64
+	NodesLeft   int64
+	// Skipped is the cumulative changes deferred (no reachable source, an unconfirmed new
+	// owner, or no quorum) — climbing without progress flags a stuck rebalance.
+	Skipped int64
+}
+
+// WriteRebalanceMetrics writes the membership-rebalance metrics for one node/role (ADR-031):
+// the migrations and bytes/samples moved to new owners, the GC of data a node no longer owns
+// (runs, series, samples), the join/leave counts, and the deferred-change counter. All are
+// cumulative, so a scraper derives a migration or reclaim rate with rate(); skipped climbing
+// while migrations stall flags a rebalance that cannot reach a source or a quorum.
+func WriteRebalanceMetrics(w io.Writer, node, role string, st RebalanceStats) {
+	fmt.Fprintf(w, "# HELP meridian_rebalance_migrations_total Arc-group transfers acknowledged by new owners during rebalancing.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rebalance_migrations_total counter\n")
+	fmt.Fprintf(w, "meridian_rebalance_migrations_total{node=%q,role=%q} %d\n", node, role, st.Migrations)
+
+	fmt.Fprintf(w, "# HELP meridian_rebalance_moved_samples_total Samples migrated to new owners during rebalancing.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rebalance_moved_samples_total counter\n")
+	fmt.Fprintf(w, "meridian_rebalance_moved_samples_total{node=%q,role=%q} %d\n", node, role, st.SamplesMoved)
+
+	fmt.Fprintf(w, "# HELP meridian_rebalance_moved_bytes_total Bytes transferred migrating data to new owners.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rebalance_moved_bytes_total counter\n")
+	fmt.Fprintf(w, "meridian_rebalance_moved_bytes_total{node=%q,role=%q} %d\n", node, role, st.BytesMoved)
+
+	fmt.Fprintf(w, "# HELP meridian_rebalance_gc_runs_total Drop-range GC calls acknowledged by losing owners.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rebalance_gc_runs_total counter\n")
+	fmt.Fprintf(w, "meridian_rebalance_gc_runs_total{node=%q,role=%q} %d\n", node, role, st.GCRuns)
+
+	fmt.Fprintf(w, "# HELP meridian_rebalance_gc_series_total Series reclaimed from owners that no longer hold them.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rebalance_gc_series_total counter\n")
+	fmt.Fprintf(w, "meridian_rebalance_gc_series_total{node=%q,role=%q} %d\n", node, role, st.SeriesDropped)
+
+	fmt.Fprintf(w, "# HELP meridian_rebalance_gc_samples_total Samples reclaimed by rebalance GC.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rebalance_gc_samples_total counter\n")
+	fmt.Fprintf(w, "meridian_rebalance_gc_samples_total{node=%q,role=%q} %d\n", node, role, st.SamplesGCed)
+
+	fmt.Fprintf(w, "# HELP meridian_rebalance_nodes_total Membership changes processed by the rebalancer, by direction.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rebalance_nodes_total counter\n")
+	fmt.Fprintf(w, "meridian_rebalance_nodes_total{node=%q,role=%q,direction=\"join\"} %d\n", node, role, st.NodesJoined)
+	fmt.Fprintf(w, "meridian_rebalance_nodes_total{node=%q,role=%q,direction=\"leave\"} %d\n", node, role, st.NodesLeft)
+
+	fmt.Fprintf(w, "# HELP meridian_rebalance_skipped_total Ownership changes deferred (no reachable source, unconfirmed owner, or no quorum).\n")
+	fmt.Fprintf(w, "# TYPE meridian_rebalance_skipped_total counter\n")
+	fmt.Fprintf(w, "meridian_rebalance_skipped_total{node=%q,role=%q} %d\n", node, role, st.Skipped)
+}
+
 // WriteAnomalyMetrics writes the streaming-anomaly-detector metrics for one
 // node/role: the cumulative count of alerts raised (a counter) and the number of
 // series currently firing (a gauge). Shared by the monolith and the gateway so

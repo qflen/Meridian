@@ -221,6 +221,51 @@ can read a divergent window from each replica and push whatever a peer is missin
 back through `/api/internal/backfill`. Both the read and the push are scoped to the
 differing window, so a converged cluster moves no data.
 
+### Rebalance drop (storage)
+
+```
+POST /api/internal/rebalance/drop
+```
+
+The GC half of rebalancing on membership change (ADR-031). After the coordinator has
+migrated a range to its new owners (the range read above + a backfill push) and confirmed
+receipt at quorum, it tells the old owner to drop the data it no longer owns. The body is a
+list of `[lo, hi]` hash arcs (same arc shape as anti-entropy); the storage node drops every
+series whose ring position falls in any arc, across the head, raw blocks, and rollup tiers,
+and reports what it removed:
+
+```json
+{ "ranges": [[1024, 4096]] }
+```
+```json
+{ "series_dropped": 12, "samples_dropped": 4096, "rollup_windows_dropped": 340,
+  "blocks_rewritten": 2, "blocks_deleted": 1 }
+```
+
+An empty `ranges` is a no-op — the drop is always expressed as the arcs that moved away,
+never "keep only these," so it cannot erase a node. The cluster-level safety (drop only
+after the new owners confirm at quorum, never the last copy) is enforced by the coordinator
+before it issues the drop.
+
+### Cluster membership (ingestor)
+
+```
+POST /api/internal/cluster/join     { "addr": "storage-4:8080" }
+POST /api/internal/cluster/leave    { "addr": "storage-4:8080" }
+```
+
+Drives a membership change through the rebalance coordinator (ADR-031). `join` adds the node
+(catching up out of routing), migrates the ranges it now owns onto it, promotes it, and GCs
+the displaced owners; `leave` re-homes the node's ranges to the survivors before removing it.
+The migration runs synchronously and the response reports what moved:
+
+```json
+{ "Migrations": 18, "SamplesMoved": 7200, "BytesMoved": 245760, "GCRuns": 18,
+  "SeriesDropped": 18, "SamplesGCed": 7200, "NodesJoined": 1, "NodesLeft": 0, "Skipped": 0 }
+```
+
+Returns `503` when rebalancing is disabled (`REBALANCE_ENABLED=false`).
+
 ## WebSocket Streams
 
 ### Metrics Stream

@@ -3,6 +3,22 @@
 ## Unreleased
 
 ### Replication & clustering
+- Rebalancing on membership change (ADR-031): adding or removing a storage node now
+  re-derives placement **and moves the data**. `cluster.PlacementDelta` diffs the owner
+  sets before/after the change (at the union of the rings' virtual-node boundaries) into the
+  arcs that moved; the coordinator **migrates** each moved arc to its new owners by reusing
+  the anti-entropy range read (`/api/internal/antientropy/range`) + the handoff backfill
+  apply (`/api/internal/backfill`), then **GCs** the data a node no longer owns via the new
+  `TSDB.DropSeriesInRanges` (`/api/internal/rebalance/drop`) — head flushed, then blocks
+  left, deleted whole, or rewritten to keep only owned series. GC runs only after the new
+  owners confirm receipt at quorum and never drops the last copy; a joining node catches up
+  out of routing before it serves, a leaving node re-homes its ranges before removal, and a
+  node returning from `dead` has the over-replication its absence created reclaimed off the
+  fallbacks. Reads stay complete throughout. Driven by `POST
+  /api/internal/cluster/{join,leave}`; `meridian_rebalance_*` exposes
+  migrations/bytes/GC/joins/leaves. On by default for the cluster tier
+  (`cluster.rebalance`); disabled, a membership change re-derives routing without moving
+  data (the pre-ADR-031 behaviour).
 - Proactive anti-entropy (ADR-030): a rate-limited, jittered background sweep on the
   ingestor converges co-replicas that read-repair and hinted handoff never reach — cold
   data, an unobserved partial write, a hint dropped past the cap, a series no longer

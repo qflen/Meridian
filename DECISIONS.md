@@ -1306,3 +1306,116 @@ behaviour.
   window reads all its in-range points from each replica before pushing only the gaps. A
   finer per-series or per-point digest would read less at the cost of a larger digest —
   `window` is the knob that trades the two off.
+
+---
+
+## ADR-031: Rebalancing on Membership Change — Migrate to New Owners, GC the Un-owned
+
+**Status**: Accepted
+**Context**: The consistent-hash ring (ADR-022) re-derives *placement* the instant
+membership changes — add a node and `GetNodes`/`PreferenceList`/`ReplicaGroups` immediately
+return the new owner set; remove one and routing flows to the survivors. But the **data**
+does not follow:
+
+- **A joined node owns ranges it does not hold.** New writes for its ranges arrive, but the
+  history those ranges already accumulated stays on the old owners. The new node serves
+  incomplete reads for its own ranges until — never, on its own.
+- **A removed node's data is stranded.** Routing moves to the survivors, but the departing
+  node still holds the only copy of some ranges; pull it and that data is gone.
+- **Degraded windows leave over-replication.** While an owner is down, ADR-022 routes its
+  writes to a live fallback and ADR-029 buffers a hint; when the owner returns and the hint
+  replays, the range now sits on `RF + 1` nodes — the fallback holds a copy it does not own,
+  paying storage forever.
+
+Read-repair (ADR-022), hinted handoff (ADR-029), and anti-entropy (ADR-030) all converge
+*co-replicas* — nodes that share an owner set. None of them **moves** an owner set: they
+reconcile A and B where both own a range, but say nothing about data that must travel from
+A (no longer an owner) to C (a new one). That is rebalancing, and it was the last deferred
+piece of elastic membership.
+
+**Decision**: Drive a **migrate-then-GC reconcile** off ring transitions, computing the
+exact ranges that moved and **reusing the existing transfer and GC surfaces** end to end —
+no new data plane. The work splits along the same import direction as anti-entropy (a pure
+ring diff in `cluster`; the ring-aware coordinator in `service`; a mechanical drop in
+`storage`).
+
+- **Ownership diff — pure, ring-only (`cluster.PlacementDelta`).** Given two ring snapshots
+  (before and after a change), diff their owner sets at the **union of their virtual-node
+  boundaries** — the finest granularity at which both classify a key consistently — and
+  group the arcs whose owner set changed into `OwnershipChange{Before, After, Added,
+  Removed, Arcs}`. Target ownership counts the first `RF` **non-departing** nodes clockwise:
+  a *joining* node is already a target owner (it is coming in), while a *leaving* or *dead*
+  node is excluded as a target yet still appears in `Before` as a **source**. This single
+  primitive expresses every transition — a join (the joiner is `Added`, a displaced owner
+  `Removed`), a graceful leave (the leaver `Removed`, a survivor `Added`), and a return from
+  Dead (the returnee `Added`, the degraded fallback `Removed`).
+- **Migrate by reusing the anti-entropy transfer (`service`).** For each change, read the
+  moved arcs from a reachable current owner via the ADR-030 range-export endpoint and push
+  them to each new owner through the ADR-029 out-of-order-tolerant `/api/internal/backfill`
+  — the *same* gap-fill, idempotent, WAL-durable apply hints and anti-entropy already use.
+  A new owner is a **confirmed holder** only when it acknowledges the push.
+- **GC by extending the block-delete surface (`storage.DropSeriesInRanges`).** Once data
+  has moved, the old owner drops the arcs it no longer owns: the head is flushed first (so
+  nothing lingers in the WAL to be replayed), then each block is left untouched, deleted
+  whole (only un-owned series), or **rewritten to keep just its owned series** — reusing
+  `WriteBlock`/`WriteRollupBlock`'s crash-safe temp→fsync→rename commit. The drop is keyed
+  by the *arcs that moved away* (`/api/internal/rebalance/drop`), never "keep only these,"
+  so an empty set is a no-op — it cannot accidentally erase a node.
+- **Lifecycle ordering is the safety contract.** A join adds the node `Joining` (out of live
+  routing, and shielded from health-driven promotion so liveness cannot mark it Active
+  early), migrates its ranges, **then** promotes it to `Active` and **only then** GCs the
+  displaced owner. A leave migrates while the node is still `Active` and serving (reads stay
+  complete), **then** marks it `Leaving` (out of routing), GCs it, and removes it. Doing the
+  state flip *before* the GC is what stops read-repair from re-adding what the drop removed
+  — the loser is already out of the arc's routing set, so no read targets it for repair.
+
+Two invariants gate every drop: **GC only after the new owners are confirmed holders at
+quorum**, and **never drop the last copy** (the losers are by construction not in `After`, and
+the drop requires a quorum of confirmed `After` holders ≥ 1). If migration cannot complete a
+pass — a source or a new owner is unreachable, or the byte cap is hit — the node is left
+`Joining`/`Leaving`, nothing is GC'd, and the data stays on its existing owners; a later pass
+finishes it. Safe to retry, idempotent throughout.
+
+Why this shape: rebalancing is the *movement* layer the convergence layers assume but never
+provide, and it is built entirely from their parts — the `PreferenceList` ring walk
+(generalised to a before/after diff), the anti-entropy range read, and the handoff backfill
+apply — plus one new local operation (drop a hash range) that extends the existing
+delete-by-ULID GC. Reusing the backfill apply means a migrated range is gap-filled and
+crash-durable for free, and a re-pushed range a new owner already holds is a no-op, which is
+what makes the whole thing safe to re-run.
+
+**Consequences**: Membership is elastic, proven end to end. Adding a node migrates the ranges
+it now owns onto it and GCs them from the displaced owners — final placement is *exactly* the
+ring's replica sets (no missing copy, no stale copy), reads stay complete throughout, and a
+reader hammering the cluster across the whole join never sees an incomplete result. Removing a
+node re-homes its ranges to the survivors before it is dropped, losing nothing. A node
+returning from Dead has the over-replication its absence created GC'd off the fallbacks once
+the natural owners are confirmed at quorum. Observability:
+`meridian_rebalance_migrations_total`, `_moved_samples_total`, `_moved_bytes_total`,
+`_gc_runs_total`, `_gc_series_total`, `_gc_samples_total`, `_nodes_total{direction}`, and
+`_skipped_total` on the coordinator. Opt-in and on by default for the cluster tier; disabled,
+a membership change re-derives routing without moving data (the pre-ADR-031 behaviour),
+driven through `POST /api/internal/cluster/{join,leave}` on the ingestor.
+
+**Deferred (honest scope)**:
+- **Membership change is operator-driven, not gossiped.** A join/leave is an explicit admin
+  call (or a coordinator-API call); there is no discovery protocol electing it. The
+  coordinator that holds the ring (the ingestor) executes the move synchronously. A
+  gossip/membership service would remove the manual trigger but is a separate concern.
+- **One coordinator per deployment.** Like anti-entropy (ADR-030), the rebalance runs on the
+  ingestor (it holds the ring and the transfer clients). Two coordinators acting on the same
+  change would both migrate/GC — redundant but safe (every apply and drop is idempotent).
+- **Block rewrite decodes and re-encodes.** GC of a partially-owned block rebuilds it from
+  its kept series through the normal block writer rather than splicing compressed chunks —
+  simpler and reusing the tested crash-safe path, at the cost of a decode/re-encode. GC is
+  rate-limited and off the hot path, so the cost is acceptable; direct chunk-copy is a future
+  optimisation. The rewritten block resets to compaction level 1 (it is effectively fresh)
+  but preserves its WAL low-water-mark so replay still skips the same segments.
+- **A late write during a move can leave a new owner one point behind.** Migration snapshots
+  the source, so a write that lands on the old owners after the snapshot but before the state
+  flip is not in the pushed set; the new owner is momentarily one point short until
+  anti-entropy/read-repair fills it. This is under-replication, never loss (the staying owners
+  hold it), and self-heals — the same convergence guarantee everything else leans on.
+- **Migration rate-limiting is sequential + a byte cap.** Changes are processed one at a time
+  (no thundering herd) with an optional `max_bytes_per_round` to spread a large move across
+  passes; there is no token-bucket throughput shaper yet.

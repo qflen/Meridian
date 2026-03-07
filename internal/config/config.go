@@ -158,6 +158,42 @@ type ClusterConfig struct {
 	// AntiEntropy configures proactive Merkle anti-entropy (ADR-030), the background
 	// sweep that converges co-replicas read-repair and handoff cannot reach.
 	AntiEntropy AntiEntropyConfig `yaml:"anti_entropy"`
+	// Rebalance configures data migration on membership change (ADR-031): when a node joins
+	// or leaves, the ranges that changed owners are migrated to their new owners and the data
+	// a node no longer owns is GC'd.
+	Rebalance RebalanceConfig `yaml:"rebalance"`
+}
+
+// RebalanceConfig configures rebalancing on membership change (ADR-031). When a node joins or
+// leaves the ring, placement is re-derived and the affected ranges are migrated to their new
+// owners (reusing the backfill transfer); the old owners then drop the data they no longer own
+// once the new owners confirm receipt at quorum (never the last copy). Disabled, a membership
+// change re-derives routing but leaves existing data where it was (the pre-ADR-031 behaviour).
+type RebalanceConfig struct {
+	// Enabled turns rebalancing on for the coordinator (the ingestor).
+	Enabled bool `yaml:"enabled"`
+	// Lookback bounds how far back a migration reads/GCs. 0 migrates all history; a finite
+	// value bounds the per-pass read cost on large datasets.
+	Lookback Duration `yaml:"lookback"`
+	// MaxBytesPerRound soft-caps the bytes a single migrate pass transfers (the throughput
+	// rate limit); 0 is unlimited. A node is not promoted/removed until a pass completes, so
+	// capping just spreads a large move across more passes.
+	MaxBytesPerRound int64 `yaml:"max_bytes_per_round"`
+}
+
+// Validate checks the rebalance tunables when enabled, so a misconfiguration is caught at
+// load time.
+func (c RebalanceConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.Lookback < 0 {
+		return fmt.Errorf("cluster.rebalance.lookback must be >= 0, got %s", time.Duration(c.Lookback))
+	}
+	if c.MaxBytesPerRound < 0 {
+		return fmt.Errorf("cluster.rebalance.max_bytes_per_round must be >= 0, got %d", c.MaxBytesPerRound)
+	}
+	return nil
 }
 
 // HandoffConfig configures hinted handoff (ADR-029): durable, bounded buffering of
@@ -266,6 +302,9 @@ func (c ClusterConfig) Validate() error {
 		return err
 	}
 	if err := c.AntiEntropy.Validate(); err != nil {
+		return err
+	}
+	if err := c.Rebalance.Validate(); err != nil {
 		return err
 	}
 	return nil
@@ -620,6 +659,11 @@ func DefaultConfig() *Config {
 				Lookback:       0, // all history
 				Jitter:         Duration(10 * time.Second),
 				GroupsPerRound: 16,
+			},
+			Rebalance: RebalanceConfig{
+				Enabled:          true,
+				Lookback:         0, // all history
+				MaxBytesPerRound: 0, // unlimited; migrate a membership change in one pass
 			},
 		},
 		Downsampling: DownsamplingConfig{

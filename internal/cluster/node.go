@@ -7,8 +7,10 @@ package cluster
 // a node returning from Dead with a backlog of buffered hints enters it, replays the
 // hints through the out-of-order-tolerant backfill path, and is promoted to NodeActive
 // only once caught up — so it never receives live writes (or serves reads) while still
-// holding a gap. NodeLeaving remains reserved for graceful departure/rebalancing, which
-// is not yet implemented. See ADR-022 and ADR-029.
+// holding a gap. NodeLeaving drives graceful departure during a rebalance (ADR-031): a node
+// being removed migrates its ranges to their new owners while still serving, then enters
+// NodeLeaving (out of routing) so its shed data can be GC'd before it is dropped from the
+// ring. See ADR-022, ADR-029, and ADR-031.
 type NodeState string
 
 const (
@@ -17,7 +19,8 @@ const (
 	NodeJoining NodeState = "joining"
 	// NodeActive indicates the node is actively serving requests.
 	NodeActive NodeState = "active"
-	// NodeLeaving indicates the node is gracefully leaving the cluster. Reserved; not yet assigned.
+	// NodeLeaving indicates the node is gracefully leaving the cluster: kept out of routing
+	// while a rebalance sheds its now-un-owned data before it is removed (ADR-031).
 	NodeLeaving NodeState = "leaving"
 	// NodeDead indicates the node is unreachable.
 	NodeDead NodeState = "dead"

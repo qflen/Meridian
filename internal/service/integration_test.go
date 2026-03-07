@@ -482,6 +482,27 @@ func replMux(n *replNode) http.Handler {
 		}
 		json.NewEncoder(w).Encode(exportToWrite(series))
 	})
+	// Rebalance GC (ADR-031): drop the series in the requested hash arcs — the data this node
+	// no longer owns — exactly as cmd/storage does.
+	mux.HandleFunc("/api/internal/rebalance/drop", func(w http.ResponseWriter, r *http.Request) {
+		var req service.DropRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		res, err := n.db.DropSeriesInRanges(wireRangesToStorage(req.Ranges), cluster.HashKey)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(service.DropResponse{
+			SeriesDropped:   res.SeriesDropped,
+			SamplesDropped:  res.SamplesDropped,
+			RollupWindows:   res.RollupWindows,
+			BlocksRewritten: res.BlocksRewritten,
+			BlocksDeleted:   res.BlocksDeleted,
+		})
+	})
 	// Gate: a "down" node fails every request, the way a crashed process would.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !n.alive.Load() {

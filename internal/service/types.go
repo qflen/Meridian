@@ -69,6 +69,26 @@ type RangeRequest struct {
 	End    int64       `json:"end"`
 }
 
+// DropRequest asks a storage node to drop every series whose ring position falls in any of
+// Ranges — the data the node no longer owns after a rebalance (ADR-031). Each range is a
+// [lo, hi] hash arc, half-open (lo, hi]; lo > hi wraps the ring. The arc set is supplied by
+// the migration coordinator (which holds the ring) so the storage node stays ring-agnostic,
+// and is only ever issued after the new owners have confirmed receipt at quorum. An empty
+// range set is a no-op.
+type DropRequest struct {
+	Ranges [][2]uint64 `json:"ranges"`
+}
+
+// DropResponse reports what a DropRequest removed from a storage node (ADR-031), so the
+// coordinator can account for the bytes/series reclaimed.
+type DropResponse struct {
+	SeriesDropped   int   `json:"series_dropped"`
+	SamplesDropped  int64 `json:"samples_dropped"`
+	RollupWindows   int64 `json:"rollup_windows_dropped"`
+	BlocksRewritten int   `json:"blocks_rewritten"`
+	BlocksDeleted   int   `json:"blocks_deleted"`
+}
+
 // MatcherJSON serializes a label matcher over the wire.
 type MatcherJSON struct {
 	Name  string `json:"name"`

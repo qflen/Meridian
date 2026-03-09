@@ -56,10 +56,17 @@ export interface WSStatsMessage {
   droppedSamples: number;
 }
 
-// ── Anomaly detection (ADR-024) ─────────────────────────────────────────────
+// ── Anomaly detection (ADR-024, ADR-028) ────────────────────────────────────
 
 export type AnomalySeverity = 'warn' | 'crit';
 export type AnomalyState = 'firing' | 'resolved';
+
+/**
+ * The active detector model reported by the server (ADR-028): `ewma` (moving
+ * baseline) or `holt_winters` (seasonal). Empty until the recent-anomalies seed
+ * reports it; live anomaly frames do not carry it.
+ */
+export type AnomalyModel = '' | 'ewma' | 'holt_winters';
 
 /**
  * One anomaly transition from the streaming detector: a series went out-of-band
@@ -134,6 +141,8 @@ export interface DashboardState {
   connectionStatus: ConnectionStatus;
   // Recent anomalies, one row per series (latest transition wins), most-recent-first.
   anomalies: Anomaly[];
+  // The active detector model, reported by the recent-anomalies seed (ADR-028).
+  anomalyModel: AnomalyModel;
 }
 
 export type DashboardAction =
@@ -147,4 +156,4 @@ export type DashboardAction =
   | { type: 'SET_CLUSTER_NODES'; nodes: ClusterNode[] }
   | { type: 'SET_CONNECTION_STATUS'; status: ConnectionStatus }
   | { type: 'ADD_ANOMALY'; anomaly: Anomaly }
-  | { type: 'SEED_ANOMALIES'; anomalies: Anomaly[] };
+  | { type: 'SEED_ANOMALIES'; anomalies: Anomaly[]; model?: AnomalyModel };

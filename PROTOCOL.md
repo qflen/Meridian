@@ -313,10 +313,11 @@ Per-series samples are also pushed on the same channel:
 }
 ```
 
-**Anomaly alert** (ADR-024): a raise/clear transition from the streaming detector.
-`state` is `firing` or `resolved`; `severity` is `warn` or `crit`; `baseline` is the
-tracked EWMA level and `score` is `|value - baseline| / dispersion`; `seq` is a
-monotonic id for de-duplication.
+**Anomaly alert** (ADR-024, ADR-028): a raise/clear transition from the streaming
+detector. `state` is `firing` or `resolved`; `severity` is `warn` or `crit`;
+`baseline` is the value the point was scored against — the EWMA level, or the
+Holt-Winters forecast (level+trend+seasonal) under `mode: holt_winters` — and `score`
+is `|value - baseline| / dispersion`; `seq` is a monotonic id for de-duplication.
 ```json
 {
   "type": "anomaly",
@@ -334,5 +335,7 @@ monotonic id for de-duplication.
 ```
 
 The recent transitions are also retained server-side; `GET /api/v1/anomalies`
-returns them most-recent-first as `{"anomalies": [...], "total": N, "active": M}`
-so a late-joining client can seed its view.
+returns them most-recent-first as
+`{"anomalies": [...], "total": N, "active": M, "model": "ewma"}` — `model` is the
+active scoring model (`ewma` or `holt_winters`) — so a late-joining client can seed its
+view and label the detector.

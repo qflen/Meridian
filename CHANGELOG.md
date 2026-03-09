@@ -63,6 +63,19 @@
   Default on with zero linger; the on-disk frame format is byte-for-byte unchanged
   and the synchronous path remains available (`storage.wal_group_commit`).
 
+### Anomaly detection
+- Seasonal Holt-Winters model (ADR-028): per-series scoring now sits behind a model
+  interface, with an additive level+trend+seasonal **Holt-Winters** model selectable
+  via `anomaly.mode: holt_winters` alongside the default EWMA. It derives the diurnal
+  phase from the sample timestamp, warms up over one full season, and scores each value
+  against the band for its own time of day — so it flags a value normal globally but
+  abnormal for that phase (a midday level in the small hours, a scheduled dip that fails
+  to happen), which EWMA cannot. The Huber clamp, scale floor, debounce/hysteresis and
+  event emission are shared by both models; EWMA's math and defaults are unchanged.
+  `anomaly.{mode,season_length,season_period}` are configurable; the active model
+  appears on `/api/v1/stats`, `/api/v1/anomalies`, `meridian_anomaly_model_info`, and the
+  dashboard's Anomalies panel.
+
 ## v0.2.0 — 2026-06-18
 
 Meridian as it stands at this release: a distributed time-series database in Go

@@ -159,3 +159,12 @@ numbers, here are the cost characteristics and where to read the real signal liv
   at quorum. `meridian_rebalance_*` shows migrations/bytes moved and GC series/samples
   reclaimed; `_skipped_total` climbing without `_migrations_total` flags a move that cannot
   reach a source or a quorum.
+- **Anomaly detection** (ADR-024, ADR-028): on the broadcast tick, not the read or write
+  path — one map lookup and a handful of float ops per live series per tick (~1 Hz), under
+  a single lock. **EWMA** (default) keeps O(1) state per series (a few `float64`s).
+  **Holt-Winters** (`mode: holt_winters`) keeps O(`season_length`) per series (the seasonal
+  array, plus a one-season warmup accumulator that is released once seeded); its per-tick
+  work is still a constant handful of ops (one bucket index from the timestamp, a forecast,
+  three smoothing updates). Memory follows live cardinality because unseen series are
+  evicted. Activity shows in `meridian_anomalies_total` / `meridian_active_anomalies`, and
+  `meridian_anomaly_model_info` names the active model.

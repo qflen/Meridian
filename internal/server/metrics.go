@@ -290,10 +290,11 @@ func WriteRebalanceMetrics(w io.Writer, node, role string, st RebalanceStats) {
 }
 
 // WriteAnomalyMetrics writes the streaming-anomaly-detector metrics for one
-// node/role: the cumulative count of alerts raised (a counter) and the number of
-// series currently firing (a gauge). Shared by the monolith and the gateway so
-// both expose identical anomaly metrics. See ADR-024.
-func WriteAnomalyMetrics(w io.Writer, node, role string, total uint64, active int) {
+// node/role: the cumulative count of alerts raised (a counter), the number of series
+// currently firing (a gauge), and an info gauge naming the active scoring model.
+// Shared by the monolith and the gateway so both expose identical anomaly metrics.
+// See ADR-024, ADR-028.
+func WriteAnomalyMetrics(w io.Writer, node, role, model string, total uint64, active int) {
 	fmt.Fprintf(w, "# HELP meridian_anomalies_total Anomaly alerts raised since startup.\n")
 	fmt.Fprintf(w, "# TYPE meridian_anomalies_total counter\n")
 	fmt.Fprintf(w, "meridian_anomalies_total{node=%q,role=%q} %d\n", node, role, total)
@@ -301,6 +302,12 @@ func WriteAnomalyMetrics(w io.Writer, node, role string, total uint64, active in
 	fmt.Fprintf(w, "# HELP meridian_active_anomalies Series currently in an out-of-band (firing) state.\n")
 	fmt.Fprintf(w, "# TYPE meridian_active_anomalies gauge\n")
 	fmt.Fprintf(w, "meridian_active_anomalies{node=%q,role=%q} %d\n", node, role, active)
+
+	// Info gauge identifying the active scoring model (ewma or holt_winters, ADR-028):
+	// always 1, with the model carried as a label so scrapers can tell which is running.
+	fmt.Fprintf(w, "# HELP meridian_anomaly_model_info Active anomaly scoring model (value is always 1).\n")
+	fmt.Fprintf(w, "# TYPE meridian_anomaly_model_info gauge\n")
+	fmt.Fprintf(w, "meridian_anomaly_model_info{node=%q,role=%q,model=%q} 1\n", node, role, model)
 }
 
 // WriteServiceMetrics writes process-level metrics common to every Meridian service

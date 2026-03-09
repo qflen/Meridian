@@ -57,6 +57,9 @@ func TestRecentAnomaliesPayload(t *testing.T) {
 	if list, ok := p["anomalies"].([]anomaly.Event); !ok || len(list) != 0 {
 		t.Fatalf("nil payload anomalies = %v, want empty slice", p["anomalies"])
 	}
+	if p["model"] != "" {
+		t.Errorf("nil payload model = %v, want empty string", p["model"])
+	}
 
 	cfg := anomaly.DefaultConfig()
 	cfg.Enabled = true
@@ -77,6 +80,9 @@ func TestRecentAnomaliesPayload(t *testing.T) {
 	}
 	if p["active"].(int) != 1 {
 		t.Errorf("expected active = 1, got %v", p["active"])
+	}
+	if p["model"] != string(anomaly.ModeEWMA) {
+		t.Errorf("expected model = %q, got %v", anomaly.ModeEWMA, p["model"])
 	}
 	// Most-recent-first ordering.
 	for i := 1; i < len(list); i++ {

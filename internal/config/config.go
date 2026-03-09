@@ -564,23 +564,44 @@ func (c IngestionConfig) Validate() error {
 }
 
 // AnomalyConfig tunes the streaming anomaly detector that runs over the live
-// telemetry path (ADR-024). The detector tracks an EWMA baseline + dispersion per
-// series and flags points whose local z-score |value-baseline|/dispersion exceeds
-// Threshold; the remaining robustness knobs (Huber clamp, scale floor, hysteresis)
-// take internal defaults.
+// telemetry path (ADR-024, ADR-028). The detector scores each series' latest value
+// against a per-series model and flags points whose score |value-baseline|/dispersion
+// exceeds Threshold; the remaining robustness knobs (Huber clamp, scale floor,
+// hysteresis) take internal defaults.
+//
+// Mode selects the model. The default "ewma" tracks an EWMA baseline + dispersion,
+// robust to a moving baseline. "holt_winters" (ADR-028) additionally learns the
+// diurnal shape and scores against the band for each time of day, so it flags a value
+// that is normal globally but abnormal for that phase — at the cost of warming up over
+// a full season. Threshold/Alpha/DebounceK apply to both models; SeasonLength and
+// SeasonPeriod apply only to Holt-Winters (its trend/seasonal smoothing take internal
+// defaults).
 type AnomalyConfig struct {
 	// Enabled turns the detector on. When false the broadcast loop feeds it nothing
 	// and no anomaly frames or metrics are produced.
 	Enabled bool `yaml:"enabled"`
 	// Threshold is the local z-score above which a sample is out-of-band (~3–4).
 	Threshold float64 `yaml:"threshold"`
-	// Alpha is the EWMA smoothing factor in (0,1] for the baseline and dispersion.
+	// Alpha is the smoothing factor in (0,1] for the level and dispersion (and the
+	// Holt-Winters level).
 	Alpha float64 `yaml:"alpha"`
 	// Warmup is the number of samples used to seed a per-series baseline before any
-	// alert may fire (>= 2).
+	// alert may fire (>= 2). Used by EWMA; Holt-Winters instead warms over one season.
 	Warmup int `yaml:"warmup"`
 	// DebounceK is the consecutive out-of-band samples required to raise an alert (>= 1).
 	DebounceK int `yaml:"debounce_k"`
+
+	// Mode selects the scoring model: "ewma" (default, also the empty value) or
+	// "holt_winters".
+	Mode string `yaml:"mode"`
+	// SeasonLength is the number of seasonal buckets the season is divided into
+	// (holt_winters only, >= 2); a sample is scored against the band learned for its
+	// bucket. Unset falls back to the detector's internal default.
+	SeasonLength int `yaml:"season_length"`
+	// SeasonPeriod is the wall-clock span of one full season (holt_winters only, > 0),
+	// e.g. 24h for a diurnal cycle. A sample's bucket is derived from its timestamp
+	// modulo this period. Unset falls back to the detector's internal default.
+	SeasonPeriod Duration `yaml:"season_period"`
 }
 
 // Validate checks the anomaly tunables when the detector is enabled, so a
@@ -602,11 +623,28 @@ func (c AnomalyConfig) Validate() error {
 	if c.DebounceK < 1 {
 		return fmt.Errorf("anomaly.debounce_k must be >= 1, got %d", c.DebounceK)
 	}
+	switch c.Mode {
+	case "", string(anomaly.ModeEWMA):
+		// EWMA needs no seasonal parameters.
+	case string(anomaly.ModeHoltWinters):
+		// Validate the seasonal parameters only when set; unset falls back to the
+		// detector's internal defaults, which are themselves valid.
+		if c.SeasonLength != 0 && c.SeasonLength < 2 {
+			return fmt.Errorf("anomaly.season_length must be >= 2 for holt_winters, got %d", c.SeasonLength)
+		}
+		if c.SeasonPeriod.Std() < 0 {
+			return fmt.Errorf("anomaly.season_period must be > 0 for holt_winters, got %s", c.SeasonPeriod.Std())
+		}
+	default:
+		return fmt.Errorf("anomaly.mode must be %q or %q, got %q", anomaly.ModeEWMA, anomaly.ModeHoltWinters, c.Mode)
+	}
 	return nil
 }
 
 // Detector maps the YAML-exposed tunables onto an anomaly.Config, leaving the
-// detector's internal robustness defaults (clip/clear/crit/floor/buffer) in place.
+// detector's internal robustness defaults (clip/clear/crit/floor/buffer and the
+// Holt-Winters trend/seasonal smoothing) in place. An unset Mode/SeasonLength/
+// SeasonPeriod falls through to the anomaly package defaults.
 func (c AnomalyConfig) Detector() anomaly.Config {
 	base := anomaly.DefaultConfig()
 	base.Enabled = c.Enabled
@@ -614,6 +652,13 @@ func (c AnomalyConfig) Detector() anomaly.Config {
 	base.Alpha = c.Alpha
 	base.Warmup = c.Warmup
 	base.DebounceK = c.DebounceK
+	base.Mode = anomaly.Mode(c.Mode) // "" → withDefaults normalises to ModeEWMA
+	if c.SeasonLength > 0 {
+		base.SeasonLength = c.SeasonLength
+	}
+	if c.SeasonPeriod.Std() > 0 {
+		base.SeasonPeriodMs = c.SeasonPeriod.Std().Milliseconds()
+	}
 	return base
 }
 
@@ -690,6 +735,9 @@ func DefaultConfig() *Config {
 			Alpha:     0.1,
 			Warmup:    20,
 			DebounceK: 2,
+			Mode:      string(anomaly.ModeEWMA),
+			// SeasonLength/SeasonPeriod are unset: they apply only to holt_winters and
+			// fall back to the detector's internal defaults (48 buckets over 24h).
 		},
 		Log: LogConfig{
 			Level:  "info",

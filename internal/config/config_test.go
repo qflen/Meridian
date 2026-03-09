@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/meridiandb/meridian/internal/anomaly"
 )
 
 func TestParseDuration(t *testing.T) {
@@ -215,6 +217,10 @@ func TestAnomalyConfigValidate(t *testing.T) {
 		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 3},
 		{Enabled: true, Threshold: 0.5, Alpha: 1, Warmup: 2, DebounceK: 1}, // boundary values
 		{Enabled: false}, // tunables irrelevant when disabled
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 2, Mode: "ewma"},
+		// holt_winters with explicit and with defaulted season parameters.
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 2, Mode: "holt_winters", SeasonLength: 48, SeasonPeriod: Duration(24 * time.Hour)},
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 2, Mode: "holt_winters"},
 	}
 	for _, c := range valid {
 		if err := c.Validate(); err != nil {
@@ -228,6 +234,9 @@ func TestAnomalyConfigValidate(t *testing.T) {
 		{Enabled: true, Threshold: 3.5, Alpha: 1.5, Warmup: 20, DebounceK: 3}, // alpha > 1
 		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 1, DebounceK: 3},  // warmup < 2
 		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 0}, // debounce < 1
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 2, Mode: "bogus"},                              // unknown mode
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 2, Mode: "holt_winters", SeasonLength: 1},      // season_length < 2
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 2, Mode: "holt_winters", SeasonPeriod: Duration(-time.Second)}, // negative period
 	}
 	for _, c := range invalid {
 		if err := c.Validate(); err == nil {
@@ -240,10 +249,71 @@ func TestDefaultConfigAnomalyValid(t *testing.T) {
 	if err := DefaultConfig().Anomaly.Validate(); err != nil {
 		t.Fatalf("default anomaly config must validate: %v", err)
 	}
-	// The mapping onto the detector config preserves the YAML-exposed tunables.
+	// The mapping onto the detector config preserves the YAML-exposed tunables and
+	// defaults to the EWMA model.
 	d := DefaultConfig().Anomaly.Detector()
 	if !d.Enabled || d.Threshold != 3.5 || d.Alpha != 0.1 || d.Warmup != 20 || d.DebounceK != 2 {
 		t.Fatalf("detector mapping lost tunables: %+v", d)
+	}
+	if d.Mode != anomaly.ModeEWMA {
+		t.Fatalf("default mode should be EWMA, got %q", d.Mode)
+	}
+}
+
+func TestAnomalyHoltWintersMapping(t *testing.T) {
+	c := AnomalyConfig{
+		Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 2,
+		Mode: "holt_winters", SeasonLength: 24, SeasonPeriod: Duration(12 * time.Hour),
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("holt_winters config should validate: %v", err)
+	}
+	d := c.Detector()
+	if d.Mode != anomaly.ModeHoltWinters {
+		t.Errorf("mode not mapped onto the detector: got %q", d.Mode)
+	}
+	if d.SeasonLength != 24 {
+		t.Errorf("season_length = %d, want 24", d.SeasonLength)
+	}
+	if want := (12 * time.Hour).Milliseconds(); d.SeasonPeriodMs != want {
+		t.Errorf("season_period_ms = %d, want %d", d.SeasonPeriodMs, want)
+	}
+
+	// Unset season parameters fall back to the detector's internal defaults (non-zero),
+	// so a minimal holt_winters config is still complete.
+	bare := AnomalyConfig{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 2, Mode: "holt_winters"}.Detector()
+	if bare.SeasonLength <= 0 || bare.SeasonPeriodMs <= 0 {
+		t.Errorf("unset season params should default, got length=%d periodMs=%d", bare.SeasonLength, bare.SeasonPeriodMs)
+	}
+}
+
+func TestLoadParsesHoltWintersAnomaly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "meridian.yaml")
+	yaml := `
+anomaly:
+  enabled: true
+  threshold: 4
+  alpha: 0.2
+  warmup: 30
+  debounce_k: 3
+  mode: holt_winters
+  season_length: 24
+  season_period: 12h
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load should accept a valid holt_winters config: %v", err)
+	}
+	a := cfg.Anomaly
+	if a.Mode != "holt_winters" || a.SeasonLength != 24 || a.SeasonPeriod.Std() != 12*time.Hour {
+		t.Fatalf("holt_winters anomaly fields not parsed from YAML: %+v", a)
+	}
+	if d := a.Detector(); d.Mode != anomaly.ModeHoltWinters || d.SeasonPeriodMs != (12*time.Hour).Milliseconds() {
+		t.Fatalf("detector mapping after load is wrong: mode=%q periodMs=%d", d.Mode, d.SeasonPeriodMs)
 	}
 }
 

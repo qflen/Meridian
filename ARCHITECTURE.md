@@ -183,18 +183,30 @@ monolith and the gateway, where the anomaly detector runs, additionally export
 **Detector** (`internal/anomaly/detector.go`): a pure, per-series online detector
 fed from the same per-series stream the broadcaster emits each tick, so it runs
 uniformly in the monolith (`cmd/meridian/serve.go`, from `Head().SeriesInfos()`) and
-the cluster gateway (`cmd/gateway`, from the aggregated `FetchSeries`). Each series
-keeps O(1) state: an **EWMA level** (baseline) and **EWMA variance** (dispersion);
-the score `|value − level| / dispersion` is a *local* z-score, so the slow diurnal
-swing and memory drift are tracked (small residual → no alert) while a spike departs
-sharply (large score → alert) — where a naive global z-score would flag the diurnal
-peak (ADR-024). A Welford warmup seeds the baseline; a Huber clamp bounds a spike's
-pull on the level/variance; a relative scale floor stops a flat series from collapsing
-the dispersion; debounce + a hysteresis clear band and timestamp dedup (on
-`SeriesInfo.LastTS`) avoid alert storms; stale series are evicted so memory follows
-live cardinality. Raise/clear transitions broadcast as a distinct `anomaly` WebSocket
-frame and into a bounded recent-events ring exposed at `/api/v1/anomalies` for
-late-joining clients; the dashboard's Anomalies strip lists them most-recent-first.
+the cluster gateway (`cmd/gateway`, from the aggregated `FetchSeries`). Per-series
+scoring sits behind a small **model interface**, selected by `Config.Mode`; the
+detector owns the shared machinery (dedup, debounce/hysteresis, scale floor, event
+emission, eviction) and a model only supplies a `(baseline, score)`.
+
+- **EWMA** (default): each series keeps O(1) state — an **EWMA level** (baseline) and
+  **EWMA variance** (dispersion); the score `|value − level| / dispersion` is a *local*
+  z-score, so the slow diurnal swing and memory drift are tracked (small residual → no
+  alert) while a spike departs sharply (large score → alert) — where a naive global
+  z-score would flag the diurnal peak (ADR-024). A Welford warmup seeds the baseline.
+- **Holt-Winters** (`holtwinters.go`, opt-in via `mode: holt_winters`): an additive
+  level+trend+seasonal model (ADR-028). It derives the seasonal **phase from the sample
+  timestamp** (`ts mod season_period`), warms up over one full season, and scores each
+  value against the band for its own time of day — so it flags a value normal globally
+  but abnormal for that phase, which EWMA cannot. Per-series state is O(season) (the
+  seasonal array). It reuses the shared scale floor and the Huber clamp.
+
+A Huber clamp bounds a spike's pull on the baseline/dispersion; a relative scale floor
+stops a flat series from collapsing the dispersion; debounce + a hysteresis clear band
+and timestamp dedup (on `SeriesInfo.LastTS`) avoid alert storms; stale series are
+evicted so memory follows live cardinality. Raise/clear transitions broadcast as a
+distinct `anomaly` WebSocket frame and into a bounded recent-events ring exposed at
+`/api/v1/anomalies` (which also reports the active model) for late-joining clients; the
+dashboard's Anomalies strip lists them most-recent-first and shows the model.
 
 ### Cluster (microservices tier)
 

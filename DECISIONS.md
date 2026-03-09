@@ -1097,6 +1097,110 @@ never shed); the config validation; and the metric families.
   drop (rare under the new policy) is counted in the grand total but not broken down
   by class — the breakdown covers the admission-stage decisions.
 
+## ADR-028: Seasonal Anomaly Detection — Holt-Winters Alongside EWMA
+
+**Status**: Accepted (implemented)
+
+**Context**: The EWMA detector (ADR-024) scores each value against the level the
+series was *just holding*. That is exactly right for spikes and robust to slow
+movement — the level follows a diurnal swing or a memory drift, so neither alerts —
+but it has a structural blind spot: it never learns the diurnal **shape**. Two
+consequences follow. First, EWMA cannot flag a value that is normal *globally* yet
+wrong *for the time of day*: a load that holds its midday level through the small
+hours, or a scheduled nightly dip that one day fails to happen, never departs from the
+recent level, so EWMA stays silent. Second, on a series with a real daily swing EWMA's
+dispersion is inflated by the part of that swing it is perpetually chasing, so its band
+is wider than the genuine noise — it is less sensitive than a model that has subtracted
+the season. ADR-024 named this gap explicitly as deferred ("no seasonal model … e.g.
+Holt-Winters"). We want to close it **without disturbing the EWMA path**, which is
+cheap, warms up in a handful of samples, and is the right default for most series.
+
+**Decision**: Add a per-series **additive Holt-Winters** model (level + trend +
+seasonal) in `internal/anomaly/holtwinters.go`, selectable by config, **alongside**
+EWMA — not replacing it.
+
+- **A model interface, shared machinery.** Per-series scoring is factored behind a
+  small `model` interface: given a value and its timestamp it folds the value into the
+  series' state and returns `(baseline, score, warming)`. The `Detector` keeps
+  everything else — timestamp dedup, debounce + hysteresis, the dispersion scale floor,
+  severity, event emission, the recent-events ring, eviction, the counters. EWMA is one
+  implementation (`ewmaModel`), Holt-Winters the other (`hwModel`); `Config.Mode`
+  (`ewma` default, `holt_winters` opt-in) picks one at construction. The refactor is
+  behaviour-preserving: EWMA's math, defaults and public API are unchanged and the
+  existing `detector_test.go` passes verbatim.
+- **Phase from the timestamp, not a counter.** The season is divided into
+  `season_length` buckets spanning a wall-clock `season_period` (default 48 buckets over
+  24h). A sample's bucket is `(TimestampMs mod season_period) · season_length /
+  season_period` — its **time of day**, derived from `Sample.TimestampMs`, so a value is
+  always compared against the band learned for its own phase regardless of how many
+  samples preceded it or whether a slow stream was deduped. No storage change: the
+  per-sample timestamp already on the tick feed carries the phase.
+- **One-step forecast, scored against a dynamic band.** For a value `y` in bucket `k`
+  the forecast is `f = level + trend + seasonal[k]`, the residual `e = y − f`, and the
+  score `|e| / dispersion`. The model then folds the (Huber-clamped) residual back in,
+  in residual form so the clamp applies cleanly: `L' = L + T + α·e`, `T' = T + β·(L'−L−T)`,
+  `S'[k] = S[k] + γ·(1−α)·e`. The dispersion is an EWMA variance of the residual — the
+  *same* West recurrence the EWMA model uses — so it tracks the genuine noise *around the
+  season*, which is what makes an off-phase value stand out. `α` (level) is shared with
+  EWMA; `β` (trend) and `γ` (seasonal) take internal defaults.
+- **Reuse the robustness, not just the plumbing.** The forecast residual is winsorized
+  by the shared Huber clamp (`±clip·dispersion`) before it updates the model, so one
+  spike cannot rewrite the learned level/season or inflate the band — the same
+  self-blinding fix ADR-024 applies to EWMA. The dispersion is floored by the shared
+  `scaleFloor` (`floorFrac·|level| + floorAbs`), so a flat phase cannot collapse the
+  band. Debounce, hysteresis, severity and emission are the detector's, unchanged.
+- **Warmup over one full season.** A seasonal model cannot score before it has seen each
+  time of day, so Holt-Winters warms up over one whole `season_period` (not over
+  `warmup` samples): it gathers per-bucket sum/sum-of-squares/count, and on the first
+  sample past one period seeds `level` = overall mean, `seasonal[k]` = bucket mean −
+  level (0 for a bucket not yet seen), `variance` = pooled within-bucket variance (the
+  residual noise, *not* the global variance — using the global variance would hide
+  exactly the off-season values we want), and `trend` = 0. Seeding the season from the
+  warmup window is what keeps the first post-warmup season from spuriously alerting.
+- **Bounded state.** Per series, Holt-Winters keeps O(`season_length`) (the seasonal
+  array) plus a one-season warmup accumulator that is **released once seeded**; EWMA
+  stays O(1). Per-tick work is a constant handful of ops either way (one bucket index, a
+  forecast, three smoothing updates). Eviction by last-seen still bounds memory to live
+  cardinality.
+- **Config, metrics, dashboard.** `anomaly.{mode, season_length, season_period}` are
+  YAML-configurable and validated at load (the trend/seasonal smoothing take internal
+  defaults, like EWMA's clip/floor); the gateway honours `GATEWAY_ANOMALY_MODE`. The
+  active model is surfaced on `/api/v1/stats` (`anomaly_model`), in the
+  `/api/v1/anomalies` seed payload (`model`), as the `meridian_anomaly_model_info{model}`
+  gauge on `/metrics`, and as a restrained readout in the dashboard's Anomalies panel.
+  Detection runs uniformly in the monolith and the cluster gateway, as for EWMA.
+
+**Consequences**: With `mode: holt_winters`, a clean diurnal series raises no alerts
+(the season is learned), a spike still fires, and — the payoff — a value that is normal
+globally but abnormal for its phase fires where EWMA is silent. The unit tests prove the
+defining case with a sharp **scheduled dip that one season fails to happen**: the value
+holds the baseline (its most ordinary value), so the EWMA detector — fed the identical
+series — tracks it and never fires, while Holt-Winters flags the missing dip and, unlike
+EWMA, does *not* false-positive on the legitimate dips it learned. Tests also cover
+warmup over a full season, bounded seasonal state, and that the phase is derived
+deterministically from the timestamp. EWMA remains the default, so every existing
+deployment is byte-for-byte unchanged until it opts in.
+
+**Deferred (honest scope)**:
+- **Slow off-season drift is still absorbed.** Because the level adapts at the shared
+  `α`, a deviation from the season that develops *slowly* (over many samples) is folded
+  into the level just as EWMA would fold it — the seasonal advantage is sharpest for
+  **sharp** seasonal features (a scheduled dip/peak that appears or vanishes) and for the
+  **tighter per-phase band**, not for gradual off-season ramps. A separate, smaller level
+  factor for Holt-Winters (so the season, not the level, explains the cyclic part) would
+  widen the advantage and is future work.
+- **Single, global seasonality.** One `season_length`/`season_period` applies to every
+  series; there is no per-metric period and no multi-seasonal model (e.g. daily *and*
+  weekly). A series whose period differs from the configured one is modelled poorly.
+- **Long warmup.** Holt-Winters is useful only after a full season of data — far longer
+  than EWMA's ~20 samples — so it is opt-in for series where a season of history exists;
+  EWMA stays the default for everything else. A bucket never visited during the warmup
+  season seeds to a zero offset and is learned only when first seen afterwards.
+- **Online simplifications.** The seasonal indices are not renormalised to sum to zero
+  each cycle (a standard batch-Holt-Winters step), and `β`/`γ` are global internal
+  defaults rather than per-series learned — both acceptable for alerting on the live
+  path, neither exact for forecasting.
+
 ## ADR-029: Hinted Handoff — Buffer Writes for a Down Replica, Replay on Return
 
 **Status**: Accepted

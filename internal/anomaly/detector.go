@@ -1,6 +1,24 @@
 // Package anomaly implements a streaming, per-series anomaly detector for the
-// live telemetry path. It is single-pass and O(1) in memory per series, so it can
-// run inline in the broadcast loop without buffering history.
+// live telemetry path. It is single-pass and O(1) in memory per series (Holt-Winters
+// adds a bounded O(season) seasonal array), so it can run inline in the broadcast
+// loop without buffering history.
+//
+// # Two models, one machinery
+//
+// Per-series scoring is factored behind a small model interface, so the surrounding
+// machinery — dedup, debounce/hysteresis, event emission, the dispersion floor, and
+// eviction — is shared and a model only has to turn a value into a (baseline, score).
+// Two models are selectable by Config.Mode:
+//
+//   - EWMA (default, ModeEWMA): an exponentially-weighted moving baseline +
+//     dispersion, described below. It tracks any slow movement (diurnal or drift) but
+//     does not learn the daily shape.
+//   - Holt-Winters (ModeHoltWinters, ADR-028): an additive level+trend+seasonal model
+//     in holtwinters.go that learns the diurnal shape and scores each value against
+//     the band for its own time of day — so it flags a value that is normal globally
+//     but abnormal for that phase, which EWMA cannot. EWMA stays the default/fallback.
+//
+// The rest of this doc describes the EWMA model; see holtwinters.go for Holt-Winters.
 //
 // # Why not a naive global mean/z-score
 //
@@ -61,6 +79,22 @@ import (
 	"sync"
 )
 
+// Mode selects the per-series scoring model.
+type Mode string
+
+const (
+	// ModeEWMA is the default model: an EWMA baseline + dispersion (ADR-024). It
+	// tracks any slow movement — diurnal or drift — but does not learn the daily
+	// shape, so a value that is normal globally but wrong for the time of day only
+	// looks anomalous until the level catches up.
+	ModeEWMA Mode = "ewma"
+	// ModeHoltWinters is the seasonal model (ADR-028): additive level+trend+seasonal
+	// Holt-Winters. It learns the diurnal shape and scores each value against the band
+	// for its own time of day, so it flags a value that is normal globally but
+	// abnormal for that phase — which EWMA cannot.
+	ModeHoltWinters Mode = "holt_winters"
+)
+
 // Config tunes the detector. The zero value is not usable directly; pass a Config
 // through DefaultConfig (or call (Config).withDefaults, which New applies) so unset
 // fields take sane defaults.
@@ -102,6 +136,27 @@ type Config struct {
 	// BufferSize is the capacity of the bounded recent-events ring used for
 	// late-joining clients. <= 0 selects a default.
 	BufferSize int
+
+	// Mode selects the scoring model: ModeEWMA (default) or ModeHoltWinters. An empty
+	// or unrecognised value defaults to EWMA, so existing configs are unaffected.
+	Mode Mode
+
+	// Holt-Winters tunables (used only when Mode == ModeHoltWinters; ignored by EWMA).
+	//
+	// SeasonLength is the number of seasonal buckets the season is divided into; a
+	// sample is scored against the band learned for its bucket. Must be >= 2.
+	// SeasonPeriodMs is the wall-clock span of one full season in milliseconds (e.g.
+	// 24h for a diurnal cycle); a sample's bucket is (TimestampMs mod SeasonPeriodMs)
+	// mapped into [0, SeasonLength), so the phase comes from the timestamp, not a
+	// sample counter. The model warms up over one full SeasonPeriodMs (so every bucket
+	// is seeded) rather than over Warmup samples.
+	SeasonLength   int
+	SeasonPeriodMs int64
+	// Beta is the trend smoothing factor and Gamma the seasonal smoothing factor, both
+	// in (0,1]. Alpha (shared with EWMA) smooths the level. These take internal
+	// defaults; the dispersion band reuses the EWMA Alpha and the shared scale floor.
+	Beta  float64
+	Gamma float64
 }
 
 // Default tuning constants. These back DefaultConfig and (Config).withDefaults.
@@ -126,6 +181,20 @@ const (
 	defaultFloorFrac  = 0.04
 	defaultFloorAbs   = 1e-9
 	defaultBufferSize = 128
+
+	// Holt-Winters defaults (Mode == ModeHoltWinters).
+	defaultMode = ModeEWMA
+	// defaultSeasonLength divides the season into 48 buckets (30-minute resolution for
+	// a 24h period) — fine enough to follow a diurnal sinusoid without over-fitting.
+	defaultSeasonLength = 48
+	// defaultSeasonPeriodMs is one day: the simulator and real infrastructure cycle on
+	// a 24-hour diurnal period (ADR-013).
+	defaultSeasonPeriodMs = 24 * 60 * 60 * 1000
+	// defaultBeta keeps the trend slow so it absorbs genuine drift, not noise;
+	// defaultGamma adapts the seasonal shape gradually so a single odd day does not
+	// rewrite the learned season.
+	defaultBeta  = 0.01
+	defaultGamma = 0.05
 )
 
 // DefaultConfig returns the recommended tuning. Enabled is false: callers opt in.
@@ -142,6 +211,12 @@ func DefaultConfig() Config {
 		FloorFrac:   defaultFloorFrac,
 		FloorAbs:    defaultFloorAbs,
 		BufferSize:  defaultBufferSize,
+
+		Mode:           defaultMode,
+		SeasonLength:   defaultSeasonLength,
+		SeasonPeriodMs: defaultSeasonPeriodMs,
+		Beta:           defaultBeta,
+		Gamma:          defaultGamma,
 	}
 }
 
@@ -178,6 +253,21 @@ func (c Config) withDefaults() Config {
 	}
 	if c.BufferSize <= 0 {
 		c.BufferSize = defaultBufferSize
+	}
+	if c.Mode != ModeEWMA && c.Mode != ModeHoltWinters {
+		c.Mode = defaultMode
+	}
+	if c.SeasonLength < 2 {
+		c.SeasonLength = defaultSeasonLength
+	}
+	if c.SeasonPeriodMs <= 0 {
+		c.SeasonPeriodMs = defaultSeasonPeriodMs
+	}
+	if c.Beta <= 0 || c.Beta > 1 {
+		c.Beta = defaultBeta
+	}
+	if c.Gamma <= 0 || c.Gamma > 1 {
+		c.Gamma = defaultGamma
 	}
 	return c
 }
@@ -241,26 +331,92 @@ type Event struct {
 	TimestampMs int64 `json:"timestamp"`
 }
 
-// seriesState is the O(1) per-series state. During warmup only count/mean/m2 are
-// used (an exact Welford accumulation); afterwards level/variance carry the EWMA
-// baseline and dispersion. breaches/firing drive the debounce and hysteresis, and
-// lastTS feeds dedup and eviction.
+// seriesState is the per-series state. breaches/firing drive the debounce and
+// hysteresis and lastTS feeds dedup and eviction, regardless of model. The EWMA
+// fields (count/mean/m2/level/variance) carry that model's state: during warmup only
+// count/mean/m2 are used (an exact Welford accumulation); afterwards level/variance
+// carry the EWMA baseline and dispersion. The Holt-Winters model instead keeps its
+// state behind hw (nil under EWMA), so per-series memory stays O(1) for EWMA and
+// O(season) for Holt-Winters.
 type seriesState struct {
 	count    int
-	mean     float64 // Welford running mean (warmup)
-	m2       float64 // Welford running sum of squared deviations (warmup)
+	mean     float64 // Welford running mean (EWMA warmup)
+	m2       float64 // Welford running sum of squared deviations (EWMA warmup)
 	level    float64 // EWMA level (post-warmup)
 	variance float64 // EWMA variance of the residual (post-warmup)
 	breaches int     // consecutive out-of-band samples
 	firing   bool
 	lastTS   int64
+	hw       *hwState // Holt-Winters state; nil unless Mode == ModeHoltWinters
+}
+
+// model is the per-series scoring strategy behind the detector. It owns whatever
+// per-series state its model needs (kept in seriesState) and turns each new value
+// into the baseline it was judged against and a score, plus whether the series is
+// still warming up. The Detector supplies everything around it — dedup, debounce,
+// hysteresis, event emission, eviction — so a model only has to score. EWMA is the
+// default (ewmaModel, this file); a seasonal Holt-Winters model is the alternative
+// (hwModel, holtwinters.go), selected by Config.Mode. A model carries no per-series
+// state of its own, so one instance serves every series.
+type model interface {
+	// observe folds value (sampled at tsMs) into st's per-series model state and
+	// returns the baseline the value was scored against, its score
+	// |value-baseline|/dispersion, and whether the model is still warming up (during
+	// which no alert may be raised). It is called with the detector lock held, after
+	// st.count has been advanced to include this sample.
+	observe(st *seriesState, value float64, tsMs int64) (baseline, score float64, warming bool)
+}
+
+// ewmaModel is the default model (ADR-024): a per-series exponentially-weighted
+// moving level + dispersion, robust to a moving baseline. Its math is identical to
+// the original inline implementation — see the package doc for the rationale.
+type ewmaModel struct{ cfg Config }
+
+func newEWMAModel(cfg Config) *ewmaModel { return &ewmaModel{cfg: cfg} }
+
+func (m *ewmaModel) observe(st *seriesState, value float64, _ int64) (float64, float64, bool) {
+	// Warmup: accumulate an exact Welford mean/variance and raise nothing. On the
+	// sample that completes warmup, seed the EWMA level/variance from it.
+	if st.count <= m.cfg.Warmup {
+		delta := value - st.mean
+		st.mean += delta / float64(st.count)
+		st.m2 += delta * (value - st.mean)
+		if st.count == m.cfg.Warmup {
+			st.level = st.mean
+			st.variance = st.m2 / float64(st.count-1) // sample variance
+		}
+		return 0, 0, true
+	}
+
+	// Post-warmup: score against the current baseline, then fold the (clamped)
+	// residual into the baseline. The baseline the point is judged against is the
+	// pre-update level, so capture it for the emitted event.
+	baseline := st.level
+	scale := scaleFloor(m.cfg, st.variance, st.level)
+	resid := value - st.level
+	score := math.Abs(resid) / scale
+
+	// Huber winsorization: bound the residual's pull on the baseline/dispersion.
+	clip := m.cfg.ClipFactor * scale
+	cresid := resid
+	if cresid > clip {
+		cresid = clip
+	} else if cresid < -clip {
+		cresid = -clip
+	}
+	incr := m.cfg.Alpha * cresid
+	st.level += incr
+	// EWMA variance (West's recurrence): variance = (1-α)(variance + α·cresid²).
+	st.variance = (1 - m.cfg.Alpha) * (st.variance + cresid*incr)
+	return baseline, score, false
 }
 
 // Detector is a concurrency-safe streaming anomaly detector over many series. It
 // also keeps a bounded ring of recent events for late-joining consumers and the
 // two counters (cumulative raised, currently active) used for metrics.
 type Detector struct {
-	cfg Config
+	cfg   Config
+	model model // per-series scoring strategy (EWMA or Holt-Winters), chosen by cfg.Mode
 
 	mu     sync.Mutex
 	series map[string]*seriesState
@@ -274,13 +430,27 @@ type Detector struct {
 	rfull  bool
 }
 
-// New constructs a Detector from cfg, filling unset fields with defaults.
+// New constructs a Detector from cfg, filling unset fields with defaults and
+// selecting the per-series scoring model from cfg.Mode (EWMA by default).
 func New(cfg Config) *Detector {
 	cfg = cfg.withDefaults()
 	return &Detector{
 		cfg:    cfg,
+		model:  newModel(cfg),
 		series: make(map[string]*seriesState),
 		recent: make([]Event, 0, cfg.BufferSize),
+	}
+}
+
+// newModel builds the scoring model named by cfg.Mode. EWMA is the default and the
+// fallback for any unrecognised mode (withDefaults already normalises Mode, so this
+// is belt-and-braces).
+func newModel(cfg Config) model {
+	switch cfg.Mode {
+	case ModeHoltWinters:
+		return newHWModel(cfg)
+	default:
+		return newEWMAModel(cfg)
 	}
 }
 
@@ -307,39 +477,13 @@ func (d *Detector) Observe(s Sample) (Event, bool) {
 	st.lastTS = s.TimestampMs
 	st.count++
 
-	// Warmup: accumulate an exact Welford mean/variance and raise nothing. On the
-	// sample that completes warmup, seed the EWMA level/variance from it.
-	if st.count <= d.cfg.Warmup {
-		delta := s.Value - st.mean
-		st.mean += delta / float64(st.count)
-		st.m2 += delta * (s.Value - st.mean)
-		if st.count == d.cfg.Warmup {
-			st.level = st.mean
-			st.variance = st.m2 / float64(st.count-1) // sample variance
-		}
+	// Score this sample against its series' model. The model folds the value into the
+	// per-series state and returns the baseline it was judged against, the score, and
+	// whether the series is still warming up (no alert may be raised during warmup).
+	baseline, score, warming := d.model.observe(st, s.Value, s.TimestampMs)
+	if warming {
 		return Event{}, false
 	}
-
-	// Post-warmup: score against the current baseline, then fold the (clamped)
-	// residual into the baseline. The baseline the point is judged against is the
-	// pre-update level, so capture it for the emitted event.
-	baseline := st.level
-	scale := d.scaleFloor(st.variance, st.level)
-	resid := s.Value - st.level
-	score := math.Abs(resid) / scale
-
-	// Huber winsorization: bound the residual's pull on the baseline/dispersion.
-	clip := d.cfg.ClipFactor * scale
-	cresid := resid
-	if cresid > clip {
-		cresid = clip
-	} else if cresid < -clip {
-		cresid = -clip
-	}
-	incr := d.cfg.Alpha * cresid
-	st.level += incr
-	// EWMA variance (West's recurrence): variance = (1-α)(variance + α·cresid²).
-	st.variance = (1 - d.cfg.Alpha) * (st.variance + cresid*incr)
 
 	// Debounce + hysteresis. Raise after DebounceK consecutive out-of-band samples;
 	// clear once the score falls back below the lower band.
@@ -382,14 +526,21 @@ func (d *Detector) ObserveBatch(samples []Sample) []Event {
 
 // scaleFloor returns the dispersion used for scoring: sqrt(variance), floored at
 // FloorFrac·|level| + FloorAbs so a momentarily-flat series cannot collapse the
-// scale toward zero.
-func (d *Detector) scaleFloor(variance, level float64) float64 {
+// scale toward zero. Shared by every model (EWMA and Holt-Winters) so the dynamic
+// band and the flat-series floor behave identically regardless of mode.
+func scaleFloor(cfg Config, variance, level float64) float64 {
 	scale := math.Sqrt(math.Max(variance, 0))
-	floor := d.cfg.FloorFrac*math.Abs(level) + d.cfg.FloorAbs
+	floor := cfg.FloorFrac*math.Abs(level) + cfg.FloorAbs
 	if scale < floor {
 		scale = floor
 	}
 	return scale
+}
+
+// scaleFloor is the detector-bound form of the package scaleFloor, scoring against
+// the detector's own config.
+func (d *Detector) scaleFloor(variance, level float64) float64 {
+	return scaleFloor(d.cfg, variance, level)
 }
 
 // emit builds an Event, assigns it a Seq, and records it in the recent ring. Caller
@@ -485,6 +636,11 @@ func (d *Detector) Len() int {
 	defer d.mu.Unlock()
 	return len(d.series)
 }
+
+// Mode returns the active scoring model (after defaulting), so the server can
+// surface which model is running on /api/v1/stats, /metrics, and the dashboard. It
+// is fixed at construction, so no lock is needed.
+func (d *Detector) Mode() Mode { return d.cfg.Mode }
 
 // SortEventsRecentFirst orders events most-recent (highest Seq) first. Helper for
 // callers exposing the recent buffer to a UI.

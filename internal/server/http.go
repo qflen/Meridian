@@ -437,6 +437,7 @@ func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	if s.anomalyDet != nil {
 		out["anomalies_total"] = s.anomalyDet.Total()
 		out["active_anomalies"] = s.anomalyDet.Active()
+		out["anomaly_model"] = string(s.anomalyDet.Mode())
 	}
 	// Downsampling cascade (ADR-011): per-resolution rollup footprint and the savings
 	// figure (raw samples represented per stored rollup window).
@@ -533,7 +534,7 @@ func (s *HTTPServer) handleAnomalies(w http.ResponseWriter, r *http.Request) {
 // counters so the endpoint is always well-formed.
 func RecentAnomaliesPayload(d *anomaly.Detector) map[string]interface{} {
 	if d == nil {
-		return map[string]interface{}{"anomalies": []anomaly.Event{}, "total": 0, "active": 0}
+		return map[string]interface{}{"anomalies": []anomaly.Event{}, "total": 0, "active": 0, "model": ""}
 	}
 	events := d.Recent()
 	anomaly.SortEventsRecentFirst(events)
@@ -541,6 +542,8 @@ func RecentAnomaliesPayload(d *anomaly.Detector) map[string]interface{} {
 		"anomalies": events,
 		"total":     d.Total(),
 		"active":    d.Active(),
+		// model lets a late-joining dashboard label which detector is running (ADR-028).
+		"model": string(d.Mode()),
 	}
 }
 
@@ -570,7 +573,7 @@ func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// Streaming anomaly detection metrics, when wired.
 	if s.anomalyDet != nil {
-		WriteAnomalyMetrics(w, node, "monolith", s.anomalyDet.Total(), s.anomalyDet.Active())
+		WriteAnomalyMetrics(w, node, "monolith", string(s.anomalyDet.Mode()), s.anomalyDet.Total(), s.anomalyDet.Active())
 	}
 
 	fmt.Fprintf(w, "# HELP meridian_query_latency_seconds Query executor latency histogram.\n")

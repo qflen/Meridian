@@ -45,6 +45,12 @@ func main() {
 	if envBool("GATEWAY_ANOMALY_ENABLED", true) {
 		acfg := anomaly.DefaultConfig()
 		acfg.Enabled = true
+		// Optional seasonal model (ADR-028); GATEWAY_ANOMALY_MODE=holt_winters selects
+		// it. Season tunables take the detector's defaults (48 buckets over 24h); an
+		// unrecognised value falls back to EWMA via withDefaults.
+		if mode := os.Getenv("GATEWAY_ANOMALY_MODE"); mode != "" {
+			acfg.Mode = anomaly.Mode(mode)
+		}
 		det = anomaly.New(acfg)
 	}
 
@@ -207,6 +213,7 @@ func (gw *gatewayServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	if gw.anomalyDet != nil {
 		out["anomalies_total"] = gw.anomalyDet.Total()
 		out["active_anomalies"] = gw.anomalyDet.Active()
+		out["anomaly_model"] = string(gw.anomalyDet.Mode())
 	}
 	writeJSON(w, out)
 }
@@ -348,7 +355,7 @@ func (gw *gatewayServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE meridian_ws_clients gauge\n")
 	fmt.Fprintf(w, "meridian_ws_clients{node=%q,role=\"gateway\"} %d\n", gw.nodeID, gw.wsHub.ClientCount())
 	if gw.anomalyDet != nil {
-		server.WriteAnomalyMetrics(w, gw.nodeID, "gateway", gw.anomalyDet.Total(), gw.anomalyDet.Active())
+		server.WriteAnomalyMetrics(w, gw.nodeID, "gateway", string(gw.anomalyDet.Mode()), gw.anomalyDet.Total(), gw.anomalyDet.Active())
 	}
 }
 

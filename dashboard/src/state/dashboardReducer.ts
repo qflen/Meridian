@@ -14,6 +14,7 @@ export const initialState: DashboardState = {
   clusterNodes: [],
   connectionStatus: 'connecting',
   anomalies: [],
+  anomalyModel: '',
 };
 
 /**
@@ -77,8 +78,13 @@ export function dashboardReducer(
 
     case 'SEED_ANOMALIES':
       // Fold the seed through the same upsert so live frames that already arrived
-      // are never clobbered by an older buffered event.
-      return { ...state, anomalies: action.anomalies.reduce(upsertAnomaly, state.anomalies) };
+      // are never clobbered by an older buffered event. The seed also reports the
+      // active detector model; keep the current value if this seed omits it.
+      return {
+        ...state,
+        anomalies: action.anomalies.reduce(upsertAnomaly, state.anomalies),
+        anomalyModel: action.model ?? state.anomalyModel,
+      };
 
     default:
       return state;

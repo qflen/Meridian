@@ -163,17 +163,24 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   memory drift without alerting**, while an injected **spike** departs sharply from it
   and **does** alert — where a naive global mean/z-score would flag the whole diurnal
   peak. (ADR-024.)
-- **Robust by construction**: a Welford warmup seeds the baseline before any alert; a
-  Huber clamp bounds a spike's pull on the baseline/dispersion (so it can't blind the
-  detector); a relative scale floor stops a momentarily-flat series from looking
-  anomalous; debounce + hysteresis and timestamp dedup prevent alert storms; stale
-  series are evicted so memory follows live cardinality.
+- **Selectable seasonal model**: switch `anomaly.mode` to **`holt_winters`** for an
+  additive level+trend+seasonal model that *learns the diurnal shape* and scores each
+  value against the band for its own time of day. It catches what EWMA cannot — a value
+  that is **normal globally but abnormal for that phase** (a midday load level in the
+  small hours, a scheduled dip that fails to happen) — at the cost of warming up over
+  one full season. EWMA stays the default. (ADR-028.)
+- **Robust by construction**: a Welford warmup (EWMA) or one-season warmup
+  (Holt-Winters) seeds the baseline before any alert; a Huber clamp bounds a spike's
+  pull on the baseline/dispersion (so it can't blind the detector); a relative scale
+  floor stops a momentarily-flat series from looking anomalous; debounce + hysteresis
+  and timestamp dedup prevent alert storms; stale series are evicted so memory follows
+  live cardinality. The clamp, floor, debounce and emission are shared by both models.
 - **On the wire and the screen**: raise/clear transitions stream as a distinct
   `anomaly` WebSocket frame and into a bounded recent-buffer (`/api/v1/anomalies`) for
-  late-joining clients; the dashboard's **Anomalies** strip lists them most-recent-first
-  and clears each as it recovers. `meridian_anomalies_total` and
-  `meridian_active_anomalies` are on `/metrics` and `/api/v1/stats`. Runs uniformly in
-  the monolith and the cluster gateway.
+  late-joining clients; the dashboard's **Anomalies** strip lists them most-recent-first,
+  clears each as it recovers, and shows the active model. `meridian_anomalies_total`,
+  `meridian_active_anomalies` and `meridian_anomaly_model_info` are on `/metrics` and
+  `/api/v1/stats`. Runs uniformly in the monolith and the cluster gateway.
 
 ### Dashboard
 - **Canvas-rendered**: charts drawn directly on the Canvas 2D API, no chart library
@@ -347,12 +354,15 @@ ingestion:                # write-path backpressure (ADR-023)
     classes:                    # priority bands, highest first; ceiling = capacity fraction
       - { name: high,    label: priority, value: high, ceiling: 1.0 }
       - { name: default,                               ceiling: 0.6 }
-anomaly:                  # streaming anomaly detection (ADR-024)
+anomaly:                  # streaming anomaly detection (ADR-024, ADR-028)
   enabled:    true        # toggle the detector on the live path
-  threshold:  3.5         # local z-score above which a sample is out-of-band
-  alpha:      0.1         # EWMA smoothing in (0,1]; smaller = steadier baseline
-  warmup:     20          # samples used to seed a baseline before any alert
+  threshold:  3.5         # score above which a sample is out-of-band
+  alpha:      0.1         # level/dispersion smoothing in (0,1]; smaller = steadier
+  warmup:     20          # samples used to seed an EWMA baseline before any alert
   debounce_k: 2           # consecutive out-of-band samples required to raise
+  mode:          ewma     # scoring model: ewma (default) or holt_winters (seasonal)
+  season_length: 48       # holt_winters: seasonal buckets per period
+  season_period: 24h      # holt_winters: wall-clock span of one season (phase from ts)
 ```
 
 The microservice binaries read the same knobs from the environment: replication
@@ -366,7 +376,7 @@ rebalancing on the ingestor (`REBALANCE_ENABLED`, `REBALANCE_LOOKBACK`,
 `REBALANCE_MAX_BYTES_PER_ROUND`) — backpressure
 (`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
 `MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents) — and the
-gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`). The storage node also reads its
+gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`, `GATEWAY_ANOMALY_MODE`). The storage node also reads its
 local TSDB timings from `STORAGE_BLOCK_DURATION`, `STORAGE_FLUSH_INTERVAL`, and
 `STORAGE_RETENTION` (and `STORAGE_DOWNSAMPLE_INTERVAL` for the rollup cascade pass).
 
@@ -392,7 +402,7 @@ internal/
   query/            Lexer, parser, planner, executor
   ingestion/        TCP server, batch writer
   backpressure/     Bounded block-then-shed ingest queue + per-series/priority admission
-  anomaly/          Streaming per-series EWMA anomaly detector
+  anomaly/          Streaming per-series anomaly detector (EWMA + Holt-Winters)
   server/           HTTP API, WebSocket hub, /metrics exporter
   cluster/          Hash ring, coordinator, node lifecycle
   retention/        TTL enforcer, downsampler
@@ -412,7 +422,8 @@ CORS policy, cluster-wide `/metrics`, the replication consistency model (quorum
 writes/reads + read-repair), the write-path backpressure model (bounded queues with
 block-then-shed load shedding, plus per-series fair-share / priority admission), the
 streaming anomaly detector (EWMA baseline +
-dispersion, robust to a moving diurnal baseline), and more.
+dispersion, robust to a moving diurnal baseline, with a selectable seasonal
+Holt-Winters model), and more.
 
 ## Development
 

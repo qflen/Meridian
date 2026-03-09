@@ -62,4 +62,13 @@ describe('dashboardReducer anomalies', () => {
     expect(s?.seq).toBe(10); // newer live event preserved
     expect(t?.seq).toBe(8); // new series added from the seed
   });
+
+  it('SEED_ANOMALIES records the active model and a later seed without one keeps it', () => {
+    let state = withAnomalies([]);
+    state = dashboardReducer(state, { type: 'SEED_ANOMALIES', anomalies: [], model: 'holt_winters' });
+    expect(state.anomalyModel).toBe('holt_winters');
+    // A subsequent seed that omits the model must not clear it.
+    state = dashboardReducer(state, { type: 'SEED_ANOMALIES', anomalies: [anomaly({ series: 'a', seq: 1 })] });
+    expect(state.anomalyModel).toBe('holt_winters');
+  });
 });

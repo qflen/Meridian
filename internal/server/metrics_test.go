@@ -225,3 +225,18 @@ func TestMonolithPromMetricsHandler(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteAnomalyMetricsIncludesModelInfo(t *testing.T) {
+	var buf bytes.Buffer
+	WriteAnomalyMetrics(&buf, "node-1", "monolith", "holt_winters", 5, 2)
+	body := buf.String()
+	for _, want := range []string{
+		`meridian_anomalies_total{node="node-1",role="monolith"} 5`,
+		`meridian_active_anomalies{node="node-1",role="monolith"} 2`,
+		`meridian_anomaly_model_info{node="node-1",role="monolith",model="holt_winters"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("anomaly metrics missing %q\n%s", want, body)
+		}
+	}
+}

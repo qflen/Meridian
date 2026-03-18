@@ -1,0 +1,36 @@
+server:
+  http_addr: "0.0.0.0:8080"
+  grpc_addr: "0.0.0.0:9090"
+
+storage:
+  data_dir: "./data"
+  wal_dir: "./data/wal"
+  block_duration: "2h"
+  retention: "15d"
+  flush_interval: "1m"
+
+cluster:
+  enabled: false
+  node_id: ""
+  bind_addr: "0.0.0.0:7946"
+  join: []
+  replication_factor: 3
+  virtual_nodes: 256
+
+downsampling:
+  rules:
+    - source_interval: "5s"
+      target_interval: "1m"
+      retention: "7d"
+    - source_interval: "1m"
+      target_interval: "1h"
+      retention: "30d"
+
+ingestion:
+  batch_size: 1000
+  flush_interval: "100ms"
+  max_concurrent_writes: 64
+
+log:
+  level: "info"
+  format: "text"

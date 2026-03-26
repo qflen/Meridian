@@ -1,0 +1,33 @@
+syntax = "proto3";
+package meridian.ingestion.v1;
+
+option go_package = "github.com/meridiandb/meridian/internal/ingestion/proto";
+
+service IngestionService {
+  rpc Write(WriteRequest) returns (WriteResponse);
+  rpc WriteBatch(stream WriteRequest) returns (WriteResponse);
+}
+
+message WriteRequest {
+  repeated TimeSeries time_series = 1;
+}
+
+message TimeSeries {
+  string name = 1;
+  repeated Label labels = 2;
+  repeated Sample samples = 3;
+}
+
+message Label {
+  string name = 1;
+  string value = 2;
+}
+
+message Sample {
+  int64 timestamp_ms = 1;
+  double value = 2;
+}
+
+message WriteResponse {
+  int64 samples_ingested = 1;
+}

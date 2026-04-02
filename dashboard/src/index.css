@@ -1,0 +1,95 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-bg: 249 250 251;
+    --color-surface: 255 255 255;
+    --color-text: 17 24 39;
+    --color-text-muted: 107 114 128;
+    --color-border: 229 231 235;
+    --color-accent: 76 110 245;
+    --color-success: 34 197 94;
+    --color-warning: 234 179 8;
+    --color-danger: 239 68 68;
+    --grid-color: rgba(229, 231, 235, 0.3);
+    --chart-glow: rgba(76, 110, 245, 0.15);
+  }
+
+  .dark {
+    --color-bg: 3 7 18;
+    --color-surface: 17 24 39;
+    --color-text: 243 244 246;
+    --color-text-muted: 156 163 175;
+    --color-border: 55 65 81;
+    --color-accent: 92 124 250;
+    --color-success: 34 197 94;
+    --color-warning: 234 179 8;
+    --color-danger: 239 68 68;
+    --grid-color: rgba(55, 65, 81, 0.4);
+    --chart-glow: rgba(92, 124, 250, 0.2);
+  }
+
+  .high-contrast {
+    --color-bg: 0 0 0;
+    --color-surface: 15 15 15;
+    --color-text: 255 255 255;
+    --color-text-muted: 200 200 200;
+    --color-border: 100 100 100;
+    --color-accent: 120 160 255;
+    --color-success: 50 255 120;
+    --color-warning: 255 220 50;
+    --color-danger: 255 80 80;
+    --grid-color: rgba(100, 100, 100, 0.5);
+    --chart-glow: rgba(120, 160, 255, 0.3);
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--color-border)) transparent;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-gray-800 bg-gray-900/80 backdrop-blur-sm p-4 shadow-lg;
+  }
+
+  .dark .card {
+    @apply border-gray-800 bg-gray-900/80;
+  }
+
+  .light .card {
+    @apply border-gray-200 bg-white/90;
+  }
+
+  .btn-primary {
+    @apply rounded-lg bg-meridian-600 px-4 py-2 text-sm font-medium text-white
+           transition-all hover:bg-meridian-500 active:bg-meridian-700
+           focus:outline-none focus:ring-2 focus:ring-meridian-500/50;
+  }
+
+  .btn-ghost {
+    @apply rounded-lg px-3 py-1.5 text-sm text-gray-400
+           transition-all hover:bg-gray-800 hover:text-gray-200;
+  }
+
+  .input {
+    @apply rounded-lg border border-gray-700 bg-gray-800/50 px-3 py-2 text-sm text-gray-100
+           placeholder-gray-500 transition-colors
+           focus:border-meridian-500 focus:outline-none focus:ring-1 focus:ring-meridian-500/30;
+  }
+
+  .stat-value {
+    @apply text-2xl font-bold tracking-tight text-white;
+  }
+
+  .stat-label {
+    @apply text-xs font-medium uppercase tracking-wider text-gray-500;
+  }
+}

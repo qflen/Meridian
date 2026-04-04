@@ -1,0 +1,89 @@
+version: "3.8"
+
+services:
+  meridian-1:
+    build: .
+    container_name: meridian-1
+    hostname: meridian-1
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - meridian-1-data:/app/data
+    environment:
+      MERIDIAN_NODE_ID: node-1
+    command: >
+      serve
+      --http-listen=:8080
+      --ingestion-listen=:9090
+      --cluster-listen=:7946
+      --cluster-peers=meridian-2:7946,meridian-3:7946
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  meridian-2:
+    build: .
+    container_name: meridian-2
+    hostname: meridian-2
+    ports:
+      - "8081:8080"
+      - "9091:9090"
+    volumes:
+      - meridian-2-data:/app/data
+    environment:
+      MERIDIAN_NODE_ID: node-2
+    command: >
+      serve
+      --http-listen=:8080
+      --ingestion-listen=:9090
+      --cluster-listen=:7946
+      --cluster-peers=meridian-1:7946,meridian-3:7946
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  meridian-3:
+    build: .
+    container_name: meridian-3
+    hostname: meridian-3
+    ports:
+      - "8082:8080"
+      - "9092:9090"
+    volumes:
+      - meridian-3-data:/app/data
+    environment:
+      MERIDIAN_NODE_ID: node-3
+    command: >
+      serve
+      --http-listen=:8080
+      --ingestion-listen=:9090
+      --cluster-listen=:7946
+      --cluster-peers=meridian-1:7946,meridian-2:7946
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  meridian-1-data:
+  meridian-2-data:
+  meridian-3-data:
+
+networks:
+  meridian-net:
+    driver: bridge

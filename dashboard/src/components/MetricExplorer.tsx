@@ -16,11 +16,13 @@ export function MetricExplorer() {
   const [filter, setFilter] = useState('');
 
   useEffect(() => {
-    fetch('/api/labels')
+    // Fetch metric names (values of __name__ label)
+    fetch('/api/v1/label/__name__/values')
       .then((r) => r.json())
-      .then((data) => {
-        if (Array.isArray(data)) {
-          const metas: MetricMeta[] = data.map((name: string) => ({
+      .then((resp) => {
+        const names = resp?.data ?? resp;
+        if (Array.isArray(names)) {
+          const metas: MetricMeta[] = names.map((name: string) => ({
             name,
             type: name.endsWith('_total') ? 'counter' : name.endsWith('_bytes') ? 'gauge' : 'gauge',
             labels: [],

@@ -223,6 +223,7 @@ type SeriesInfo struct {
 	Name        string
 	Labels      map[string]string
 	SampleCount int
+	LastValue   float64
 }
 
 // SeriesInfos returns metadata for all series.
@@ -233,11 +234,16 @@ func (h *HeadBlock) SeriesInfos() []SeriesInfo {
 	infos := make([]SeriesInfo, 0, len(h.series))
 	for _, s := range h.series {
 		s.mu.Lock()
+		var lastVal float64
+		if len(s.Values) > 0 {
+			lastVal = s.Values[len(s.Values)-1]
+		}
 		infos = append(infos, SeriesInfo{
 			ID:          s.ID,
 			Name:        s.Name,
 			Labels:      s.Labels,
 			SampleCount: len(s.Timestamps),
+			LastValue:   lastVal,
 		})
 		s.mu.Unlock()
 	}

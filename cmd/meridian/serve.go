@@ -110,48 +110,55 @@ func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingSer
 		ingestionRate := currentIngested - lastIngested
 		lastIngested = currentIngested
 
-		batchStats := ingServer.BatchWriter().Stats()
-		ratio := db.CompressionRatio()
-
 		metrics := map[string]interface{}{
-			"ingestion_rate":     ingestionRate,
-			"total_samples":      stats.TotalSamples,
-			"total_series":       stats.TotalSeries,
-			"head_samples":       stats.HeadSamples,
-			"block_count":        stats.BlockCount,
-			"wal_size":           stats.WALSize,
-			"compression_ratio":  fmt.Sprintf("%.1f", ratio),
-			"storage_bytes_raw":  stats.StorageBytesRaw,
-			"storage_bytes_disk": stats.StorageBytesDisk,
-			"batch_count":        batchStats.TotalBatches,
-			"batch_errors":       batchStats.TotalErrors,
-			"ws_clients":         hub.ClientCount(),
+			"type":            "stats",
+			"ingestionRate":   ingestionRate,
+			"activeSeries":    stats.TotalSeries,
+			"memoryBytes":     stats.HeadSamples * 16, // approximate
+			"compressedBytes": stats.StorageBytesDisk,
+			"rawBytes":        stats.StorageBytesRaw,
+			"walSegments":     stats.WALSize,
+			"blockCount":      stats.BlockCount,
+			"uptimeSeconds":   int(time.Since(db.StartTime()).Seconds()),
 		}
 
 		hub.BroadcastMetrics(metrics)
 
-		// Also broadcast to live stream periodically with a sample snapshot
+		// Also broadcast individual metric messages for live stream
 		head := db.Head()
 		seriesInfos := head.SeriesInfos()
 		if len(seriesInfos) > 0 {
-			var liveBatch []interface{}
 			count := 0
 			for _, si := range seriesInfos {
 				if si.SampleCount > 0 {
-					liveBatch = append(liveBatch, map[string]interface{}{
-						"name":      si.Name,
+					seriesKey := si.Name
+					if len(si.Labels) > 0 {
+						pairs := ""
+						for k, v := range si.Labels {
+							if k == "__name__" {
+								continue
+							}
+							if pairs != "" {
+								pairs += ","
+							}
+							pairs += k + `="` + v + `"`
+						}
+						if pairs != "" {
+							seriesKey = si.Name + "{" + pairs + "}"
+						}
+					}
+					hub.BroadcastMetrics(map[string]interface{}{
+						"type":      "metric",
+						"series":    seriesKey,
 						"labels":    si.Labels,
 						"timestamp": time.Now().UnixMilli(),
-						"value":     si.SampleCount,
+						"value":     si.LastValue,
 					})
 					count++
-					if count >= 10 {
+					if count >= 20 {
 						break
 					}
 				}
-			}
-			if len(liveBatch) > 0 {
-				hub.BroadcastLive(liveBatch)
 			}
 		}
 	}

@@ -13,7 +13,7 @@ export function LatencyHistogram() {
   // Fetch histogram data periodically
   useEffect(() => {
     const fetchData = () => {
-      fetch('/api/query?q=query_duration_seconds_bucket&format=json')
+      fetch('/api/v1/query?q=query_duration_seconds_bucket')
         .then((r) => r.json())
         .then((data) => {
           if (data?.data) {

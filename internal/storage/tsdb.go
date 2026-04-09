@@ -65,9 +65,10 @@ type ResultSeries struct {
 
 // TSDB is the top-level time-series database orchestrator.
 type TSDB struct {
-	opts TSDBOptions
-	wal  *WAL
-	head *HeadBlock
+	opts      TSDBOptions
+	wal       *WAL
+	head      *HeadBlock
+	startTime time.Time
 
 	mu     sync.RWMutex
 	blocks []*Block
@@ -105,10 +106,11 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 	head := NewHeadBlock()
 
 	db := &TSDB{
-		opts: opts,
-		wal:  wal,
-		head: head,
-		done: make(chan struct{}),
+		opts:      opts,
+		wal:       wal,
+		head:      head,
+		startTime: time.Now(),
+		done:      make(chan struct{}),
 	}
 
 	// Load existing blocks from disk
@@ -301,6 +303,11 @@ func (db *TSDB) Stats() TSDBStats {
 // Head returns the head block for direct access.
 func (db *TSDB) Head() *HeadBlock {
 	return db.head
+}
+
+// StartTime returns when this TSDB instance was opened.
+func (db *TSDB) StartTime() time.Time {
+	return db.startTime
 }
 
 // IngestionRate returns the total number of ingested samples.

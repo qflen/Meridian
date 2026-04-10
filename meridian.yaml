@@ -5,9 +5,11 @@ server:
 storage:
   data_dir: "./data"
   wal_dir: "./data/wal"
-  block_duration: "2h"
+  # Head flushes to a Gorilla-compressed block every block_duration. Short values
+  # surface the compression ratio quickly; 2h–24h is typical for production.
+  block_duration: "15m"
   retention: "15d"
-  flush_interval: "1m"
+  flush_interval: "30s"
 
 cluster:
   enabled: false

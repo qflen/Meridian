@@ -8,3 +8,19 @@ dashboard/node_modules/
 dashboard/dist/
 .DS_Store
 *.log
+.meridian.pid
+
+# Stray binaries built at repo root (use ./bin/ instead)
+/meridian
+/compactor
+/gateway
+/ingestor
+/querier
+/storage
+
+# Local tooling and session scratch files
+.claude/
+CLAUDE.md
+NEXT_SESSION_PROMPT.md
+.vscode/
+.idea/

@@ -27,9 +27,9 @@ func DefaultTSDBOptions() TSDBOptions {
 	return TSDBOptions{
 		WALDir:          "./data/wal",
 		BlockDir:        "./data/blocks",
-		BlockDuration:   2 * time.Hour,
+		BlockDuration:   15 * time.Minute,
 		RetentionPeriod: 15 * 24 * time.Hour,
-		FlushInterval:   1 * time.Minute,
+		FlushInterval:   30 * time.Second,
 	}
 }
 
@@ -40,7 +40,14 @@ type TSDBStats struct {
 	HeadSamples      int64
 	HeadSeries       int
 	BlockCount       int
-	StorageBytesRaw  int64
+	// StorageBytesRaw is the cost of the data if stored as raw 16-byte (ts,val) samples.
+	StorageBytesRaw int64
+	// ChunkBytes is the actual Gorilla-compressed size: compressed chunk bytes across all
+	// flushed blocks plus the size the current head would occupy if compressed now. This is
+	// the meaningful number for the compression ratio.
+	ChunkBytes int64
+	// StorageBytesDisk is the on-disk footprint (block chunks + WAL), which carries WAL
+	// framing overhead and is only a good compression proxy once blocks have been flushed.
 	StorageBytesDisk int64
 	WALSize          int64
 }
@@ -88,10 +95,10 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 		opts.BlockDir = filepath.Join(dataDir, "blocks")
 	}
 	if opts.BlockDuration == 0 {
-		opts.BlockDuration = 2 * time.Hour
+		opts.BlockDuration = 15 * time.Minute
 	}
 	if opts.FlushInterval == 0 {
-		opts.FlushInterval = 1 * time.Minute
+		opts.FlushInterval = 30 * time.Second
 	}
 
 	if err := os.MkdirAll(opts.BlockDir, 0o755); err != nil {
@@ -276,17 +283,17 @@ func (db *TSDB) Stats() TSDBStats {
 	db.mu.RLock()
 	nBlocks := len(db.blocks)
 	var blockSamples int64
-	var diskBytes int64
+	var blockChunkBytes int64
 	for _, b := range db.blocks {
 		blockSamples += b.meta.Stats.NumSamples
-		// Estimate disk size from chunk data
-		diskBytes += int64(len(b.chunks))
+		blockChunkBytes += int64(len(b.chunks))
 	}
 	db.mu.RUnlock()
 
 	headSamples := db.head.SampleCount()
 	totalSamples := headSamples + blockSamples
 	rawBytes := totalSamples * 16 // 8 bytes timestamp + 8 bytes value
+	headCompressed := db.head.CompressedSize()
 
 	return TSDBStats{
 		TotalSamples:     totalSamples,
@@ -295,7 +302,8 @@ func (db *TSDB) Stats() TSDBStats {
 		HeadSeries:       db.head.SeriesCount(),
 		BlockCount:       nBlocks,
 		StorageBytesRaw:  rawBytes,
-		StorageBytesDisk: diskBytes + db.wal.Size(),
+		ChunkBytes:       blockChunkBytes + headCompressed,
+		StorageBytesDisk: blockChunkBytes + db.wal.Size(),
 		WALSize:          db.wal.Size(),
 	}
 }
@@ -458,13 +466,14 @@ func mergePoints(a, b []Point) []Point {
 	return result
 }
 
-// CompressionRatio returns the ratio of raw data size to compressed storage size.
+// CompressionRatio returns the ratio of raw data size to Gorilla-compressed chunk size.
+// This reflects the compression algorithm's effectiveness and excludes WAL framing overhead.
 func (db *TSDB) CompressionRatio() float64 {
 	stats := db.Stats()
-	if stats.StorageBytesDisk == 0 {
+	if stats.ChunkBytes == 0 {
 		return 0
 	}
-	return float64(stats.StorageBytesRaw) / float64(stats.StorageBytesDisk)
+	return float64(stats.StorageBytesRaw) / float64(stats.ChunkBytes)
 }
 
 // LabelNames returns all known label names across head and blocks.

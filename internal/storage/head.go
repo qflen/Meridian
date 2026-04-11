@@ -5,6 +5,8 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"github.com/meridiandb/meridian/internal/compress"
 )
 
 // HeadBlock is the in-memory active write buffer. All incoming samples go here first.
@@ -215,6 +217,28 @@ func (h *HeadBlock) Reset() {
 	h.minTime.Store(0)
 	h.maxTime.Store(0)
 	h.numSamples.Store(0)
+}
+
+// CompressedSize returns what the current head would occupy on disk if Gorilla-encoded
+// right now. It re-runs the encoder over every series, so callers should avoid hot loops.
+func (h *HeadBlock) CompressedSize() int64 {
+	series := h.AllSeries()
+	var total int64
+	for _, s := range series {
+		s.mu.Lock()
+		n := len(s.Timestamps)
+		if n == 0 {
+			s.mu.Unlock()
+			continue
+		}
+		enc := compress.NewEncoder()
+		for i := 0; i < n; i++ {
+			enc.Write(s.Timestamps[i], s.Values[i])
+		}
+		total += int64(len(enc.Bytes()))
+		s.mu.Unlock()
+	}
+	return total
 }
 
 // SeriesInfo contains metadata about a series.

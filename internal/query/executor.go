@@ -8,14 +8,20 @@ import (
 	"github.com/meridiandb/meridian/internal/storage"
 )
 
-// Engine executes parsed queries against a TSDB.
-type Engine struct {
-	db *storage.TSDB
+// DataSource abstracts the storage layer so the engine can query local or remote data.
+type DataSource interface {
+	Query(ctx context.Context, matchers []storage.LabelMatcher, start, end int64) (storage.SeriesSet, error)
 }
 
-// NewEngine creates a query engine backed by the given TSDB.
-func NewEngine(db *storage.TSDB) *Engine {
-	return &Engine{db: db}
+// Engine executes parsed queries against a DataSource.
+type Engine struct {
+	ds DataSource
+}
+
+// NewEngine creates a query engine backed by the given DataSource.
+// *storage.TSDB implements DataSource directly.
+func NewEngine(ds DataSource) *Engine {
+	return &Engine{ds: ds}
 }
 
 // ResultSeries holds a single series result from query execution.
@@ -60,7 +66,7 @@ func (e *Engine) eval(ctx context.Context, expr Expr, start, end int64) ([]Resul
 
 func (e *Engine) evalVector(ctx context.Context, vs *VectorSelector, start, end int64) ([]ResultSeries, error) {
 	matchers := convertMatchers(vs.Name, vs.Matchers)
-	ss, err := e.db.Query(ctx, matchers, start, end)
+	ss, err := e.ds.Query(ctx, matchers, start, end)
 	if err != nil {
 		return nil, err
 	}

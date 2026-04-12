@@ -110,6 +110,28 @@ func (p *Parser) parseAggregateOrFunction() (Expr, error) {
 	name := p.peek().Literal
 	p.advance()
 
+	// Handle: avg by (labels)(expr) — grouping before arguments
+	if p.peek().Type == TokenBy {
+		p.advance()
+		grouping, err := p.parseGrouping()
+		if err != nil {
+			return nil, err
+		}
+		if p.peek().Type != TokenLParen {
+			return nil, fmt.Errorf("expected '(' after grouping at position %d", p.peek().Pos)
+		}
+		p.advance()
+		arg, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if p.peek().Type != TokenRParen {
+			return nil, fmt.Errorf("expected ')' at position %d", p.peek().Pos)
+		}
+		p.advance()
+		return &AggregateExpr{Op: name, Expr: arg, Grouping: grouping}, nil
+	}
+
 	if p.peek().Type == TokenLParen {
 		// Could be function call: sum(expr) or aggregate: sum(expr) by (labels)
 		p.advance()

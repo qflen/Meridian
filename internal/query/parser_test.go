@@ -127,6 +127,30 @@ func TestParserAggregateWithoutGrouping(t *testing.T) {
 	}
 }
 
+func TestParserAggregateByBeforeArgs(t *testing.T) {
+	expr, err := Parse("avg by (host)(cpu_usage_percent)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ae, ok := expr.(*AggregateExpr)
+	if !ok {
+		t.Fatalf("expected AggregateExpr, got %T", expr)
+	}
+	if ae.Op != "avg" {
+		t.Fatalf("op: %s", ae.Op)
+	}
+	if len(ae.Grouping) != 1 || ae.Grouping[0] != "host" {
+		t.Fatalf("expected grouping [host], got %v", ae.Grouping)
+	}
+	vs, ok := ae.Expr.(*VectorSelector)
+	if !ok {
+		t.Fatalf("inner expr should be VectorSelector, got %T", ae.Expr)
+	}
+	if vs.Name != "cpu_usage_percent" {
+		t.Fatalf("inner name: %s", vs.Name)
+	}
+}
+
 func TestParserBinaryExpression(t *testing.T) {
 	expr, err := Parse("cpu_usage * 100")
 	if err != nil {

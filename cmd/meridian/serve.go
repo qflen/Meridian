@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -17,8 +19,13 @@ import (
 )
 
 var (
-	configPath string
-	dataDir    string
+	configPath    string
+	dataDir       string
+	httpListen    string
+	ingListen     string
+	clusterListen string
+	clusterPeers  string
+	flagNodeID    string
 )
 
 var serveCmd = &cobra.Command{
@@ -30,6 +37,11 @@ var serveCmd = &cobra.Command{
 func init() {
 	serveCmd.Flags().StringVar(&configPath, "config", "meridian.yaml", "Path to config file")
 	serveCmd.Flags().StringVar(&dataDir, "data-dir", "", "Data directory (overrides config)")
+	serveCmd.Flags().StringVar(&httpListen, "http-listen", "", "HTTP listen address (overrides config)")
+	serveCmd.Flags().StringVar(&ingListen, "ingestion-listen", "", "Ingestion/gRPC listen address (overrides config)")
+	serveCmd.Flags().StringVar(&clusterListen, "cluster-listen", "", "Cluster gossip listen address (overrides config)")
+	serveCmd.Flags().StringVar(&clusterPeers, "cluster-peers", "", "Comma-separated cluster peer addresses")
+	serveCmd.Flags().StringVar(&flagNodeID, "node-id", "", "Node ID (overrides config and env)")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -44,14 +56,31 @@ func runServe(cmd *cobra.Command, args []string) error {
 		cfg.Storage.DataDir = dataDir
 		cfg.Storage.WALDir = dataDir + "/wal"
 	}
+	if httpListen != "" {
+		cfg.Server.HTTPAddr = httpListen
+	}
+	if ingListen != "" {
+		cfg.Server.GRPCAddr = ingListen
+	}
+	if clusterListen != "" {
+		cfg.Cluster.BindAddr = clusterListen
+	}
+	if clusterPeers != "" {
+		cfg.Cluster.Join = strings.Split(clusterPeers, ",")
+	}
+	if flagNodeID != "" {
+		cfg.Cluster.NodeID = flagNodeID
+	} else if envID := os.Getenv("MERIDIAN_NODE_ID"); envID != "" && cfg.Cluster.NodeID == "" {
+		cfg.Cluster.NodeID = envID
+	}
 
 	// Open TSDB
 	opts := storage.TSDBOptions{
 		WALDir:          cfg.Storage.WALDir,
 		BlockDir:        cfg.Storage.DataDir + "/blocks",
-		BlockDuration:   cfg.Storage.BlockDuration,
-		RetentionPeriod: cfg.Storage.Retention,
-		FlushInterval:   cfg.Storage.FlushInterval,
+		BlockDuration:   cfg.Storage.BlockDuration.Std(),
+		RetentionPeriod: cfg.Storage.Retention.Std(),
+		FlushInterval:   cfg.Storage.FlushInterval.Std(),
 	}
 
 	db, err := storage.Open(cfg.Storage.DataDir, opts)
@@ -60,7 +89,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Start ingestion server
-	ingServer := ingestion.NewServer(db, cfg.Ingestion.BatchSize, cfg.Ingestion.FlushInterval)
+	ingServer := ingestion.NewServer(db, cfg.Ingestion.BatchSize, cfg.Ingestion.FlushInterval.Std())
 	if err := ingServer.Start(cfg.Server.GRPCAddr); err != nil {
 		return fmt.Errorf("start ingestion server: %w", err)
 	}
@@ -70,13 +99,29 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if nodeID == "" {
 		nodeID = fmt.Sprintf("node-%d", os.Getpid())
 	}
-	httpServer := server.NewHTTPServer(db, nodeID)
+
+	// Derive peer HTTP addresses from cluster peers
+	var peerHTTPAddrs []string
+	if len(cfg.Cluster.Join) > 0 {
+		_, httpPort, _ := net.SplitHostPort(cfg.Server.HTTPAddr)
+		if httpPort == "" {
+			httpPort = "8080"
+		}
+		for _, peer := range cfg.Cluster.Join {
+			host, _, err := net.SplitHostPort(peer)
+			if err != nil {
+				host = peer
+			}
+			peerHTTPAddrs = append(peerHTTPAddrs, net.JoinHostPort(host, httpPort))
+		}
+	}
+	httpServer := server.NewHTTPServer(db, nodeID, peerHTTPAddrs)
 	if err := httpServer.Start(cfg.Server.HTTPAddr); err != nil {
 		return fmt.Errorf("start HTTP server: %w", err)
 	}
 
 	// Start retention enforcer
-	enforcer := retention.NewEnforcer(db, cfg.Storage.Retention)
+	enforcer := retention.NewEnforcer(db, cfg.Storage.Retention.Std())
 	enforcer.Start()
 
 	// Start internal metrics broadcaster
@@ -115,7 +160,7 @@ func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingSer
 			"ingestionRate":   ingestionRate,
 			"activeSeries":    stats.TotalSeries,
 			"memoryBytes":     stats.HeadSamples * 16, // approximate
-			"compressedBytes": stats.StorageBytesDisk,
+			"compressedBytes": stats.ChunkBytes,
 			"rawBytes":        stats.StorageBytesRaw,
 			"walSegments":     stats.WALSize,
 			"blockCount":      stats.BlockCount,

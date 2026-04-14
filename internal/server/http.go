@@ -26,10 +26,43 @@ type HTTPServer struct {
 	httpServer *http.Server
 	startTime  time.Time
 	nodeID     string
+	peerAddrs  []string // HTTP addresses of cluster peers
+	latency    *latencyTracker
+}
+
+// latencyTracker records query execution latency into histogram buckets.
+type latencyTracker struct {
+	buckets []latencyBucket
+}
+
+type latencyBucket struct {
+	LE    string `json:"le"`
+	Count int64  `json:"count"`
+}
+
+func newLatencyTracker() *latencyTracker {
+	return &latencyTracker{
+		buckets: []latencyBucket{
+			{LE: "1ms"}, {LE: "5ms"}, {LE: "10ms"}, {LE: "25ms"},
+			{LE: "50ms"}, {LE: "100ms"}, {LE: "250ms"}, {LE: "500ms"}, {LE: "1s"},
+		},
+	}
+}
+
+func (lt *latencyTracker) record(d time.Duration) {
+	ms := d.Milliseconds()
+	thresholds := []int64{1, 5, 10, 25, 50, 100, 250, 500, 1000}
+	for i, t := range thresholds {
+		if ms <= t {
+			lt.buckets[i].Count++
+			return
+		}
+	}
+	lt.buckets[len(lt.buckets)-1].Count++
 }
 
 // NewHTTPServer creates a new HTTP server.
-func NewHTTPServer(db *storage.TSDB, nodeID string) *HTTPServer {
+func NewHTTPServer(db *storage.TSDB, nodeID string, peerAddrs []string) *HTTPServer {
 	s := &HTTPServer{
 		db:        db,
 		engine:    query.NewEngine(db),
@@ -37,6 +70,8 @@ func NewHTTPServer(db *storage.TSDB, nodeID string) *HTTPServer {
 		mux:       http.NewServeMux(),
 		startTime: time.Now(),
 		nodeID:    nodeID,
+		peerAddrs: peerAddrs,
+		latency:   newLatencyTracker(),
 	}
 
 	s.registerRoutes()
@@ -79,7 +114,9 @@ func (s *HTTPServer) registerRoutes() {
 	s.mux.HandleFunc("/api/v1/label/", s.handleLabelValues)
 	s.mux.HandleFunc("/api/v1/stats", s.handleStats)
 	s.mux.HandleFunc("/api/v1/cluster", s.handleCluster)
-	s.mux.HandleFunc("/ws/live", s.handleWSLive)
+	s.mux.HandleFunc("/api/v1/blocks", s.handleBlocks)
+	s.mux.HandleFunc("/api/v1/query_latency", s.handleQueryLatency)
+	s.mux.HandleFunc("/metrics", s.handlePromMetrics)
 	s.mux.HandleFunc("/ws/metrics", s.handleWSMetrics)
 
 	// Serve dashboard static files
@@ -139,6 +176,7 @@ func (s *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	startExec := time.Now()
 	results, err := s.engine.Execute(r.Context(), q, start, end, step)
 	execTime := time.Since(startExec)
+	s.latency.record(execTime)
 
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -208,31 +246,168 @@ func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.db.Stats()
 	ratio := s.db.CompressionRatio()
 	writeJSON(w, map[string]interface{}{
-		"total_samples":           stats.TotalSamples,
-		"total_series":            stats.TotalSeries,
-		"blocks":                  stats.BlockCount,
-		"compression_ratio":       fmt.Sprintf("%.1f", ratio),
-		"storage_bytes_raw":       stats.StorageBytesRaw,
-		"storage_bytes_compressed": stats.StorageBytesDisk,
-		"head_samples":            stats.HeadSamples,
-		"head_series":             stats.HeadSeries,
-		"wal_size":                stats.WALSize,
-		"ingestion_rate":          s.db.IngestionRate(),
-		"uptime":                  time.Since(s.startTime).String(),
+		"total_samples":            stats.TotalSamples,
+		"total_series":             stats.TotalSeries,
+		"blocks":                   stats.BlockCount,
+		"compression_ratio":        fmt.Sprintf("%.1f", ratio),
+		"storage_bytes_raw":        stats.StorageBytesRaw,
+		"storage_bytes_compressed": stats.ChunkBytes,
+		"storage_bytes_disk":       stats.StorageBytesDisk,
+		"head_samples":             stats.HeadSamples,
+		"head_series":              stats.HeadSeries,
+		"wal_size":                 stats.WALSize,
+		"ingestion_rate":           s.db.IngestionRate(),
+		"uptime":                   time.Since(s.startTime).String(),
 	})
 }
 
+func (s *HTTPServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
+	blocks := s.db.Blocks()
+	type blockInfo struct {
+		ULID       string `json:"ulid"`
+		NodeID     string `json:"node_id"`
+		MinTime    int64  `json:"min_time"`
+		MaxTime    int64  `json:"max_time"`
+		NumSamples int64  `json:"num_samples"`
+		NumSeries  int    `json:"num_series"`
+		Level      int    `json:"level"`
+	}
+	infos := make([]blockInfo, len(blocks))
+	for i, b := range blocks {
+		meta := b.Meta()
+		infos[i] = blockInfo{
+			ULID:       meta.ULID,
+			NodeID:     s.nodeID,
+			MinTime:    meta.MinTime,
+			MaxTime:    meta.MaxTime,
+			NumSamples: meta.Stats.NumSamples,
+			NumSeries:  meta.Stats.NumSeries,
+			Level:      meta.Compaction.Level,
+		}
+	}
+	writeJSON(w, map[string]interface{}{"blocks": infos})
+}
+
+func (s *HTTPServer) handleQueryLatency(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.latency.buckets)
+}
+
+// handlePromMetrics exposes Meridian's internal stats in Prometheus text format
+// (https://prometheus.io/docs/instrumenting/exposition_formats/). This lets the
+// server be scraped by a Prometheus-compatible collector — useful for running
+// Meridian alongside an existing metrics pipeline.
+func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
+	stats := s.db.Stats()
+	ratio := s.db.CompressionRatio()
+	node := s.nodeID
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+	fmt.Fprintf(w, "# HELP meridian_samples_ingested_total Total samples ingested since startup.\n")
+	fmt.Fprintf(w, "# TYPE meridian_samples_ingested_total counter\n")
+	fmt.Fprintf(w, "meridian_samples_ingested_total{node=%q} %d\n", node, s.db.IngestionRate())
+
+	fmt.Fprintf(w, "# HELP meridian_head_samples Samples currently resident in the in-memory head block.\n")
+	fmt.Fprintf(w, "# TYPE meridian_head_samples gauge\n")
+	fmt.Fprintf(w, "meridian_head_samples{node=%q} %d\n", node, stats.HeadSamples)
+
+	fmt.Fprintf(w, "# HELP meridian_active_series Distinct (name,labels) tuples currently tracked.\n")
+	fmt.Fprintf(w, "# TYPE meridian_active_series gauge\n")
+	fmt.Fprintf(w, "meridian_active_series{node=%q} %d\n", node, stats.TotalSeries)
+
+	fmt.Fprintf(w, "# HELP meridian_blocks Number of flushed on-disk blocks.\n")
+	fmt.Fprintf(w, "# TYPE meridian_blocks gauge\n")
+	fmt.Fprintf(w, "meridian_blocks{node=%q} %d\n", node, stats.BlockCount)
+
+	fmt.Fprintf(w, "# HELP meridian_storage_bytes Storage footprint by layer.\n")
+	fmt.Fprintf(w, "# TYPE meridian_storage_bytes gauge\n")
+	fmt.Fprintf(w, "meridian_storage_bytes{node=%q,layer=\"raw\"} %d\n", node, stats.StorageBytesRaw)
+	fmt.Fprintf(w, "meridian_storage_bytes{node=%q,layer=\"compressed\"} %d\n", node, stats.ChunkBytes)
+	fmt.Fprintf(w, "meridian_storage_bytes{node=%q,layer=\"disk\"} %d\n", node, stats.StorageBytesDisk)
+	fmt.Fprintf(w, "meridian_storage_bytes{node=%q,layer=\"wal\"} %d\n", node, stats.WALSize)
+
+	fmt.Fprintf(w, "# HELP meridian_compression_ratio Raw-to-compressed size ratio for Gorilla-encoded chunks.\n")
+	fmt.Fprintf(w, "# TYPE meridian_compression_ratio gauge\n")
+	fmt.Fprintf(w, "meridian_compression_ratio{node=%q} %.3f\n", node, ratio)
+
+	fmt.Fprintf(w, "# HELP meridian_query_latency_seconds Query executor latency histogram.\n")
+	fmt.Fprintf(w, "# TYPE meridian_query_latency_seconds histogram\n")
+	var cumulative int64
+	var sumSeconds float64
+	for _, b := range s.latency.buckets {
+		cumulative += b.Count
+		le, secs := promBucketUpperBound(b.LE)
+		fmt.Fprintf(w, "meridian_query_latency_seconds_bucket{node=%q,le=%q} %d\n", node, le, cumulative)
+		sumSeconds += float64(b.Count) * secs
+	}
+	fmt.Fprintf(w, "meridian_query_latency_seconds_bucket{node=%q,le=\"+Inf\"} %d\n", node, cumulative)
+	fmt.Fprintf(w, "meridian_query_latency_seconds_sum{node=%q} %f\n", node, sumSeconds)
+	fmt.Fprintf(w, "meridian_query_latency_seconds_count{node=%q} %d\n", node, cumulative)
+
+	fmt.Fprintf(w, "# HELP meridian_ws_clients Connected dashboard WebSocket clients.\n")
+	fmt.Fprintf(w, "# TYPE meridian_ws_clients gauge\n")
+	fmt.Fprintf(w, "meridian_ws_clients{node=%q} %d\n", node, s.wsHub.ClientCount())
+
+	fmt.Fprintf(w, "# HELP meridian_uptime_seconds Seconds since this node started.\n")
+	fmt.Fprintf(w, "# TYPE meridian_uptime_seconds counter\n")
+	fmt.Fprintf(w, "meridian_uptime_seconds{node=%q} %d\n", node, int64(time.Since(s.startTime).Seconds()))
+}
+
+// promBucketUpperBound converts the internal bucket label (e.g. "5ms", "1s") into
+// a Prometheus `le` value in seconds (both the string label and numeric bound used
+// when computing the histogram sum).
+func promBucketUpperBound(label string) (string, float64) {
+	d, err := time.ParseDuration(label)
+	if err != nil {
+		return label, 0
+	}
+	secs := d.Seconds()
+	return strconv.FormatFloat(secs, 'f', -1, 64), secs
+}
+
 func (s *HTTPServer) handleCluster(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]interface{}{
-		"nodes": []map[string]interface{}{
-			{
-				"id":     s.nodeID,
-				"addr":   "localhost",
-				"state":  "active",
-				"shards": 256,
-			},
+	stats := s.db.Stats()
+	nodes := []map[string]interface{}{
+		{
+			"id":      s.nodeID,
+			"addr":    "localhost",
+			"state":   "active",
+			"role":    "storage",
+			"series":  stats.TotalSeries,
+			"samples": stats.TotalSamples,
 		},
-	})
+	}
+
+	// Probe configured peers for cluster-wide view
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	for _, peer := range s.peerAddrs {
+		resp, err := client.Get(fmt.Sprintf("http://%s/health", peer))
+		if err != nil {
+			nodes = append(nodes, map[string]interface{}{
+				"id": peer, "addr": peer, "state": "dead", "role": "storage", "series": 0, "samples": 0,
+			})
+			continue
+		}
+		var health struct {
+			NodeID string `json:"node_id"`
+			Status string `json:"status"`
+		}
+		json.NewDecoder(resp.Body).Decode(&health)
+		resp.Body.Close()
+
+		peerState := "dead"
+		if health.Status == "ok" {
+			peerState = "active"
+		}
+		id := health.NodeID
+		if id == "" {
+			id = peer
+		}
+		nodes = append(nodes, map[string]interface{}{
+			"id": id, "addr": peer, "state": peerState, "role": "storage", "series": 0, "samples": 0,
+		})
+	}
+
+	writeJSON(w, map[string]interface{}{"nodes": nodes})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

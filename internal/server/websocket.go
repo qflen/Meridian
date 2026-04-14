@@ -26,7 +26,6 @@ type wsClient struct {
 	hub  *WebSocketHub
 	conn *websocket.Conn
 	send chan []byte
-	kind string // "live" or "metrics"
 }
 
 // NewWebSocketHub creates a new hub for managing WebSocket connections.
@@ -57,27 +56,7 @@ func (h *WebSocketHub) Run() {
 	}
 }
 
-// BroadcastLive sends a live sample message to all connected live WebSocket clients.
-func (h *WebSocketHub) BroadcastLive(msg interface{}) {
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for client := range h.clients {
-		if client.kind != "live" {
-			continue
-		}
-		select {
-		case client.send <- data:
-		default:
-			// client buffer full, skip
-		}
-	}
-}
-
-// BroadcastMetrics sends internal metrics to all connected metrics WebSocket clients.
+// BroadcastMetrics sends a message to every connected /ws/metrics client.
 func (h *WebSocketHub) BroadcastMetrics(msg interface{}) {
 	data, err := json.Marshal(msg)
 	if err != nil {
@@ -86,12 +65,10 @@ func (h *WebSocketHub) BroadcastMetrics(msg interface{}) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for client := range h.clients {
-		if client.kind != "metrics" {
-			continue
-		}
 		select {
 		case client.send <- data:
 		default:
+			// client buffer full, skip
 		}
 	}
 }
@@ -103,42 +80,26 @@ func (h *WebSocketHub) ClientCount() int {
 	return len(h.clients)
 }
 
-func (s *HTTPServer) handleWSLive(w http.ResponseWriter, r *http.Request) {
+// HandleWSUpgrade upgrades an HTTP connection to WebSocket and registers with the hub.
+// Exported so other binaries (e.g., the gateway) can reuse the hub implementation.
+func HandleWSUpgrade(hub *WebSocketHub, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade error: %v", err)
 		return
 	}
-
 	client := &wsClient{
-		hub:  s.wsHub,
+		hub:  hub,
 		conn: conn,
 		send: make(chan []byte, 256),
-		kind: "live",
 	}
-	s.wsHub.register <- client
-
+	hub.register <- client
 	go client.writePump()
 	go client.readPump()
 }
 
 func (s *HTTPServer) handleWSMetrics(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
-		return
-	}
-
-	client := &wsClient{
-		hub:  s.wsHub,
-		conn: conn,
-		send: make(chan []byte, 64),
-		kind: "metrics",
-	}
-	s.wsHub.register <- client
-
-	go client.writePump()
-	go client.readPump()
+	HandleWSUpgrade(s.wsHub, w, r)
 }
 
 func (c *wsClient) writePump() {

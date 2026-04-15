@@ -1,49 +1,202 @@
-version: "3.8"
+# Meridian TSDB — Microservices Docker Compose
+#
+# Topology:
+#   gateway (1)     — public API + dashboard + WebSocket
+#   ingestor (2)    — TCP ingestion + hash-sharded writes
+#   storage (3)     — TSDB engine, WAL, compression
+#   querier (1)     — PromQL parsing, fan-out to storage
+#   compactor (1)   — retention enforcement
+#   simulator (1)   — metric generator
 
 services:
-  meridian-1:
+  # ── Gateway ──────────────────────────────────────────────────────────
+  gateway:
     build: .
-    container_name: meridian-1
-    hostname: meridian-1
+    container_name: meridian-gateway
+    hostname: gateway
+    entrypoint: ["/app/gateway"]
     ports:
       - "8080:8080"
+    environment:
+      GATEWAY_HTTP_ADDR: ":8080"
+      GATEWAY_NODE_ID: "gateway-1"
+      QUERIER_ADDR: "querier:8080"
+      INGESTOR_ADDRS: "ingestor-1:8080,ingestor-2:8080"
+      STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
+    depends_on:
+      querier:
+        condition: service_healthy
+      ingestor-1:
+        condition: service_healthy
+      storage-1:
+        condition: service_healthy
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Ingestor Nodes ──────────────��─────────────────────��──────────────
+  ingestor-1:
+    build: .
+    container_name: meridian-ingestor-1
+    hostname: ingestor-1
+    entrypoint: ["/app/ingestor"]
+    ports:
       - "9090:9090"
-    volumes:
-      - meridian-1-data:/app/data
     environment:
-      MERIDIAN_NODE_ID: node-1
-    command: >
-      serve
-      --http-listen=:8080
-      --ingestion-listen=:9090
-      --cluster-listen=:7946
-      --cluster-peers=meridian-2:7946,meridian-3:7946
+      INGESTOR_HTTP_ADDR: ":8080"
+      INGESTOR_TCP_ADDR: ":9090"
+      INGESTOR_NODE_ID: "ingestor-1"
+      STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
+    depends_on:
+      storage-1:
+        condition: service_healthy
+      storage-2:
+        condition: service_healthy
+      storage-3:
+        condition: service_healthy
     networks:
       - meridian-net
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
-      interval: 10s
+      interval: 5s
       timeout: 3s
-      retries: 3
+      retries: 5
 
-  meridian-2:
+  ingestor-2:
     build: .
-    container_name: meridian-2
-    hostname: meridian-2
+    container_name: meridian-ingestor-2
+    hostname: ingestor-2
+    entrypoint: ["/app/ingestor"]
     ports:
-      - "8081:8080"
       - "9091:9090"
-    volumes:
-      - meridian-2-data:/app/data
     environment:
-      MERIDIAN_NODE_ID: node-2
-    command: >
-      serve
-      --http-listen=:8080
-      --ingestion-listen=:9090
-      --cluster-listen=:7946
-      --cluster-peers=meridian-1:7946,meridian-3:7946
+      INGESTOR_HTTP_ADDR: ":8080"
+      INGESTOR_TCP_ADDR: ":9090"
+      INGESTOR_NODE_ID: "ingestor-2"
+      STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
+    depends_on:
+      storage-1:
+        condition: service_healthy
+      storage-2:
+        condition: service_healthy
+      storage-3:
+        condition: service_healthy
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Storage Nodes ──────��─────────────────────────────────────────────
+  storage-1:
+    build: .
+    container_name: meridian-storage-1
+    hostname: storage-1
+    entrypoint: ["/app/storage-svc"]
+    volumes:
+      - storage-1-data:/app/data
+    environment:
+      STORAGE_HTTP_ADDR: ":8080"
+      STORAGE_DATA_DIR: "/app/data"
+      STORAGE_NODE_ID: "storage-1"
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  storage-2:
+    build: .
+    container_name: meridian-storage-2
+    hostname: storage-2
+    entrypoint: ["/app/storage-svc"]
+    volumes:
+      - storage-2-data:/app/data
+    environment:
+      STORAGE_HTTP_ADDR: ":8080"
+      STORAGE_DATA_DIR: "/app/data"
+      STORAGE_NODE_ID: "storage-2"
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  storage-3:
+    build: .
+    container_name: meridian-storage-3
+    hostname: storage-3
+    entrypoint: ["/app/storage-svc"]
+    volumes:
+      - storage-3-data:/app/data
+    environment:
+      STORAGE_HTTP_ADDR: ":8080"
+      STORAGE_DATA_DIR: "/app/data"
+      STORAGE_NODE_ID: "storage-3"
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Querier ──────────────────────────────────────────────────────────
+  querier:
+    build: .
+    container_name: meridian-querier
+    hostname: querier
+    entrypoint: ["/app/querier"]
+    environment:
+      QUERIER_HTTP_ADDR: ":8080"
+      QUERIER_NODE_ID: "querier-1"
+      STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
+    depends_on:
+      storage-1:
+        condition: service_healthy
+      storage-2:
+        condition: service_healthy
+      storage-3:
+        condition: service_healthy
+    networks:
+      - meridian-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Compactor ────────────────────────────────────��───────────────────
+  compactor:
+    build: .
+    container_name: meridian-compactor
+    hostname: compactor
+    entrypoint: ["/app/compactor"]
+    environment:
+      COMPACTOR_HTTP_ADDR: ":8080"
+      COMPACTOR_NODE_ID: "compactor-1"
+      STORAGE_ADDRS: "storage-1:8080,storage-2:8080,storage-3:8080"
+      RETENTION: "360h"
+    depends_on:
+      storage-1:
+        condition: service_healthy
     networks:
       - meridian-net
     restart: unless-stopped
@@ -53,36 +206,23 @@ services:
       timeout: 3s
       retries: 3
 
-  meridian-3:
+  # ── Simulator ────────────────────────────────────────────────────────
+  simulator:
     build: .
-    container_name: meridian-3
-    hostname: meridian-3
-    ports:
-      - "8082:8080"
-      - "9092:9090"
-    volumes:
-      - meridian-3-data:/app/data
-    environment:
-      MERIDIAN_NODE_ID: node-3
-    command: >
-      serve
-      --http-listen=:8080
-      --ingestion-listen=:9090
-      --cluster-listen=:7946
-      --cluster-peers=meridian-1:7946,meridian-2:7946
+    container_name: meridian-simulator
+    entrypoint: ["/app/meridian"]
+    depends_on:
+      ingestor-1:
+        condition: service_healthy
+    command: simulate --addr=ingestor-1:9090 --hosts=8 --rate=5s
     networks:
       - meridian-net
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
 
 volumes:
-  meridian-1-data:
-  meridian-2-data:
-  meridian-3-data:
+  storage-1-data:
+  storage-2-data:
+  storage-3-data:
 
 networks:
   meridian-net:

@@ -114,21 +114,13 @@ Server sends JSON messages of type:
 }
 ```
 
-### Live Stream
-
-```
-ws://<host>/ws/live
-```
-
-Subscribes to raw sample batches:
+Per-series samples are also pushed on the same channel:
 ```json
 {
-  "type": "live",
-  "series": [
-    {
-      "labels": {"__name__": "cpu_usage_percent", "host": "web-1"},
-      "samples": [{"timestamp": 1700000000000, "value": 42.5}]
-    }
-  ]
+  "type": "metric",
+  "series": "cpu_usage_percent{host=\"web-01\",role=\"web\"}",
+  "labels": {"host": "web-01", "role": "web"},
+  "timestamp": 1700000000000,
+  "value": 42.5
 }
 ```

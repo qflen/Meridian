@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { useDashboard } from '../state/DashboardContext';
+import { getCanvasColors } from '../utils/canvasColors';
 
 function formatBytes(b: number): string {
   if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
@@ -31,6 +32,7 @@ export function CompressionStats() {
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, w, h);
 
+    const colors = getCanvasColors(canvas);
     const cx = w / 2;
     const cy = h / 2 + 8;
     const r = Math.min(w, h) * 0.35;
@@ -38,13 +40,13 @@ export function CompressionStats() {
     // Background arc
     ctx.lineWidth = 12;
     ctx.lineCap = 'round';
-    ctx.strokeStyle = 'var(--grid-color)';
+    ctx.strokeStyle = colors.gridColor;
     ctx.beginPath();
     ctx.arc(cx, cy, r, Math.PI * 0.8, Math.PI * 2.2);
     ctx.stroke();
 
-    // Ratio arc (max display ~50x)
-    const maxRatio = 50;
+    // Ratio arc (~30x covers well-populated head + flushed blocks)
+    const maxRatio = 30;
     const progress = Math.min(ratio / maxRatio, 1);
     const startAngle = Math.PI * 0.8;
     const endAngle = startAngle + progress * Math.PI * 1.4;
@@ -62,11 +64,11 @@ export function CompressionStats() {
     ctx.stroke();
 
     // Center text
-    ctx.fillStyle = 'rgb(var(--color-text))';
+    ctx.fillStyle = colors.text;
     ctx.font = 'bold 22px Inter, sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText(ratio > 0 ? `${ratio.toFixed(1)}x` : '--', cx, cy + 2);
-    ctx.fillStyle = 'rgb(var(--color-text-muted))';
+    ctx.fillStyle = colors.textMuted;
     ctx.font = '10px Inter, sans-serif';
     ctx.fillText('compression ratio', cx, cy + 18);
   }, [ratio]);
@@ -85,13 +87,13 @@ export function CompressionStats() {
 
   return (
     <div className="card">
-      <h3 className="text-sm font-semibold text-gray-300 mb-2">Gorilla Compression</h3>
+      <h3 className="text-sm font-semibold mb-2" style={{ color: 'rgb(var(--color-text))' }}>Gorilla Compression</h3>
       <div ref={containerRef} style={{ height: 160 }}>
         <canvas ref={canvasRef} className="w-full h-full" style={{ height: 160 }} />
       </div>
       <div className="grid grid-cols-2 gap-3 mt-2">
         <div className="text-center">
-          <div className="text-sm font-bold text-white">
+          <div className="text-sm font-bold" style={{ color: 'rgb(var(--color-text))' }}>
             {stats ? formatBytes(stats.rawBytes) : '--'}
           </div>
           <div className="stat-label">raw size</div>

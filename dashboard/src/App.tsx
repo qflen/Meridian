@@ -17,24 +17,43 @@ function Dashboard() {
   useMetricStream();
   const frameMetrics = useFrameMetrics();
 
-  // Build chart series from query result
-  const chartSeries =
-    state.queryResult?.data?.map((ts, i) => {
-      const labelStr = Object.entries(ts.labels)
-        .filter(([k]) => k !== '__name__')
-        .map(([k, v]) => `${k}="${v}"`)
-        .join(', ');
-      const name = ts.labels.__name__ || `series-${i}`;
-      return {
-        label: labelStr ? `${name}{${labelStr}}` : name,
-        samples: ts.samples,
-      };
-    }) ?? [];
+  // Build chart series from query result — use short legend labels
+  const chartSeries = (() => {
+    const data = state.queryResult?.data ?? [];
+    if (data.length === 0) return [];
+
+    // Find which label keys differ across series (skip __name__)
+    const allKeys = new Set<string>();
+    for (const ts of data) {
+      for (const k of Object.keys(ts.labels)) {
+        if (k !== '__name__') allKeys.add(k);
+      }
+    }
+    const varyingKeys = [...allKeys].filter((k) => {
+      const vals = new Set(data.map((ts) => ts.labels[k] ?? ''));
+      return vals.size > 1;
+    });
+
+    return data.map((ts, i) => {
+      let label: string;
+      if (varyingKeys.length > 0) {
+        // Show only the labels that differ between series
+        label = varyingKeys
+          .map((k) => ts.labels[k] ?? '')
+          .filter(Boolean)
+          .join(', ');
+      } else {
+        // All labels are the same — just show the metric name
+        label = ts.labels.__name__ || `series-${i}`;
+      }
+      return { label: label || `series-${i}`, samples: ts.samples };
+    });
+  })();
 
   return (
-    <div className="min-h-screen bg-gray-950">
+    <div className="min-h-screen">
       {/* Header */}
-      <header className="sticky top-0 z-40 border-b border-gray-800 bg-gray-950/90 backdrop-blur-sm">
+      <header className="app-header">
         <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <svg viewBox="0 0 32 32" className="w-7 h-7">
@@ -48,18 +67,18 @@ function Dashboard() {
               />
             </svg>
             <div>
-              <h1 className="text-base font-bold text-white tracking-tight">Meridian</h1>
-              <p className="text-[10px] text-gray-500 -mt-0.5">Distributed Time-Series Database</p>
+              <h1 className="text-base font-bold tracking-tight">Meridian</h1>
+              <p className="text-[10px] -mt-0.5" style={{ color: 'rgb(var(--color-text-muted))' }}>Distributed Time-Series Database</p>
             </div>
           </div>
 
           <div className="flex items-center gap-4">
             {/* Frame metrics */}
-            <div className="hidden md:flex items-center gap-3 text-xs text-gray-500">
+            <div className="hidden md:flex items-center gap-3 text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
               <span>{frameMetrics.fps} fps</span>
               <span>{frameMetrics.frameTime}ms</span>
               {frameMetrics.droppedFrames > 0 && (
-                <span className="text-yellow-500">{frameMetrics.droppedFrames} dropped</span>
+                <span style={{ color: 'rgb(var(--color-warning))' }}>{frameMetrics.droppedFrames} dropped</span>
               )}
             </div>
 
@@ -67,17 +86,18 @@ function Dashboard() {
             <div className="flex items-center gap-1.5">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  state.connected ? 'bg-green-400 animate-pulse' : 'bg-gray-600'
+                  state.connected ? 'animate-pulse' : ''
                 }`}
+                style={{ backgroundColor: state.connected ? 'rgb(var(--color-success))' : 'rgb(var(--color-text-muted))' }}
               />
-              <span className="text-xs text-gray-400">
+              <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
                 {state.connected ? 'Live' : 'Offline'}
               </span>
             </div>
 
             {/* Uptime */}
             {state.stats && (
-              <span className="text-xs text-gray-500">
+              <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
                 Up {Math.floor(state.stats.uptimeSeconds / 60)}m
               </span>
             )}
@@ -90,7 +110,7 @@ function Dashboard() {
       {/* Main content */}
       <main className="max-w-[1600px] mx-auto px-4 py-4 space-y-4">
         {/* Query bar */}
-        <div className="card">
+        <div className="card relative z-10">
           <QueryEditor />
         </div>
 
@@ -98,8 +118,8 @@ function Dashboard() {
         {chartSeries.length > 0 && (
           <div className="card">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-semibold text-gray-300">Query Result</h3>
-              <span className="text-xs text-gray-500">
+              <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Query Result</h3>
+              <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
                 {state.queryResult?.data?.length ?? 0} series
                 {state.queryResult?.stats &&
                   ` | ${state.queryResult.stats.samplesFetched} samples in ${state.queryResult.stats.executionMs}ms`}
@@ -117,10 +137,12 @@ function Dashboard() {
           <CompressionStats />
         </div>
 
-        {/* Middle row: Cluster + Live + Histogram */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {/* Middle row: Live (wide) + Cluster + Histogram */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div className="lg:col-span-2">
+            <LiveStream />
+          </div>
           <ClusterTopology />
-          <LiveStream />
           <LatencyHistogram />
         </div>
 
@@ -132,8 +154,8 @@ function Dashboard() {
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-gray-800 mt-8">
-        <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between text-xs text-gray-600">
+      <footer className="border-t mt-8" style={{ borderColor: 'rgb(var(--color-border))' }}>
+        <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
           <span>Meridian TSDB v0.1.0</span>
           <span>Canvas-rendered at 60fps | Zero chart dependencies</span>
         </div>

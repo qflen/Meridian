@@ -31,41 +31,28 @@
     --chart-glow: rgba(92, 124, 250, 0.2);
   }
 
-  .high-contrast {
-    --color-bg: 0 0 0;
-    --color-surface: 15 15 15;
-    --color-text: 255 255 255;
-    --color-text-muted: 200 200 200;
-    --color-border: 100 100 100;
-    --color-accent: 120 160 255;
-    --color-success: 50 255 120;
-    --color-warning: 255 220 50;
-    --color-danger: 255 80 80;
-    --grid-color: rgba(100, 100, 100, 0.5);
-    --chart-glow: rgba(120, 160, 255, 0.3);
-  }
-
-  body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  }
-
   * {
     scrollbar-width: thin;
     scrollbar-color: rgb(var(--color-border)) transparent;
   }
 }
 
+/* Body styles OUTSIDE @layer so they always win over Tailwind utilities */
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background-color: rgb(var(--color-bg));
+  color: rgb(var(--color-text));
+}
+
 @layer components {
   .card {
-    @apply rounded-xl border border-gray-800 bg-gray-900/80 backdrop-blur-sm p-4 shadow-lg;
+    @apply rounded-xl backdrop-blur-sm p-4 shadow-lg;
+    border: 1px solid rgb(var(--color-border));
+    background: rgb(var(--color-surface) / 0.8);
   }
 
-  .dark .card {
-    @apply border-gray-800 bg-gray-900/80;
-  }
-
-  .light .card {
-    @apply border-gray-200 bg-white/90;
+  .card h3 {
+    color: rgb(var(--color-text));
   }
 
   .btn-primary {
@@ -75,21 +62,81 @@
   }
 
   .btn-ghost {
-    @apply rounded-lg px-3 py-1.5 text-sm text-gray-400
-           transition-all hover:bg-gray-800 hover:text-gray-200;
+    @apply rounded-lg px-3 py-1.5 text-sm transition-all;
+    color: rgb(var(--color-text-muted));
+  }
+
+  .btn-ghost:hover {
+    background: rgb(var(--color-text) / 0.1);
+    color: rgb(var(--color-text));
   }
 
   .input {
-    @apply rounded-lg border border-gray-700 bg-gray-800/50 px-3 py-2 text-sm text-gray-100
-           placeholder-gray-500 transition-colors
-           focus:border-meridian-500 focus:outline-none focus:ring-1 focus:ring-meridian-500/30;
+    @apply rounded-lg px-3 py-2 text-sm transition-colors
+           focus:outline-none focus:ring-1 focus:ring-meridian-500/30;
+    border: 1px solid rgb(var(--color-border));
+    background: rgb(var(--color-surface) / 0.5);
+    color: rgb(var(--color-text));
+  }
+
+  .input::placeholder {
+    color: rgb(var(--color-text-muted) / 0.6);
+  }
+
+  .input:focus {
+    border-color: rgb(var(--color-accent));
   }
 
   .stat-value {
-    @apply text-2xl font-bold tracking-tight text-white;
+    @apply text-2xl font-bold tracking-tight;
+    color: rgb(var(--color-text));
   }
 
   .stat-label {
-    @apply text-xs font-medium uppercase tracking-wider text-gray-500;
+    @apply text-xs font-medium uppercase tracking-wider;
+    color: rgb(var(--color-text-muted));
+  }
+
+  .app-header {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    border-bottom: 1px solid rgb(var(--color-border));
+    background: rgb(var(--color-bg) / 0.9);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
   }
 }
+
+/* ── Light mode: remap hardcoded dark-theme Tailwind utilities ────── */
+.light .text-gray-300 { color: rgb(55 65 81); }
+.light .text-gray-400 { color: rgb(75 85 99); }
+.light .text-gray-500 { color: rgb(107 114 128); }
+.light .text-gray-600 { color: rgb(107 114 128); }
+
+.light .bg-gray-900 { background-color: rgb(255 255 255); }
+.light .bg-gray-900\/80 { background-color: rgb(255 255 255 / 0.8); }
+.light .bg-gray-800\/50 { background-color: rgb(243 244 246 / 0.5); }
+
+.light .border-gray-700 { border-color: rgb(209 213 219); }
+.light .border-gray-800 { border-color: rgb(229 231 235); }
+
+.light .hover\:bg-gray-800:hover { background-color: rgb(243 244 246); }
+.light .hover\:bg-gray-800\/50:hover { background-color: rgb(243 244 246 / 0.5); }
+.light .hover\:text-gray-200:hover { color: rgb(17 24 39); }
+.light .hover\:text-gray-300:hover { color: rgb(55 65 81); }
+
+.light .bg-gray-600 { background-color: rgb(156 163 175); }
+
+.light .bg-red-900\/30 { background-color: rgb(254 226 226 / 0.5); }
+.light .border-red-800 { border-color: rgb(252 165 165); }
+.light .text-red-300 { color: rgb(185 28 28); }
+
+.light .bg-meridian-600\/20 { background-color: rgb(76 110 245 / 0.1); }
+
+/* ── Dark mode: boost grays for readability on near-black bg ─────── */
+.dark .text-gray-300 { color: rgb(229 231 235); }
+.dark .text-gray-400 { color: rgb(209 213 219); }
+.dark .text-gray-500 { color: rgb(163 163 163); }
+.dark .text-gray-600 { color: rgb(140 140 140); }
+.dark .text-yellow-500 { color: rgb(250 204 21); }

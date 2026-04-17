@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { Sample } from '../types';
+import { getCanvasColors } from '../utils/canvasColors';
 
 // Palette of visually distinct colors for multi-series
 const COLORS = [
@@ -66,16 +67,20 @@ export function TimeSeriesChart({
     canvas.height = h * dpr;
     ctx.scale(dpr, dpr);
 
-    const pad = { top: title ? 32 : 16, right: 16, bottom: 40, left: 56 };
+    const legendRows = showLegend && series.length > 0 ? Math.ceil(series.length / 3) : 0;
+    const pad = { top: title ? 32 : 16, right: 16, bottom: 28 + legendRows * 16, left: 56 };
     const plotW = w - pad.left - pad.right;
     const plotH = h - pad.top - pad.bottom;
+
+    // Resolve CSS variables for canvas (canvas cannot use var() directly)
+    const colors = getCanvasColors(canvas);
 
     // Clear
     ctx.clearRect(0, 0, w, h);
 
     // Title
     if (title) {
-      ctx.fillStyle = 'rgb(var(--color-text-muted))';
+      ctx.fillStyle = colors.textMuted;
       ctx.font = '11px Inter, sans-serif';
       ctx.textAlign = 'left';
       ctx.fillText(title, pad.left, 14);
@@ -94,7 +99,7 @@ export function TimeSeriesChart({
 
     if (!isFinite(minT)) {
       // No data - draw empty state
-      ctx.fillStyle = 'rgb(var(--color-text-muted))';
+      ctx.fillStyle = colors.textMuted;
       ctx.font = '13px Inter, sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText('No data', w / 2, h / 2);
@@ -112,7 +117,7 @@ export function TimeSeriesChart({
 
     // Grid
     if (showGrid) {
-      ctx.strokeStyle = 'var(--grid-color)';
+      ctx.strokeStyle = colors.gridColor;
       ctx.lineWidth = 0.5;
 
       // Horizontal grid lines
@@ -125,7 +130,7 @@ export function TimeSeriesChart({
         ctx.lineTo(pad.left + plotW, y);
         ctx.stroke();
 
-        ctx.fillStyle = 'rgb(var(--color-text-muted))';
+        ctx.fillStyle = colors.textMuted;
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'right';
         ctx.fillText(formatValue(v), pad.left - 6, y + 3);
@@ -141,7 +146,7 @@ export function TimeSeriesChart({
         ctx.lineTo(x, pad.top + plotH);
         ctx.stroke();
 
-        ctx.fillStyle = 'rgb(var(--color-text-muted))';
+        ctx.fillStyle = colors.textMuted;
         ctx.font = '10px Inter, sans-serif';
         ctx.textAlign = 'center';
         ctx.fillText(formatTime(t), x, pad.top + plotH + 16);
@@ -151,7 +156,7 @@ export function TimeSeriesChart({
     // Y-axis label
     if (yLabel) {
       ctx.save();
-      ctx.fillStyle = 'rgb(var(--color-text-muted))';
+      ctx.fillStyle = colors.textMuted;
       ctx.font = '10px Inter, sans-serif';
       ctx.translate(12, pad.top + plotH / 2);
       ctx.rotate(-Math.PI / 2);
@@ -161,7 +166,7 @@ export function TimeSeriesChart({
     }
 
     // Plot border
-    ctx.strokeStyle = 'var(--grid-color)';
+    ctx.strokeStyle = colors.gridColor;
     ctx.lineWidth = 1;
     ctx.strokeRect(pad.left, pad.top, plotW, plotH);
 
@@ -211,27 +216,41 @@ export function TimeSeriesChart({
       }
     });
 
-    // Legend
+    // Legend — render in rows so items never overlap
     if (showLegend && series.length > 0) {
-      const legendY = pad.top + plotH + 28;
-      let lx = pad.left;
       ctx.font = '10px Inter, sans-serif';
-      for (let i = 0; i < Math.min(series.length, 6); i++) {
+      const legendBaseY = pad.top + plotH + 24;
+      let lx = pad.left;
+      let row = 0;
+
+      for (let i = 0; i < Math.min(series.length, 12); i++) {
         const color = series[i].color || COLORS[i % COLORS.length];
-        ctx.fillStyle = color;
-        ctx.fillRect(lx, legendY - 4, 8, 3);
-        ctx.fillStyle = 'rgb(var(--color-text-muted))';
-        const label = series[i].label.length > 24
-          ? series[i].label.slice(0, 22) + '..'
+        const label = series[i].label.length > 28
+          ? series[i].label.slice(0, 26) + '..'
           : series[i].label;
-        ctx.fillText(label, lx + 12, legendY);
-        lx += ctx.measureText(label).width + 24;
+        const itemWidth = 14 + ctx.measureText(label).width + 16;
+
+        // Wrap to next row if this item would overflow
+        if (lx + itemWidth > pad.left + plotW && lx > pad.left) {
+          row++;
+          lx = pad.left;
+        }
+
+        const ly = legendBaseY + row * 16;
+        ctx.fillStyle = color;
+        ctx.fillRect(lx, ly - 3, 8, 8);
+        ctx.fillStyle = colors.textMuted;
+        ctx.fillText(label, lx + 14, ly + 4);
+        lx += itemWidth;
       }
     }
   }, [series, showGrid, showLegend, animated, yLabel, title]);
 
   useEffect(() => {
-    if (animated) {
+    const isFirstData = prevSeriesRef.current.length === 0 && series.length > 0;
+
+    if (animated && isFirstData) {
+      // Animate only on first data load
       progressRef.current = 0;
       const start = performance.now();
       const duration = 600;
@@ -245,6 +264,7 @@ export function TimeSeriesChart({
       };
       rafRef.current = requestAnimationFrame(animate);
     } else {
+      // Subsequent updates: render immediately without animation
       progressRef.current = 1;
       render();
     }

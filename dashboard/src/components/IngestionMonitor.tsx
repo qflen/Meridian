@@ -30,7 +30,7 @@ export function IngestionMonitor() {
 
   return (
     <div className="card">
-      <h3 className="text-sm font-semibold text-gray-300 mb-3">Ingestion Monitor</h3>
+      <h3 className="text-sm font-semibold mb-3" style={{ color: 'rgb(var(--color-text))' }}>Ingestion Monitor</h3>
       <div className="grid grid-cols-4 gap-4 mb-4">
         <div>
           <div className="stat-value">{stats ? stats.ingestionRate.toLocaleString() : '--'}</div>

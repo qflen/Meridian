@@ -2,6 +2,8 @@ import { useCallback } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { QueryResult, TimeSeries } from '../types';
 
+const DEFAULT_LOOKBACK_MS = 15 * 60 * 1000;
+
 export function useQueryExecutor() {
   const { state, dispatch } = useDashboard();
 
@@ -13,10 +15,16 @@ export function useQueryExecutor() {
       dispatch({ type: 'QUERY_START' });
 
       try {
+        // Resolve the range at execute-time so queries always cover the most recent samples,
+        // even if the app has been open for a while. A fixed state-bound range would go stale.
+        const now = Date.now();
+        const end = now;
+        const start = now - DEFAULT_LOOKBACK_MS;
+
         const params = new URLSearchParams({
           q,
-          start: String(state.timeRange.start),
-          end: String(state.timeRange.end),
+          start: String(start),
+          end: String(end),
         });
 
         const res = await fetch(`/api/v1/query?${params}`);
@@ -63,7 +71,7 @@ export function useQueryExecutor() {
         });
       }
     },
-    [state.query, state.timeRange, dispatch],
+    [state.query, dispatch],
   );
 
   return { execute, loading: state.queryLoading };

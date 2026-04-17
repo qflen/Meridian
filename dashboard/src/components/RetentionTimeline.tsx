@@ -1,27 +1,69 @@
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect, useCallback, useState } from 'react';
 import { useDashboard } from '../state/DashboardContext';
-
-interface Block {
-  id: string;
-  minTime: number;
-  maxTime: number;
-  samples: number;
-  resolution: '5s' | '1m' | '1h';
-}
+import { getCanvasColors } from '../utils/canvasColors';
+import { BlockInfo } from '../types';
 
 export function RetentionTimeline() {
   const { state } = useDashboard();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [blocks, setBlocks] = useState<BlockInfo[]>([]);
 
-  // Demo blocks when no real data
+  // Fetch real block data from the API
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchBlocks = async () => {
+      try {
+        const res = await fetch('/api/v1/blocks');
+        const data = await res.json();
+        if (!cancelled && data.blocks) {
+          setBlocks(data.blocks);
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    fetchBlocks();
+    const interval = setInterval(fetchBlocks, 10000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // Build display blocks: real blocks + head block
   const now = Date.now();
-  const blocks: Block[] = [
-    { id: 'blk-1', minTime: now - 3600000 * 4, maxTime: now - 3600000 * 3, samples: 72000, resolution: '5s' },
-    { id: 'blk-2', minTime: now - 3600000 * 3, maxTime: now - 3600000 * 2, samples: 72000, resolution: '5s' },
-    { id: 'blk-3', minTime: now - 3600000 * 2, maxTime: now - 3600000, samples: 72000, resolution: '5s' },
-    { id: 'head', minTime: now - 3600000, maxTime: now, samples: state.stats?.activeSeries ?? 43000, resolution: '5s' },
-  ];
+  const displayBlocks = (() => {
+    const result: { id: string; node: string; minTime: number; maxTime: number; samples: number }[] = [];
+
+    if (blocks.length > 0) {
+      for (const b of blocks) {
+        result.push({
+          id: b.ulid.substring(0, 8),
+          node: b.node_id,
+          minTime: b.min_time,
+          maxTime: b.max_time,
+          samples: b.num_samples,
+        });
+      }
+    }
+
+    // Always show a head block for current time
+    const headStart = result.length > 0
+      ? Math.max(...result.map((b) => b.maxTime))
+      : now - 3600000;
+    result.push({
+      id: 'head',
+      node: 'all',
+      minTime: headStart,
+      maxTime: now,
+      samples: state.stats?.activeSeries ?? 0,
+    });
+
+    return result;
+  })();
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
@@ -37,50 +79,49 @@ export function RetentionTimeline() {
     ctx.scale(dpr, dpr);
     ctx.clearRect(0, 0, w, h);
 
+    const colors = getCanvasColors(canvas);
     const pad = { top: 16, right: 16, bottom: 24, left: 56 };
     const plotW = w - pad.left - pad.right;
     const plotH = h - pad.top - pad.bottom;
 
-    if (blocks.length === 0) return;
+    if (displayBlocks.length === 0) return;
 
-    const minT = Math.min(...blocks.map((b) => b.minTime));
-    const maxT = Math.max(...blocks.map((b) => b.maxTime));
+    const minT = Math.min(...displayBlocks.map((b) => b.minTime));
+    const maxT = Math.max(...displayBlocks.map((b) => b.maxTime));
     const tRange = maxT - minT || 1;
 
-    const resColors: Record<string, string> = {
-      '5s': '#5c7cfa',
-      '1m': '#22c55e',
-      '1h': '#f59e0b',
-    };
+    // Group blocks by storage node for multi-lane display
+    const nodeIds = [...new Set(displayBlocks.map((b) => b.node))];
+    const laneCount = Math.max(nodeIds.length, 1);
+    const laneH = plotH / laneCount;
 
-    const resLabels = ['5s', '1m', '1h'];
+    const nodeColors = ['#5c7cfa', '#22c55e', '#f59e0b', '#a855f7', '#f97316'];
 
-    // Draw resolution lanes
-    resLabels.forEach((res, lane) => {
-      const laneH = plotH / 3;
+    nodeIds.forEach((nodeId, lane) => {
       const y = pad.top + lane * laneH;
+      const color = nodeColors[lane % nodeColors.length];
 
       // Lane label
-      ctx.fillStyle = 'rgb(var(--color-text-muted))';
-      ctx.font = '10px Inter, sans-serif';
+      ctx.fillStyle = colors.textMuted;
+      ctx.font = '9px Inter, sans-serif';
       ctx.textAlign = 'right';
-      ctx.fillText(res, pad.left - 8, y + laneH / 2 + 3);
+      const label = nodeId === 'all' ? 'head' : nodeId.replace('storage-', 'S');
+      ctx.fillText(label, pad.left - 8, y + laneH / 2 + 3);
 
       // Lane background
       ctx.fillStyle = lane % 2 === 0 ? 'rgba(255,255,255,0.02)' : 'transparent';
       ctx.fillRect(pad.left, y, plotW, laneH);
 
       // Blocks in this lane
-      blocks
-        .filter((b) => b.resolution === res)
+      displayBlocks
+        .filter((b) => b.node === nodeId)
         .forEach((b) => {
           const x1 = pad.left + ((b.minTime - minT) / tRange) * plotW;
           const x2 = pad.left + ((b.maxTime - minT) / tRange) * plotW;
           const bw = Math.max(x2 - x1, 4);
 
-          const color = resColors[res] || '#5c7cfa';
           ctx.fillStyle = color;
-          ctx.globalAlpha = 0.3;
+          ctx.globalAlpha = b.id === 'head' ? 0.5 : 0.3;
           ctx.fillRect(x1 + 1, y + 4, bw - 2, laneH - 8);
           ctx.globalAlpha = 1;
 
@@ -90,7 +131,7 @@ export function RetentionTimeline() {
 
           // Block id
           if (bw > 40) {
-            ctx.fillStyle = 'rgb(var(--color-text-muted))';
+            ctx.fillStyle = colors.textMuted;
             ctx.font = '8px Inter, sans-serif';
             ctx.textAlign = 'center';
             ctx.fillText(b.id, x1 + bw / 2, y + laneH / 2 + 3);
@@ -98,7 +139,7 @@ export function RetentionTimeline() {
         });
 
       // Lane separator
-      ctx.strokeStyle = 'var(--grid-color)';
+      ctx.strokeStyle = colors.gridColor;
       ctx.lineWidth = 0.5;
       ctx.beginPath();
       ctx.moveTo(pad.left, y + laneH);
@@ -112,12 +153,12 @@ export function RetentionTimeline() {
       const t = minT + (i / ticks) * tRange;
       const x = pad.left + (i / ticks) * plotW;
       const d = new Date(t);
-      ctx.fillStyle = 'rgb(var(--color-text-muted))';
+      ctx.fillStyle = colors.textMuted;
       ctx.font = '9px Inter, sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), x, pad.top + plotH + 16);
     }
-  }, [blocks]);
+  }, [displayBlocks]);
 
   useEffect(() => {
     render();
@@ -134,9 +175,9 @@ export function RetentionTimeline() {
   return (
     <div className="card">
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold text-gray-300">Retention Timeline</h3>
-        <span className="text-xs text-gray-500">
-          {state.stats ? `${state.stats.blockCount} blocks` : '--'}
+        <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Retention Timeline</h3>
+        <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
+          {blocks.length > 0 ? `${blocks.length} blocks` : state.stats ? `${state.stats.blockCount} blocks` : '--'}
         </span>
       </div>
       <div ref={containerRef} style={{ height: 160 }}>

@@ -6,7 +6,7 @@ const EXAMPLE_QUERIES = [
   'cpu_usage_percent',
   'rate(http_requests_total[5m])',
   'avg by (host)(cpu_usage_percent)',
-  'memory_used_bytes{host="web-1"}',
+  'memory_usage_bytes{host="web-01"}',
   'sum(http_requests_total)',
 ];
 
@@ -51,8 +51,20 @@ export function QueryEditor() {
             spellCheck={false}
           />
           {showSuggestions && input === '' && (
-            <div className="absolute top-full left-0 right-0 mt-1 z-50 rounded-lg border border-gray-700 bg-gray-900 shadow-xl">
-              <div className="px-3 py-1.5 text-xs text-gray-500 border-b border-gray-800">
+            <div
+              className="absolute top-full left-0 right-0 mt-1 z-50 rounded-lg shadow-xl"
+              style={{
+                border: '1px solid rgb(var(--color-border))',
+                background: 'rgb(var(--color-surface))',
+              }}
+            >
+              <div
+                className="px-3 py-1.5 text-xs"
+                style={{
+                  color: 'rgb(var(--color-text-muted))',
+                  borderBottom: '1px solid rgb(var(--color-border))',
+                }}
+              >
                 Example queries
               </div>
               {EXAMPLE_QUERIES.map((q) => (
@@ -60,7 +72,10 @@ export function QueryEditor() {
                   key={q}
                   type="button"
                   onMouseDown={() => selectSuggestion(q)}
-                  className="block w-full text-left px-3 py-2 font-mono text-sm text-gray-300 hover:bg-gray-800 transition-colors"
+                  className="block w-full text-left px-3 py-2 font-mono text-sm transition-colors"
+                  style={{ color: 'rgb(var(--color-text))' }}
+                  onMouseEnter={(e) => e.currentTarget.style.background = 'rgb(var(--color-text) / 0.06)'}
+                  onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
                 >
                   {q}
                 </button>
@@ -85,7 +100,14 @@ export function QueryEditor() {
       </form>
 
       {state.queryError && (
-        <div className="mt-2 px-3 py-2 rounded-lg bg-red-900/30 border border-red-800 text-red-300 text-sm">
+        <div
+          className="mt-2 px-3 py-2 rounded-lg text-sm"
+          style={{
+            background: 'rgb(var(--color-danger) / 0.1)',
+            border: '1px solid rgb(var(--color-danger) / 0.3)',
+            color: 'rgb(var(--color-danger))',
+          }}
+        >
           {state.queryError}
         </div>
       )}

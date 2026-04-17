@@ -16,22 +16,27 @@ export function MetricExplorer() {
   const [filter, setFilter] = useState('');
 
   useEffect(() => {
-    // Fetch metric names (values of __name__ label)
-    fetch('/api/v1/label/__name__/values')
-      .then((r) => r.json())
-      .then((resp) => {
-        const names = resp?.data ?? resp;
-        if (Array.isArray(names)) {
-          const metas: MetricMeta[] = names.map((name: string) => ({
-            name,
-            type: name.endsWith('_total') ? 'counter' : name.endsWith('_bytes') ? 'gauge' : 'gauge',
-            labels: [],
-            seriesCount: 0,
-          }));
-          setMetrics(metas);
-        }
-      })
-      .catch(() => {});
+    const fetchMetrics = () => {
+      fetch('/api/v1/label/__name__/values')
+        .then((r) => r.json())
+        .then((resp) => {
+          const names = resp?.data ?? resp;
+          if (Array.isArray(names)) {
+            const metas: MetricMeta[] = names.map((name: string) => ({
+              name,
+              type: name.endsWith('_total') ? 'counter' : name.endsWith('_bytes') ? 'gauge' : 'gauge',
+              labels: [],
+              seriesCount: 0,
+            }));
+            setMetrics(metas);
+          }
+        })
+        .catch(() => {});
+    };
+
+    fetchMetrics();
+    const interval = setInterval(fetchMetrics, 10000);
+    return () => clearInterval(interval);
   }, []);
 
   const filtered = metrics.filter((m) =>
@@ -57,8 +62,8 @@ export function MetricExplorer() {
   return (
     <div className="card">
       <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-gray-300">Metric Explorer</h3>
-        <span className="text-xs text-gray-500">{metrics.length} metrics</span>
+        <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Metric Explorer</h3>
+        <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>{metrics.length} metrics</span>
       </div>
       <input
         type="text"
@@ -70,7 +75,7 @@ export function MetricExplorer() {
       <div className="flex gap-3 h-64">
         <div className="w-1/2 overflow-y-auto space-y-0.5 pr-2">
           {filtered.length === 0 && (
-            <div className="text-xs text-gray-600 italic py-4 text-center">
+            <div className="text-xs italic py-4 text-center" style={{ color: 'rgb(var(--color-text-muted))' }}>
               {metrics.length === 0 ? 'Connect to server to browse metrics' : 'No matching metrics'}
             </div>
           )}
@@ -79,13 +84,14 @@ export function MetricExplorer() {
               key={m.name}
               onClick={() => selectMetric(m.name)}
               className={`w-full text-left px-2 py-1.5 rounded text-xs font-mono transition-colors ${
-                selected === m.name
-                  ? 'bg-meridian-600/20 text-meridian-400'
-                  : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
+                selected === m.name ? 'bg-meridian-600/20 text-meridian-400' : ''
               }`}
+              style={selected !== m.name ? { color: 'rgb(var(--color-text))' } : undefined}
+              onMouseEnter={(e) => { if (selected !== m.name) e.currentTarget.style.background = 'rgb(var(--color-text) / 0.08)'; }}
+              onMouseLeave={(e) => { if (selected !== m.name) e.currentTarget.style.background = 'transparent'; }}
             >
               <span>{m.name}</span>
-              <span className="ml-2 text-gray-600">
+              <span className="ml-2" style={{ color: 'rgb(var(--color-text-muted))' }}>
                 {m.type === 'counter' ? 'CNT' : 'GAU'}
               </span>
             </button>
@@ -95,7 +101,7 @@ export function MetricExplorer() {
           {selected && liveData.length > 0 ? (
             <TimeSeriesChart series={liveData} height={240} showLegend={false} />
           ) : (
-            <div className="text-xs text-gray-600 italic">
+            <div className="text-xs italic" style={{ color: 'rgb(var(--color-text-muted))' }}>
               {selected ? 'Waiting for data...' : 'Select a metric'}
             </div>
           )}

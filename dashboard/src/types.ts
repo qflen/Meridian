@@ -57,8 +57,19 @@ export interface ClusterNode {
   id: string;
   address: string;
   state: 'joining' | 'active' | 'leaving' | 'dead';
+  role: 'gateway' | 'ingestor' | 'storage' | 'querier' | 'compactor' | 'unknown';
   series: number;
   samples: number;
+}
+
+export interface BlockInfo {
+  ulid: string;
+  node_id: string;
+  min_time: number;
+  max_time: number;
+  num_samples: number;
+  num_series: number;
+  level: number;
 }
 
 // ── Dashboard state ─────────────────────────────────────────────────

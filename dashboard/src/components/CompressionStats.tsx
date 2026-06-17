@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
+import { compressionRatio } from '../utils/compression';
 
 function formatBytes(b: number): string {
   if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
@@ -15,8 +16,7 @@ export function CompressionStats() {
   const containerRef = useRef<HTMLDivElement>(null);
 
   const stats = state.stats;
-  const ratio =
-    stats && stats.rawBytes > 0 ? stats.rawBytes / stats.compressedBytes : 0;
+  const ratio = stats ? compressionRatio(stats.rawBytes, stats.compressedBytes) : 0;
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;

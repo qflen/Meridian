@@ -17,7 +17,10 @@ export function IngestionMonitor() {
   const lastUpdateRef = useRef(0);
 
   useEffect(() => {
-    if (!stats || !stats.ingestionRate) return;
+    // Record every stats tick, including idle periods. The ingestion rate now
+    // genuinely decays to 0 at idle, and `!stats.ingestionRate` treated that
+    // legitimate 0 as "no data", leaving gaps in the throughput chart.
+    if (!stats) return;
     const now = Date.now();
     if (now - lastUpdateRef.current < 1000) return;
     lastUpdateRef.current = now;

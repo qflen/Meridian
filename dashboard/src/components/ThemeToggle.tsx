@@ -12,7 +12,7 @@ export function ThemeToggle() {
   const setTheme = (theme: Theme) => {
     dispatch({ type: 'SET_THEME', theme });
     const root = document.documentElement;
-    root.classList.remove('dark', 'light', 'high-contrast');
+    root.classList.remove('dark', 'light');
     root.classList.add(theme);
   };
 

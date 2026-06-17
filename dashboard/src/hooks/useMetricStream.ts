@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { useWebSocket } from './useWebSocket';
-import { WSMessage } from '../types';
+import { WSMessage, ConnectionStatus } from '../types';
 
 export function useMetricStream() {
   const { dispatch } = useDashboard();
@@ -24,13 +24,12 @@ export function useMetricStream() {
     [dispatch],
   );
 
-  const handleConnect = useCallback(() => {
-    dispatch({ type: 'SET_CONNECTED', connected: true });
-  }, [dispatch]);
+  const handleStatus = useCallback(
+    (status: ConnectionStatus) => {
+      dispatch({ type: 'SET_CONNECTION_STATUS', status });
+    },
+    [dispatch],
+  );
 
-  const handleDisconnect = useCallback(() => {
-    dispatch({ type: 'SET_CONNECTED', connected: false });
-  }, [dispatch]);
-
-  return useWebSocket('/ws/metrics', handleMessage, handleConnect, handleDisconnect);
+  return useWebSocket('/ws/metrics', handleMessage, handleStatus);
 }

@@ -32,8 +32,12 @@ export function ClusterTopology() {
   const { state, dispatch } = useDashboard();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const animRef = useRef(0);
-  const pulseRef = useRef(0);
+  const rafRef = useRef(0);
+  const nodesRef = useRef<ClusterNode[]>([]);
+
+  const nodes: ClusterNode[] = state.clusterNodes;
+  nodesRef.current = nodes;
+  const theme = state.theme;
 
   // Fetch cluster data from API
   useEffect(() => {
@@ -69,13 +73,15 @@ export function ClusterTopology() {
     };
   }, [dispatch]);
 
-  const nodes: ClusterNode[] = state.clusterNodes;
-
+  // Pure paint pass. Reads the current nodes via a ref so it has no reactive
+  // dependencies and never schedules a follow-up frame — the topology is a
+  // static diagram, repainted on data/theme/resize, not animated.
   const render = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
+    const nodes = nodesRef.current;
 
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth;
@@ -90,7 +96,6 @@ export function ClusterTopology() {
     const cx = w / 2;
     const cy = h / 2;
     const radius = Math.min(w, h) * 0.25;
-    const pulse = Math.sin(pulseRef.current) * 0.5 + 0.5;
 
     // Draw ring
     ctx.strokeStyle = colors.gridColor;
@@ -134,7 +139,7 @@ export function ClusterTopology() {
       if (node.state === 'active') {
         ctx.save();
         ctx.shadowColor = roleColor;
-        ctx.shadowBlur = 10 + pulse * 5;
+        ctx.shadowBlur = 12;
         ctx.fillStyle = roleColor;
         ctx.beginPath();
         ctx.arc(nx, ny, nodeR - 2, 0, Math.PI * 2);
@@ -179,23 +184,41 @@ export function ClusterTopology() {
     ctx.fillStyle = colors.textMuted;
     ctx.font = '10px Inter, sans-serif';
     ctx.fillText('services', cx, cy + 8);
+  }, []);
 
-    pulseRef.current += 0.03;
-    animRef.current = requestAnimationFrame(render);
-  }, [nodes]);
-
-  useEffect(() => {
-    animRef.current = requestAnimationFrame(render);
-    return () => cancelAnimationFrame(animRef.current);
+  // Single coalesced rAF driver: render() never schedules itself, so a repaint
+  // is requested here and at most one frame is ever in flight.
+  const scheduleRender = useCallback(() => {
+    if (rafRef.current !== 0) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      render();
+    });
   }, [render]);
 
+  // Repaint when the cluster data or the theme changes.
+  useEffect(() => {
+    scheduleRender();
+  }, [nodes, theme, scheduleRender]);
+
+  // Repaint on resize. The observer only requests a frame; it must not call
+  // render() directly, which previously started a second concurrent rAF loop
+  // on every resize/theme toggle.
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const ro = new ResizeObserver(() => render());
+    const ro = new ResizeObserver(() => scheduleRender());
     ro.observe(container);
     return () => ro.disconnect();
-  }, [render]);
+  }, [scheduleRender]);
+
+  // Cancel any pending frame on unmount.
+  useEffect(
+    () => () => {
+      if (rafRef.current !== 0) cancelAnimationFrame(rafRef.current);
+    },
+    [],
+  );
 
   return (
     <div className="card h-[294px]">

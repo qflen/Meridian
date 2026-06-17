@@ -103,12 +103,27 @@ flushes on either a size threshold or timeout, whichever comes first.
 ### HTTP & WebSocket
 
 **HTTP Server** (`internal/server/http.go`): REST API for queries, label
-browsing, and health checks. Serves the dashboard SPA with embedded static
-files.
+browsing, and health checks, plus the dashboard SPA. Hardened at the boundary: a
+traversal guard rejects any `..` path with 400 before `http.ServeMux` can clean and
+redirect it, and static reads are confined to the dashboard directory;
+`/api/v1/query` runs under a configurable deadline (`server.query_timeout`) with
+`start ≤ end` validation, strict `start`/`end`/`step` parsing, and a panic-recovery
+guard; and CORS echoes only configured origins — default localhost, never `*`
+(ADR-018). `/api/v1/cluster` probes peers concurrently under a request-scoped
+deadline and reports each reachable peer's real series/samples, or — in single-node
+mode — just the one real node.
 
 **WebSocket Hub** (`internal/server/websocket.go`): Broadcasts live metrics and
-system stats to connected dashboard clients. Supports metric subscription and
-server stats streams.
+system stats to connected dashboard clients. Each tick's payload is marshaled once
+and the same bytes are sent to every client; a client whose send buffer stays full
+across `maxClientDrops` consecutive broadcasts is force-disconnected so a stalled
+reader cannot linger and leak its read/write goroutines.
+
+**Metrics** (`internal/server/metrics.go`): shared Prometheus exposition helpers.
+The monolith and all five microservices serve `/metrics`; storage nodes expose the
+full storage metric set, and the cumulative `meridian_samples_ingested_total` counter
+is kept distinct from the windowed ingestion rate reported on `/api/v1/stats`
+(ADR-017, ADR-019).
 
 ### Cluster
 

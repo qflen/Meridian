@@ -89,9 +89,20 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
 - **Themes**: dark, light, high-contrast
 
 ### Observability
-- **`/metrics`**: Prometheus exposition format (head/block stats, samples ingested, out-of-order samples rejected, query-latency histogram, compression ratio, WS client count, uptime)
+- **`/metrics`**: Prometheus exposition on **every** node — the monolith and each
+  microservice (gateway, querier, storage, ingestor, compactor) — so a docker-compose
+  cluster is scrapeable end-to-end, not just the monolith. Storage nodes expose the
+  full storage metrics (cumulative `meridian_samples_ingested_total`, out-of-order
+  samples rejected, head/block stats, storage bytes by layer, compression ratio,
+  query-latency histogram); the gateway also reports connected WebSocket clients; and
+  every service exposes `meridian_up` and uptime. (ADR-019.)
 - **`/health`**: liveness probe for orchestrators
-- **`/api/v1/stats`**: JSON snapshot of storage, WAL, ingestion, compression
+- **`/api/v1/stats`**: JSON snapshot of storage, WAL, ingestion, compression. The
+  `ingestion_rate` field is a live **samples/sec rate** averaged over a short rolling
+  window (it tracks load and falls back to ~0 when idle); the monotonic cumulative
+  count lives in the `meridian_samples_ingested_total` counter. (ADR-017.)
+- **Single-node honesty**: in default single-node `serve`, `/api/v1/cluster` reports
+  exactly the one real node rather than fabricating zero-stat peers.
 
 ### Operations
 - **Retention enforcement**: TTL-based block deletion
@@ -143,12 +154,29 @@ websocat "ws://localhost:8080/ws/metrics"
 
 See [PROTOCOL.md](PROTOCOL.md) for the full wire protocol.
 
+### CORS & request safety
+
+- **CORS**: cross-origin browser requests are allowed only from configured origins.
+  The default permits `localhost` / `127.0.0.1` / `[::1]` (the dashboard and its dev
+  server) and nothing else — not `*`. Widen it with `server.allowed_origins`
+  (monolith) or `GATEWAY_ALLOWED_ORIGINS` (gateway); a single `"*"` re-enables
+  allow-all for trusted networks. (ADR-018.)
+- **Query limits**: `/api/v1/query` runs under a deadline (`server.query_timeout`,
+  default 30s), validates `start ≤ end`, rejects malformed `start`/`end`/`step` with
+  400, and recovers a panic into a 500 (the engine separately caps the step count).
+- **Static serving**: non-API paths are confined to the dashboard directory;
+  directory-traversal attempts (`..`, percent-encoded or not) return 400 and never
+  escape it.
+
 ## Configuration
 
 Meridian reads `meridian.yaml` if present; unknown fields fall back to defaults.
 Durations accept `ns`, `us`, `ms`, `s`, `m`, `h`, plus `d` (days) and `w` (weeks):
 
 ```yaml
+server:
+  query_timeout: "30s"    # max execution time for a single /api/v1/query
+  allowed_origins: []     # CORS allow-list; empty = localhost only, ["*"] = all
 storage:
   block_duration: "15m"   # flush head to a compressed block this often
   retention:      "15d"   # drop blocks older than this
@@ -189,7 +217,8 @@ dashboard/          React + TypeScript + Tailwind + Canvas
 See [DECISIONS.md](DECISIONS.md) for the ADRs covering key trade-offs:
 Gorilla vs generic compression, sorted slices vs roaring bitmaps, JSON vs protobuf
 ingestion, rAF batching for WebSocket, the out-of-order sample policy, the
-crash-consistent flush model, and more.
+crash-consistent flush model, the windowed ingestion-rate vs cumulative counter, the
+CORS policy, cluster-wide `/metrics`, and more.
 
 ## Development
 

@@ -1,14 +1,9 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
+import { canvasFont } from '../utils/canvasFont';
 import { compressionRatio } from '../utils/compression';
-
-function formatBytes(b: number): string {
-  if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
-  if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';
-  if (b >= 1e3) return (b / 1e3).toFixed(2) + ' KB';
-  return b + ' B';
-}
+import { formatBytes } from '../utils/format';
 
 export function CompressionStats() {
   const { state } = useDashboard();
@@ -38,26 +33,22 @@ export function CompressionStats() {
     const r = Math.min(w, h) * 0.35;
 
     // Background arc
-    ctx.lineWidth = 12;
+    ctx.lineWidth = 10;
     ctx.lineCap = 'round';
     ctx.strokeStyle = colors.gridColor;
     ctx.beginPath();
     ctx.arc(cx, cy, r, Math.PI * 0.8, Math.PI * 2.2);
     ctx.stroke();
 
-    // Ratio arc (~30x covers well-populated head + flushed blocks)
+    // Ratio arc — the sweep length encodes the ratio; the color is the single
+    // accent, not a decorative rainbow. (~30x covers head + flushed blocks.)
     const maxRatio = 30;
     const progress = Math.min(ratio / maxRatio, 1);
     const startAngle = Math.PI * 0.8;
     const endAngle = startAngle + progress * Math.PI * 1.4;
 
-    const gradient = ctx.createLinearGradient(cx - r, cy, cx + r, cy);
-    gradient.addColorStop(0, '#5c7cfa');
-    gradient.addColorStop(0.5, '#22c55e');
-    gradient.addColorStop(1, '#f59e0b');
-
-    ctx.strokeStyle = gradient;
-    ctx.lineWidth = 12;
+    ctx.strokeStyle = colors.accent;
+    ctx.lineWidth = 10;
     ctx.lineCap = 'round';
     ctx.beginPath();
     ctx.arc(cx, cy, r, startAngle, endAngle);
@@ -65,11 +56,11 @@ export function CompressionStats() {
 
     // Center text
     ctx.fillStyle = colors.text;
-    ctx.font = 'bold 22px Inter, sans-serif';
+    ctx.font = canvasFont(22, { weight: 600 });
     ctx.textAlign = 'center';
     ctx.fillText(ratio > 0 ? `${ratio.toFixed(1)}x` : '--', cx, cy + 2);
     ctx.fillStyle = colors.textMuted;
-    ctx.font = '10px Inter, sans-serif';
+    ctx.font = canvasFont(10, { family: 'sans' });
     ctx.fillText('compression ratio', cx, cy + 18);
   }, [ratio]);
 
@@ -87,19 +78,19 @@ export function CompressionStats() {
 
   return (
     <div className="card">
-      <h3 className="text-sm font-semibold mb-2" style={{ color: 'rgb(var(--color-text))' }}>Gorilla Compression</h3>
+      <h3 className="text-sm font-semibold mb-2">Gorilla Compression</h3>
       <div ref={containerRef} style={{ height: 160 }}>
         <canvas ref={canvasRef} className="w-full h-full" style={{ height: 160 }} />
       </div>
       <div className="grid grid-cols-2 gap-3 mt-2">
         <div className="text-center">
-          <div className="text-sm font-bold" style={{ color: 'rgb(var(--color-text))' }}>
+          <div className="text-sm font-bold font-mono tabular-nums text-text">
             {stats ? formatBytes(stats.rawBytes) : '--'}
           </div>
           <div className="stat-label">raw size</div>
         </div>
         <div className="text-center">
-          <div className="text-sm font-bold text-meridian-400">
+          <div className="text-sm font-bold font-mono tabular-nums text-accent">
             {stats ? formatBytes(stats.compressedBytes) : '--'}
           </div>
           <div className="stat-label">compressed</div>

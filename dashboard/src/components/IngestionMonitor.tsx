@@ -2,13 +2,7 @@ import { useDashboard } from '../state/DashboardContext';
 import { TimeSeriesChart } from './TimeSeriesChart';
 import { useRef, useEffect, useState } from 'react';
 import { Sample } from '../types';
-
-function formatBytes(b: number): string {
-  if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB';
-  if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB';
-  if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB';
-  return b + ' B';
-}
+import { formatBytes } from '../utils/format';
 
 export function IngestionMonitor() {
   const { state } = useDashboard();
@@ -33,7 +27,7 @@ export function IngestionMonitor() {
 
   return (
     <div className="card">
-      <h3 className="text-sm font-semibold mb-3" style={{ color: 'rgb(var(--color-text))' }}>Ingestion Monitor</h3>
+      <h3 className="text-sm font-semibold mb-3">Ingestion Monitor</h3>
       <div className="grid grid-cols-4 gap-4 mb-4">
         <div>
           <div className="stat-value">{stats ? stats.ingestionRate.toLocaleString() : '--'}</div>

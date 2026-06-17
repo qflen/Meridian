@@ -2,21 +2,19 @@ import { useRef, useEffect, useCallback } from 'react';
 import { ClusterNode } from '../types';
 import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
+import { canvasFont } from '../utils/canvasFont';
+import { CATEGORICAL } from '../utils/chartPalette';
 
-const STATE_COLORS: Record<string, string> = {
-  active: '#22c55e',
-  joining: '#f59e0b',
-  leaving: '#f97316',
-  dead: '#ef4444',
-};
-
+// Roles draw from the shared muted categorical palette; node STATE
+// (active/dead/…) is colored from the status tokens inside render() so it
+// tracks the theme.
 const ROLE_COLORS: Record<string, string> = {
-  gateway: '#5c7cfa',
-  ingestor: '#f59e0b',
-  storage: '#22c55e',
-  querier: '#a855f7',
-  compactor: '#f97316',
-  unknown: '#666666',
+  gateway: CATEGORICAL[1],   // slate blue
+  ingestor: CATEGORICAL[0],  // brass amber
+  storage: CATEGORICAL[2],   // sage green
+  querier: CATEGORICAL[3],   // muted orchid
+  compactor: CATEGORICAL[4], // clay
+  unknown: '#8A8F99',
 };
 
 const ROLE_ICONS: Record<string, string> = {
@@ -117,7 +115,7 @@ export function ClusterTopology() {
       for (const sn of storageNodes) {
         const si = nodes.indexOf(sn);
         const a2 = (si / nodes.length) * Math.PI * 2 - Math.PI / 2;
-        const roleColor = ROLE_COLORS[other.role] || '#5c7cfa';
+        const roleColor = ROLE_COLORS[other.role] || ROLE_COLORS.unknown;
         ctx.strokeStyle = roleColor + '22'; // very transparent
         ctx.beginPath();
         ctx.moveTo(cx + Math.cos(a1) * radius, cy + Math.sin(a1) * radius);
@@ -131,43 +129,36 @@ export function ClusterTopology() {
       const angle = (i / nodes.length) * Math.PI * 2 - Math.PI / 2;
       const nx = cx + Math.cos(angle) * radius;
       const ny = cy + Math.sin(angle) * radius;
-      const stateColor = STATE_COLORS[node.state] || '#666';
-      const roleColor = ROLE_COLORS[node.role] || '#666';
+      const stateColor =
+        node.state === 'active'
+          ? colors.success
+          : node.state === 'dead'
+            ? colors.danger
+            : colors.warning; // joining / leaving
+      const roleColor = ROLE_COLORS[node.role] || ROLE_COLORS.unknown;
       const nodeR = node.state === 'active' ? 10 : 7;
 
-      // Glow for active nodes
-      if (node.state === 'active') {
-        ctx.save();
-        ctx.shadowColor = roleColor;
-        ctx.shadowBlur = 12;
-        ctx.fillStyle = roleColor;
-        ctx.beginPath();
-        ctx.arc(nx, ny, nodeR - 2, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      }
-
-      // Node circle with role color
+      // Node circle: role color when active, status color otherwise
       ctx.fillStyle = node.state === 'active' ? roleColor : stateColor;
       ctx.beginPath();
       ctx.arc(nx, ny, nodeR, 0, Math.PI * 2);
       ctx.fill();
 
-      // Border
-      ctx.strokeStyle = 'rgba(0,0,0,0.3)';
-      ctx.lineWidth = 1.5;
+      // Hairline border
+      ctx.strokeStyle = colors.border;
+      ctx.lineWidth = 1;
       ctx.stroke();
 
       // Role abbreviation inside the circle
       ctx.fillStyle = '#fff';
-      ctx.font = `bold ${nodeR > 8 ? 8 : 7}px Inter, sans-serif`;
+      ctx.font = canvasFont(nodeR > 8 ? 8 : 7, { weight: 600 });
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(ROLE_ICONS[node.role] || '??', nx, ny);
 
       // Label below/above
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '10px Inter, sans-serif';
+      ctx.font = canvasFont(10, { family: 'sans' });
       ctx.textAlign = 'center';
       ctx.textBaseline = 'alphabetic';
       const labelGap = nodeR + 14;
@@ -177,12 +168,12 @@ export function ClusterTopology() {
 
     // Center label
     ctx.fillStyle = colors.text;
-    ctx.font = 'bold 14px Inter, sans-serif';
+    ctx.font = canvasFont(14, { weight: 600 });
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(`${nodes.length}`, cx, cy - 6);
     ctx.fillStyle = colors.textMuted;
-    ctx.font = '10px Inter, sans-serif';
+    ctx.font = canvasFont(10, { family: 'sans' });
     ctx.fillText('services', cx, cy + 8);
   }, []);
 
@@ -222,7 +213,7 @@ export function ClusterTopology() {
 
   return (
     <div className="card h-[294px]">
-      <h3 className="text-sm font-semibold mb-2" style={{ color: 'rgb(var(--color-text))' }}>Cluster Topology</h3>
+      <h3 className="text-sm font-semibold mb-2">Cluster Topology</h3>
       <div ref={containerRef} className="w-full" style={{ height: 180 }}>
         <canvas ref={canvasRef} className="w-full h-full" style={{ height: 180 }} />
       </div>
@@ -235,7 +226,7 @@ export function ClusterTopology() {
                 className="inline-block w-2 h-2 rounded-full"
                 style={{ backgroundColor: color }}
               />
-              <span className="text-xs capitalize" style={{ color: 'rgb(var(--color-text-muted))' }}>{role}</span>
+              <span className="text-xs capitalize text-muted">{role}</span>
             </div>
           ))}
       </div>

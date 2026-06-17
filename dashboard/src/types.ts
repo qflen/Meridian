@@ -81,6 +81,14 @@ export interface TimeRange {
   end: number;
 }
 
+/**
+ * Live connection state surfaced by the header indicator:
+ *  - `connecting`    — initial attempt, before the first open
+ *  - `connected`     — socket is open and streaming
+ *  - `reconnecting`  — dropped, retrying with exponential backoff
+ */
+export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting';
+
 export interface DashboardState {
   theme: Theme;
   timeRange: TimeRange;
@@ -92,7 +100,7 @@ export interface DashboardState {
   stats: WSStatsMessage | null;
   liveMetrics: Map<string, Sample[]>;
   clusterNodes: ClusterNode[];
-  connected: boolean;
+  connectionStatus: ConnectionStatus;
 }
 
 export type DashboardAction =
@@ -106,4 +114,4 @@ export type DashboardAction =
   | { type: 'SET_STATS'; stats: WSStatsMessage }
   | { type: 'ADD_LIVE_METRIC'; key: string; sample: Sample }
   | { type: 'SET_CLUSTER_NODES'; nodes: ClusterNode[] }
-  | { type: 'SET_CONNECTED'; connected: boolean };
+  | { type: 'SET_CONNECTION_STATUS'; status: ConnectionStatus };

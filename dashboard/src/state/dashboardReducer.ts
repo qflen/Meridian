@@ -16,7 +16,7 @@ export const initialState: DashboardState = {
   stats: null,
   liveMetrics: new Map(),
   clusterNodes: [],
-  connected: false,
+  connectionStatus: 'connecting',
 };
 
 export function dashboardReducer(
@@ -62,8 +62,8 @@ export function dashboardReducer(
     case 'SET_CLUSTER_NODES':
       return { ...state, clusterNodes: action.nodes };
 
-    case 'SET_CONNECTED':
-      return { ...state, connected: action.connected };
+    case 'SET_CONNECTION_STATUS':
+      return { ...state, connectionStatus: action.status };
 
     default:
       return state;

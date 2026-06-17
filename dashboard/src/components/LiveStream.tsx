@@ -38,7 +38,7 @@ export function LiveStream() {
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Live Stream</h3>
         <div className="flex items-center gap-2">
-          {state.connected ? (
+          {state.connectionStatus === 'connected' ? (
             <span className="flex items-center gap-1.5 text-xs" style={{ color: 'rgb(var(--color-success))' }}>
               <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: 'rgb(var(--color-success))' }} />
               Connected
@@ -46,7 +46,7 @@ export function LiveStream() {
           ) : (
             <span className="flex items-center gap-1.5 text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
               <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'rgb(var(--color-text-muted))' }} />
-              Disconnected
+              {state.connectionStatus === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}
             </span>
           )}
         </div>

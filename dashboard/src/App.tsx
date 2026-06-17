@@ -11,6 +11,29 @@ import { LatencyHistogram } from './components/LatencyHistogram';
 import { RetentionTimeline } from './components/RetentionTimeline';
 import { LiveStream } from './components/LiveStream';
 import { ThemeToggle } from './components/ThemeToggle';
+import { ConnectionStatus } from './types';
+
+function connectionDotColor(status: ConnectionStatus): string {
+  switch (status) {
+    case 'connected':
+      return 'rgb(var(--color-success))';
+    case 'reconnecting':
+      return 'rgb(var(--color-warning))';
+    default:
+      return 'rgb(var(--color-text-muted))';
+  }
+}
+
+function connectionLabel(status: ConnectionStatus): string {
+  switch (status) {
+    case 'connected':
+      return 'Live';
+    case 'reconnecting':
+      return 'Reconnecting…';
+    default:
+      return 'Connecting…';
+  }
+}
 
 function Dashboard() {
   const { state } = useDashboard();
@@ -82,21 +105,23 @@ function Dashboard() {
               )}
             </div>
 
-            {/* Connection status */}
+            {/* Connection status — third "reconnecting" state reuses the dot */}
             <div className="flex items-center gap-1.5">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  state.connected ? 'animate-pulse' : ''
+                  state.connectionStatus === 'connected' || state.connectionStatus === 'reconnecting'
+                    ? 'animate-pulse'
+                    : ''
                 }`}
-                style={{ backgroundColor: state.connected ? 'rgb(var(--color-success))' : 'rgb(var(--color-text-muted))' }}
+                style={{ backgroundColor: connectionDotColor(state.connectionStatus) }}
               />
               <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
-                {state.connected ? 'Live' : 'Offline'}
+                {connectionLabel(state.connectionStatus)}
               </span>
             </div>
 
             {/* Uptime */}
-            {state.stats && (
+            {state.stats && Number.isFinite(state.stats.uptimeSeconds) && (
               <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
                 Up {Math.floor(state.stats.uptimeSeconds / 60)}m
               </span>

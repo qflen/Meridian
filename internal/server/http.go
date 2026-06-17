@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/meridiandb/meridian/internal/query"
@@ -21,6 +23,11 @@ import (
 // defaultQueryTimeout bounds how long a single /api/v1/query may run before the
 // engine context is cancelled. It is configurable via SetQueryTimeout.
 const defaultQueryTimeout = 30 * time.Second
+
+// clusterProbeTimeout is the overall deadline for probing all peers in one
+// /api/v1/cluster request. Peers are probed concurrently, so this bounds the whole
+// fan-out rather than each peer serially.
+const clusterProbeTimeout = 2 * time.Second
 
 // HTTPServer serves the REST API, dashboard, and WebSocket endpoints.
 type HTTPServer struct {
@@ -430,48 +437,112 @@ func promBucketUpperBound(label string) (string, float64) {
 
 func (s *HTTPServer) handleCluster(w http.ResponseWriter, r *http.Request) {
 	stats := s.db.Stats()
-	nodes := []map[string]interface{}{
-		{
-			"id":      s.nodeID,
-			"addr":    "localhost",
-			"state":   "active",
-			"role":    "storage",
-			"series":  stats.TotalSeries,
-			"samples": stats.TotalSamples,
-		},
+	self := map[string]interface{}{
+		"id":      s.nodeID,
+		"addr":    "localhost",
+		"state":   "active",
+		"role":    "storage",
+		"series":  stats.TotalSeries,
+		"samples": stats.TotalSamples,
 	}
 
-	// Probe configured peers for cluster-wide view
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	for _, peer := range s.peerAddrs {
-		resp, err := client.Get(fmt.Sprintf("http://%s/health", peer))
-		if err != nil {
-			nodes = append(nodes, map[string]interface{}{
-				"id": peer, "addr": peer, "state": "dead", "role": "storage", "series": 0, "samples": 0,
-			})
-			continue
-		}
-		var health struct {
-			NodeID string `json:"node_id"`
-			Status string `json:"status"`
-		}
-		json.NewDecoder(resp.Body).Decode(&health)
-		resp.Body.Close()
-
-		peerState := "dead"
-		if health.Status == "ok" {
-			peerState = "active"
-		}
-		id := health.NodeID
-		if id == "" {
-			id = peer
-		}
-		nodes = append(nodes, map[string]interface{}{
-			"id": id, "addr": peer, "state": peerState, "role": "storage", "series": 0, "samples": 0,
-		})
+	// Single-node serve mode has no peers: report exactly the one real node rather
+	// than fabricating a cluster with hardcoded zero-stat peers.
+	if len(s.peerAddrs) == 0 {
+		writeJSON(w, map[string]interface{}{"nodes": []map[string]interface{}{self}})
+		return
 	}
 
+	// Probe peers concurrently under one overall deadline tied to the request,
+	// instead of serially blocking up to 500ms per peer.
+	ctx, cancel := context.WithTimeout(r.Context(), clusterProbeTimeout)
+	defer cancel()
+
+	peers := make([]map[string]interface{}, len(s.peerAddrs))
+	var wg sync.WaitGroup
+	for i, peer := range s.peerAddrs {
+		wg.Add(1)
+		go func(i int, peer string) {
+			defer wg.Done()
+			peers[i] = s.probePeer(ctx, peer)
+		}(i, peer)
+	}
+	wg.Wait()
+
+	nodes := make([]map[string]interface{}, 0, len(peers)+1)
+	nodes = append(nodes, self)
+	nodes = append(nodes, peers...)
 	writeJSON(w, map[string]interface{}{"nodes": nodes})
+}
+
+// probePeer fetches a peer's liveness and real stats. A reachable peer reports its
+// actual series/samples rather than fabricated zeros; an unreachable one is marked
+// dead.
+func (s *HTTPServer) probePeer(ctx context.Context, peer string) map[string]interface{} {
+	node := map[string]interface{}{
+		"id": peer, "addr": peer, "state": "dead", "role": "storage", "series": 0, "samples": 0,
+	}
+	id, ok := s.peerHealth(ctx, peer)
+	if !ok {
+		return node
+	}
+	node["state"] = "active"
+	if id != "" {
+		node["id"] = id
+	}
+	if series, samples, ok := s.peerStats(ctx, peer); ok {
+		node["series"] = series
+		node["samples"] = samples
+	}
+	return node
+}
+
+func (s *HTTPServer) peerHealth(ctx context.Context, peer string) (string, bool) {
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/health", peer), nil)
+	if err != nil {
+		return "", false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return "", false
+	}
+	var h struct {
+		NodeID string `json:"node_id"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+		return "", false
+	}
+	return h.NodeID, h.Status == "ok"
+}
+
+func (s *HTTPServer) peerStats(ctx context.Context, peer string) (int, int64, bool) {
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://%s/api/v1/stats", peer), nil)
+	if err != nil {
+		return 0, 0, false
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return 0, 0, false
+	}
+	var st struct {
+		TotalSeries  int   `json:"total_series"`
+		TotalSamples int64 `json:"total_samples"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return 0, 0, false
+	}
+	return st.TotalSeries, st.TotalSamples, true
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

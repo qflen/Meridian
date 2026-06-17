@@ -331,6 +331,35 @@ func (b *Block) Dir() string {
 	return b.dir
 }
 
+// LabelNames returns the sorted label names present in this block's index
+// (including "__name__").
+func (b *Block) LabelNames() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	names := make([]string, 0, len(b.index))
+	for name := range b.index {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// LabelValues returns the sorted values for a label name in this block's index.
+func (b *Block) LabelValues(name string) []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	vals, ok := b.index[name]
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(vals))
+	for v := range vals {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Overlaps returns true if the block's time range overlaps [minT, maxT].
 func (b *Block) Overlaps(minT, maxT int64) bool {
 	return b.meta.MinTime <= maxT && b.meta.MaxTime >= minT

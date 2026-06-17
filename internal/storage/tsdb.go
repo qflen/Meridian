@@ -657,14 +657,57 @@ func (db *TSDB) CompressionRatio() float64 {
 	return float64(stats.StorageBytesRaw) / float64(stats.ChunkBytes)
 }
 
-// LabelNames returns all known label names in the current head.
+// LabelNames returns all known label names across the head and every persisted
+// block. Consulting the blocks (not just the head) is what keeps block-only series'
+// labels visible after a flush has emptied the head.
 func (db *TSDB) LabelNames() []string {
-	return db.Head().index.LabelNames()
+	db.mu.RLock()
+	head := db.head
+	blocks := make([]*Block, len(db.blocks))
+	copy(blocks, db.blocks)
+	db.mu.RUnlock()
+
+	set := make(map[string]struct{})
+	for _, n := range head.index.LabelNames() {
+		set[n] = struct{}{}
+	}
+	for _, b := range blocks {
+		for _, n := range b.LabelNames() {
+			set[n] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for n := range set {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
-// LabelValues returns known values for a label name in the current head.
+// LabelValues returns known values for a label name across the head and every
+// persisted block, so block-only values survive a flush.
 func (db *TSDB) LabelValues(name string) []string {
-	return db.Head().index.LabelValues(name)
+	db.mu.RLock()
+	head := db.head
+	blocks := make([]*Block, len(db.blocks))
+	copy(blocks, db.blocks)
+	db.mu.RUnlock()
+
+	set := make(map[string]struct{})
+	for _, v := range head.index.LabelValues(name) {
+		set[v] = struct{}{}
+	}
+	for _, b := range blocks {
+		for _, v := range b.LabelValues(name) {
+			set[v] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for v := range set {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // validateSeriesLabels enforces the size limits required so names and labels

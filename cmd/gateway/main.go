@@ -26,6 +26,7 @@ func main() {
 	ingestorAddrs := strings.Split(envOrDefault("INGESTOR_ADDRS", "localhost:8083"), ",")
 	storageAddrs := strings.Split(envOrDefault("STORAGE_ADDRS", "localhost:8081"), ",")
 	nodeID := envOrDefault("GATEWAY_NODE_ID", "gateway-1")
+	allowedOrigins := splitOrigins(envOrDefault("GATEWAY_ALLOWED_ORIGINS", ""))
 
 	sc := service.NewStorageClient(storageAddrs)
 
@@ -46,7 +47,7 @@ func main() {
 	mux := http.NewServeMux()
 	gw.registerRoutes(mux)
 
-	httpServer := &http.Server{Addr: httpAddr, Handler: corsMiddleware(mux)}
+	httpServer := &http.Server{Addr: httpAddr, Handler: server.CORSMiddleware(allowedOrigins, mux)}
 
 	// Background: broadcast stats to WebSocket clients
 	go gw.broadcastLoop()
@@ -381,22 +382,25 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
+}
+
+// splitOrigins parses a comma-separated origin list, dropping blanks. An empty input
+// yields nil so the CORS policy falls back to its localhost-only default.
+func splitOrigins(s string) []string {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

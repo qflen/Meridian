@@ -119,19 +119,55 @@ func (s *HTTPServer) registerRoutes() {
 	s.mux.HandleFunc("/metrics", s.handlePromMetrics)
 	s.mux.HandleFunc("/ws/metrics", s.handleWSMetrics)
 
-	// Serve dashboard static files
+	// Serve dashboard static files. Hashed bundle assets are served straight from
+	// the traversal-safe http.Dir file server; every other non-API path goes through
+	// newStaticHandler, which rejects directory traversal and falls back to the SPA
+	// shell for client-side routes.
 	dashboardDir := findDashboardDir()
 	if dashboardDir != "" {
-		fs := http.FileServer(http.Dir(dashboardDir))
-		s.mux.Handle("/assets/", fs)
-		s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/" || !fileExists(filepath.Join(dashboardDir, r.URL.Path)) {
-				http.ServeFile(w, r, filepath.Join(dashboardDir, "index.html"))
-				return
-			}
-			fs.ServeHTTP(w, r)
-		})
+		s.mux.Handle("/assets/", http.FileServer(http.Dir(dashboardDir)))
+		s.mux.Handle("/", newStaticHandler(dashboardDir))
 	}
+}
+
+// newStaticHandler serves the dashboard's static files, falling back to the SPA
+// shell (index.html) for client-side routes. It is hardened against directory
+// traversal: any request whose (already percent-decoded) path contains a ".."
+// element is rejected with 400, and every file read is confined to dashboardDir via
+// http.Dir, so "/../../../../etc/passwd" or its "%2e%2e%2f" encoding can never escape
+// the dashboard directory.
+func newStaticHandler(dashboardDir string) http.Handler {
+	fileServer := http.FileServer(http.Dir(dashboardDir))
+	index := filepath.Join(dashboardDir, "index.html")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if containsDotDot(r.URL.Path) {
+			http.Error(w, "invalid URL path", http.StatusBadRequest)
+			return
+		}
+		// Serve an existing file from inside the dashboard dir; otherwise return the
+		// SPA shell so client-side routes resolve. The ".." guard above plus http.Dir
+		// keep both branches confined to dashboardDir.
+		if r.URL.Path != "/" && fileExists(filepath.Join(dashboardDir, filepath.FromSlash(r.URL.Path))) {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		http.ServeFile(w, r, index)
+	})
+}
+
+// containsDotDot reports whether v contains a ".." path element. net/http
+// percent-decodes r.URL.Path before handlers run, so this also catches encoded forms
+// such as "%2e%2e%2f".
+func containsDotDot(v string) bool {
+	if !strings.Contains(v, "..") {
+		return false
+	}
+	for _, ent := range strings.FieldsFunc(v, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if ent == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *HTTPServer) corsMiddleware(next http.Handler) http.Handler {

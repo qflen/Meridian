@@ -18,9 +18,10 @@ dashboard/dist/
 /querier
 /storage
 
-# Local tooling and session scratch files
+# Local tooling and planning/scratch files (never committed)
 .claude/
 CLAUDE.md
+PLAN.md
 NEXT_SESSION_PROMPT.md
 .vscode/
 .idea/

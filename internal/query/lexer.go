@@ -47,6 +47,8 @@ const (
 	TokenNRE
 	// TokenBy is the 'by' keyword.
 	TokenBy
+	// TokenWithout is the 'without' keyword.
+	TokenWithout
 	// TokenPlus is '+'.
 	TokenPlus
 	// TokenMinus is '-'.
@@ -250,8 +252,11 @@ func (l *Lexer) readIdent() (Token, error) {
 	}
 	lit := l.input[startPos:l.pos]
 
-	if lit == "by" {
+	switch lit {
+	case "by":
 		return Token{Type: TokenBy, Literal: lit, Pos: startPos}, nil
+	case "without":
+		return Token{Type: TokenWithout, Literal: lit, Pos: startPos}, nil
 	}
 
 	return Token{Type: TokenIdent, Literal: lit, Pos: startPos}, nil

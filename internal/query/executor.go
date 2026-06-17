@@ -161,52 +161,169 @@ func (e *Engine) evalAggregate(ctx context.Context, ae *AggregateExpr, start, en
 		return nil, err
 	}
 
-	if len(ae.Grouping) == 0 {
-		// Aggregate all series into one
-		var allPoints [][]storage.Point
-		for _, s := range series {
-			allPoints = append(allPoints, s.Points)
+	// topk/bottomk select whole series rather than collapsing them.
+	if ae.Op == "topk" || ae.Op == "bottomk" {
+		k := 0
+		if ae.Param != nil {
+			pv, err := e.eval(ctx, ae.Param, start, end)
+			if err != nil {
+				return nil, err
+			}
+			k = int(scalarValue(pv))
 		}
-		agg := aggregateFunc(ae.Op, allPoints)
+		return e.evalTopK(ae.Op, k, series, ae.Grouping, ae.Without), nil
+	}
+
+	// Plain aggregation with no grouping collapses everything into one series.
+	if len(ae.Grouping) == 0 && !ae.Without {
+		groupPoints := make([][]storage.Point, len(series))
+		for i, s := range series {
+			groupPoints[i] = s.Points
+		}
+		agg := aggregateFunc(ae.Op, groupPoints)
 		if len(agg) == 0 {
 			return nil, nil
 		}
-		return []ResultSeries{{
-			Name:   "",
-			Labels: map[string]string{},
-			Points: agg,
-		}}, nil
+		return []ResultSeries{{Name: "", Labels: map[string]string{}, Points: agg}}, nil
 	}
 
-	// Group by specified labels
-	groups := make(map[string][]int) // group key → series indexes
-	for i, s := range series {
-		key := groupKey(s.Labels, ae.Grouping)
-		groups[key] = append(groups[key], i)
+	// Group by an include-list (by) or exclude-list (without).
+	type group struct {
+		labels map[string]string
+		points [][]storage.Point
 	}
+	groups := make(map[string]*group)
+	for _, s := range series {
+		gl := groupingLabels(s.Labels, ae.Grouping, ae.Without)
+		key := labelSignature(gl)
+		g, ok := groups[key]
+		if !ok {
+			g = &group{labels: gl}
+			groups[key] = g
+		}
+		g.points = append(g.points, s.Points)
+	}
+
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic output order
 
 	var results []ResultSeries
-	for _, idxs := range groups {
-		var groupPoints [][]storage.Point
-		groupLabels := make(map[string]string)
-		for _, label := range ae.Grouping {
-			if v, ok := series[idxs[0]].Labels[label]; ok {
-				groupLabels[label] = v
-			}
-		}
-		for _, idx := range idxs {
-			groupPoints = append(groupPoints, series[idx].Points)
-		}
-		agg := aggregateFunc(ae.Op, groupPoints)
+	for _, key := range keys {
+		g := groups[key]
+		agg := aggregateFunc(ae.Op, g.points)
 		if len(agg) > 0 {
-			results = append(results, ResultSeries{
-				Name:   "",
-				Labels: groupLabels,
-				Points: agg,
-			})
+			results = append(results, ResultSeries{Name: "", Labels: g.labels, Points: agg})
 		}
 	}
 	return results, nil
+}
+
+// groupingLabels computes the label set that identifies a series' aggregation
+// group. For by(), it keeps exactly the listed labels (empty string when a label
+// is absent, so the group is well-formed). For without(), it keeps every label
+// except the listed ones and the metric name.
+func groupingLabels(labels map[string]string, grouping []string, without bool) map[string]string {
+	out := map[string]string{}
+	if without {
+		excluded := map[string]bool{"__name__": true}
+		for _, g := range grouping {
+			excluded[g] = true
+		}
+		for k, v := range labels {
+			if !excluded[k] {
+				out[k] = v
+			}
+		}
+		return out
+	}
+	for _, g := range grouping {
+		out[g] = labels[g]
+	}
+	return out
+}
+
+// evalTopK keeps the k highest (topk) or lowest (bottomk) series per timestamp,
+// within each group, preserving the selected series' labels.
+func (e *Engine) evalTopK(op string, k int, series []ResultSeries, grouping []string, without bool) []ResultSeries {
+	if k <= 0 || len(series) == 0 {
+		return nil
+	}
+
+	// Partition series indexes into groups (one group for the whole vector when
+	// there is no grouping clause).
+	hasGrouping := len(grouping) > 0 || without
+	groups := make(map[string][]int)
+	var order []string
+	for i, s := range series {
+		key := ""
+		if hasGrouping {
+			key = labelSignature(groupingLabels(s.Labels, grouping, without))
+		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], i)
+	}
+
+	selected := make([][]storage.Point, len(series))
+	for _, key := range order {
+		idxs := groups[key]
+		// Index each member's points by timestamp and collect the timestamp union.
+		byTS := make([]map[int64]float64, len(idxs))
+		tsSet := map[int64]bool{}
+		for j, idx := range idxs {
+			m := make(map[int64]float64, len(series[idx].Points))
+			for _, p := range series[idx].Points {
+				m[p.Timestamp] = p.Value
+				tsSet[p.Timestamp] = true
+			}
+			byTS[j] = m
+		}
+		timestamps := make([]int64, 0, len(tsSet))
+		for ts := range tsSet {
+			timestamps = append(timestamps, ts)
+		}
+		sort.Slice(timestamps, func(a, b int) bool { return timestamps[a] < timestamps[b] })
+
+		for _, ts := range timestamps {
+			type sv struct {
+				local int
+				value float64
+			}
+			ranked := make([]sv, 0, len(idxs))
+			for j := range idxs {
+				if v, ok := byTS[j][ts]; ok {
+					ranked = append(ranked, sv{j, v})
+				}
+			}
+			sort.SliceStable(ranked, func(a, b int) bool {
+				if op == "bottomk" {
+					return ranked[a].value < ranked[b].value
+				}
+				return ranked[a].value > ranked[b].value
+			})
+			limit := k
+			if limit > len(ranked) {
+				limit = len(ranked)
+			}
+			for _, r := range ranked[:limit] {
+				idx := idxs[r.local]
+				selected[idx] = append(selected[idx], storage.Point{Timestamp: ts, Value: r.value})
+			}
+		}
+	}
+
+	var results []ResultSeries
+	for i, pts := range selected {
+		if len(pts) == 0 {
+			continue
+		}
+		results = append(results, ResultSeries{Name: series[i].Name, Labels: series[i].Labels, Points: pts})
+	}
+	return results
 }
 
 func (e *Engine) evalBinary(ctx context.Context, be *BinaryExpr, start, end int64) ([]ResultSeries, error) {
@@ -371,15 +488,4 @@ func applyBinaryOp(op string, a, b float64) float64 {
 		return a / b
 	}
 	return math.NaN()
-}
-
-func groupKey(labels map[string]string, grouping []string) string {
-	key := ""
-	for i, g := range grouping {
-		if i > 0 {
-			key += ","
-		}
-		key += g + "=" + labels[g]
-	}
-	return key
 }

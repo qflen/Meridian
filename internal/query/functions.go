@@ -36,72 +36,61 @@ func rate(points []storage.Point) []storage.Point {
 	return []storage.Point{{Timestamp: last.Timestamp, Value: rateVal}}
 }
 
-// aggregateFunc applies an aggregation operation across multiple series.
+// aggregateFunc applies an aggregation operation across multiple series. It is
+// linear in the total number of points: each series is scanned once into a
+// per-timestamp accumulator, rather than rescanning every series for every
+// timestamp.
 func aggregateFunc(op string, seriesSets [][]storage.Point) []storage.Point {
 	if len(seriesSets) == 0 {
 		return nil
 	}
 
-	// Collect all unique timestamps
-	tsSet := make(map[int64]bool)
+	type accumulator struct {
+		sum, min, max float64
+		count         int
+	}
+	accs := make(map[int64]*accumulator)
 	for _, points := range seriesSets {
 		for _, p := range points {
-			tsSet[p.Timestamp] = true
+			a, ok := accs[p.Timestamp]
+			if !ok {
+				a = &accumulator{min: math.Inf(1), max: math.Inf(-1)}
+				accs[p.Timestamp] = a
+			}
+			a.sum += p.Value
+			a.count++
+			if p.Value < a.min {
+				a.min = p.Value
+			}
+			if p.Value > a.max {
+				a.max = p.Value
+			}
 		}
 	}
 
-	timestamps := make([]int64, 0, len(tsSet))
-	for ts := range tsSet {
+	timestamps := make([]int64, 0, len(accs))
+	for ts := range accs {
 		timestamps = append(timestamps, ts)
 	}
 	sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
 
-	// For each timestamp, aggregate across all series that have a value at that time
 	result := make([]storage.Point, 0, len(timestamps))
 	for _, ts := range timestamps {
-		var values []float64
-		for _, points := range seriesSets {
-			for _, p := range points {
-				if p.Timestamp == ts {
-					values = append(values, p.Value)
-					break
-				}
-			}
-		}
-		if len(values) == 0 {
-			continue
-		}
-
-		var aggVal float64
+		a := accs[ts]
+		var v float64
 		switch op {
 		case "sum":
-			for _, v := range values {
-				aggVal += v
-			}
+			v = a.sum
 		case "avg":
-			for _, v := range values {
-				aggVal += v
-			}
-			aggVal /= float64(len(values))
+			v = a.sum / float64(a.count)
 		case "max":
-			aggVal = math.Inf(-1)
-			for _, v := range values {
-				if v > aggVal {
-					aggVal = v
-				}
-			}
+			v = a.max
 		case "min":
-			aggVal = math.Inf(1)
-			for _, v := range values {
-				if v < aggVal {
-					aggVal = v
-				}
-			}
+			v = a.min
 		case "count":
-			aggVal = float64(len(values))
+			v = float64(a.count)
 		}
-
-		result = append(result, storage.Point{Timestamp: ts, Value: aggVal})
+		result = append(result, storage.Point{Timestamp: ts, Value: v})
 	}
 
 	return result

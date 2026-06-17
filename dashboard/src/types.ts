@@ -74,12 +74,7 @@ export interface BlockInfo {
 
 // ── Dashboard state ─────────────────────────────────────────────────
 
-export type Theme = 'dark' | 'light' | 'high-contrast';
-
-export interface TimeRange {
-  start: number;
-  end: number;
-}
+export type Theme = 'dark' | 'light';
 
 /**
  * Live connection state surfaced by the header indicator:
@@ -91,8 +86,6 @@ export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting';
 
 export interface DashboardState {
   theme: Theme;
-  timeRange: TimeRange;
-  refreshInterval: number;
   query: string;
   queryResult: QueryResult | null;
   queryError: string | null;
@@ -105,8 +98,6 @@ export interface DashboardState {
 
 export type DashboardAction =
   | { type: 'SET_THEME'; theme: Theme }
-  | { type: 'SET_TIME_RANGE'; range: TimeRange }
-  | { type: 'SET_REFRESH_INTERVAL'; interval: number }
   | { type: 'SET_QUERY'; query: string }
   | { type: 'QUERY_START' }
   | { type: 'QUERY_SUCCESS'; result: QueryResult }

@@ -4,11 +4,6 @@ const MAX_LIVE_SAMPLES = 300;
 
 export const initialState: DashboardState = {
   theme: 'dark',
-  timeRange: {
-    start: Date.now() - 15 * 60 * 1000,
-    end: Date.now(),
-  },
-  refreshInterval: 5000,
   query: '',
   queryResult: null,
   queryError: null,
@@ -26,12 +21,6 @@ export function dashboardReducer(
   switch (action.type) {
     case 'SET_THEME':
       return { ...state, theme: action.theme };
-
-    case 'SET_TIME_RANGE':
-      return { ...state, timeRange: action.range };
-
-    case 'SET_REFRESH_INTERVAL':
-      return { ...state, refreshInterval: action.interval };
 
     case 'SET_QUERY':
       return { ...state, query: action.query };

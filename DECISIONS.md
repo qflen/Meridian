@@ -133,3 +133,38 @@ random spike injection (10% probability per host per cycle) and memory drift
 (slow monotonic increase with periodic resets).  
 **Consequences**: Dashboard screenshots and demos look realistic. Compression
 benchmarks reflect real-world data patterns.
+
+## ADR-014: PromQL Evaluation Semantics
+
+**Status**: Accepted
+**Context**: The query engine advertised a PromQL subset, but several pieces were
+incorrect rather than merely incomplete: a range window was subtracted twice,
+`rate()` divided by the sample span, `histogram_quantile()` ignored `le` buckets,
+vector÷vector returned the left operand, and `/0` returned `0`. Making the engine
+*correct* required committing to specific semantics.
+**Decision**:
+- **One window, anchored at `end`.** A range vector `m[d]` evaluated at instant
+  `end` covers `[end-d, end]`. The duration is subtracted in exactly one place
+  (`evalRange`), not in the planner. The planner's `TimeRange` is kept as the
+  block-pruning span a future stepped evaluator will fetch; it no longer feeds the
+  eval start. Anchoring at `end` (not `start`) makes `rate(m[5m])` read one
+  selector-width of samples regardless of the `[start,end]` span.
+- **`rate()` follows Prometheus.** Divide the increase by the *range* (threaded in
+  from the selector), correct counter resets by adding the post-reset value, and
+  extrapolate to the window edges. `rate()` takes the window end explicitly and
+  returns a single value, so it composes with a future per-step matrix evaluator.
+- **`histogram_quantile()` interpolates cumulative buckets.** Group `_bucket`
+  series by their non-`le` labels, sort by numeric `le` (`+Inf` parsed), and
+  linearly interpolate within the bucket holding rank `φ·total`.
+- **Vector matching ignores `__name__`; division is IEEE-754.** Two vectors pair on
+  their full label set excluding the metric name, drop unmatched series, and drop
+  `__name__` from the result. `x/0` yields `±Inf` and `0/0` yields `NaN` rather
+  than a silent `0`.
+- **One duration grammar.** The query layer parses durations via
+  `config.ParseDuration`, so compound/decimal forms (`1h30m`, `1.5h`) are accepted
+  consistently and the two layers cannot drift.
+**Consequences**: Engine output matches Prometheus for the supported subset, and
+the README's Query Engine claims are now backed by code paths and regression
+tests. Evaluation is still single-instant (at `end`); per-step matrix evaluation
+remains future work (`PLAN.md` §5.5), at which point the planner's `TimeRange` and
+the `end`-anchored window become the per-step fetch and window.

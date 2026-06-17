@@ -54,11 +54,15 @@ Live compression figures (blocks + in-memory head) are exposed on `/api/v1/stats
 - **Block storage**: ULID-named immutable blocks with a binary index
 
 ### Query Engine
-- **PromQL subset**: recursive-descent parser
-- **Selectors**: vector, range, label matchers (`=`, `!=`, `=~`, `!~`)
-- **Functions**: `rate()`, `histogram_quantile()`
-- **Aggregations**: `sum`, `avg`, `min`, `max`, `count`, `topk`, `bottomk` with `by`/`without`
-- **Binary ops**: `+`, `-`, `*`, `/` with operator precedence
+- **PromQL subset**: recursive-descent parser with operator precedence and unary `+`/`-`
+- **Selectors**: instant, range, and bare label-only (`{job="x"}`); matchers `=`, `!=`, `=~`, `!~`; compound/decimal durations (`1h30m`, `1.5h`)
+- **`rate()`**: per-second average over the selector range — counter-reset corrected and extrapolated to the window edges, Prometheus-style
+- **`histogram_quantile()`**: linear interpolation within cumulative `le` buckets, grouped by the remaining labels
+- **Aggregations**: `sum`, `avg`, `min`, `max`, `count`, and `topk`/`bottomk`, with both `by` and `without` grouping
+- **Binary ops**: scalar↔vector and vector↔vector with label-set matching; `/` follows IEEE-754 (`x/0 → ±Inf`, `0/0 → NaN`)
+
+Range functions are evaluated at the query's `end` instant (one value per series);
+per-step matrix evaluation is on the roadmap (`PLAN.md` §5.5).
 
 ### Cluster
 - **Consistent hash ring**: SHA256 with virtual nodes

@@ -88,8 +88,9 @@ increase in perceived latency (up to 16ms) which is imperceptible.
 **Context**: The spec requires zero chart dependencies (no D3, Chart.js,
 Recharts). Charts must render at 60fps for live streaming data.  
 **Decision**: Direct Canvas 2D API rendering with custom TimeSeriesChart
-component. Features: glow effects, area fills, animated transitions, auto-scaling
-axes, multi-series support.  
+component. Features: area fills, a one-shot load transition, auto-scaling axes,
+and multi-series support. (The original revision also drew decorative glow; that
+was removed under ADR-020.)  
 **Consequences**: Full control over rendering pipeline. No dependency bloat.
 Requires manual hit-testing for interactivity (tooltips, zoom).
 
@@ -337,3 +338,71 @@ node emits identical metrics whether run as the monolith or as the storage servi
 **Consequences**: The cluster is scrapeable end-to-end and metric names/labels are
 consistent across deployment modes. The endpoints are unauthenticated and intended
 for an internal scrape network (the same trust boundary as the internal RPC APIs).
+
+## ADR-020: Visual Design Language — "Precision Instrument"
+
+**Status**: Accepted
+**Context**: The dashboard was functional but read as templated / AI-generated.
+The concrete tells: the brand palette was verbatim Mantine indigo (`#4c6ef5`);
+every surface used the same glassmorphism (backdrop-blur + lifted shadow +
+`rounded-xl`); charts carried decorative glow and a rainbow compression gradient
+that encoded no scale; `Inter` was named ~30 times but never actually loaded (a
+silent system-font fallback, with the DOM and canvas free to disagree); two
+styling systems coexisted (semantic CSS-var inline styles next to hardcoded
+Tailwind grays monkey-patched per theme); three different `formatBytes` rendered
+the same quantity differently; and the chrome carried a self-congratulatory,
+partly false "60fps" boast backed by an always-on `requestAnimationFrame` meter.
+A single committed point of view was needed — and consistency, not novelty, is
+what removes the generated feel.
+**Decision**: Adopt one design language — *Precision Instrument*
+(mission-console-meets-chronometer: calm, engraved, exact), derived from the name
+*Meridian* (navigation / transit instruments). Deliberately avoid the other two
+AI-default looks as well (near-black + acid accent; cream + serif + terracotta).
+
+- **Color — one accent; status means status.** Semantic CSS custom properties,
+  re-valued per theme and exposed as Tailwind colors via
+  `rgb(var(--x) / <alpha-value>)`. Exactly one accent (a calibrated phosphor teal)
+  is reserved for live data and focus; ok/warn/crit carry status meaning only.
+  - Dark (default): bg `#0E1320`, surface `#131A29`, border `#26303F`, text
+    `#E6EAF0`, muted `#8A97A8`, accent `#3AA8A0` (hover `#4AC0B7`, active
+    `#2D8B84`), ok `#57A773`, warn `#C9993A`, crit `#C7564C`.
+  - Light (warm paper): bg `#F6F4EE`, surface `#FCFBF7`, border `#D8D3C6`, text
+    `#1A2230`, muted `#5A6675`, accent `#1E7A72` (hover `#17635C`, active
+    `#12524D`), ok `#2F7A54`, warn `#A6741A`, crit `#B04036`.
+  - Multi-series, retention lanes, and node roles draw from a shared muted
+    categorical palette (brass, slate-blue, sage, orchid, clay, dim-teal), never
+    neon. The canvas graticule is derived from the border token, so DOM hairlines
+    and chart grids are one system.
+- **Type — three roles, mono for all figures.** Self-hosted via `@fontsource`:
+  Inter Tight (display grotesque, headings), Inter (body), IBM Plex Mono (every
+  numeric, with `tabular-nums`, so columns of figures align like a readout). One
+  `canvasFont()` constant mirrors the loaded families into every canvas `ctx.font`
+  — numeric axes/codes in the mono, word labels in the sans — so the DOM and
+  canvas can never disagree. A small scale replaces ad-hoc sizes (`text-[10px]` →
+  `text-2xs`).
+- **Panel language.** One coherent base panel: a solid surface, a single hairline
+  border in the border token, a tight radius (`rounded-md`), no glass blur and no
+  lifted shadow. The header is solid, not blurred. (Panel tiers / hierarchy are
+  deferred.)
+- **Decoration removed (it encoded nothing).** All canvas glow (`shadowBlur`) on
+  lines, bars, and nodes; the rainbow compression-gauge gradient (replaced by a
+  single-accent arc whose sweep length honestly encodes the ratio) and the indigo
+  bar gradient; the meaningless zebra stripe behind retention lanes; the header
+  FPS/frameTime/dropped meter and the `useFrameMetrics` rAF loop it drove (the
+  last always-on animation — an idle tab now does ~zero rAF); and the boastful
+  footer line.
+- **One styling system; one formatter.** Components use the semantic Tailwind
+  classes only — the inline `style={{ rgb(var(--color-*)) }}` sprawl, the
+  per-theme `.light/.dark .text-gray-*` override blocks, and the inline
+  onMouseEnter/Leave hover hacks are gone. `utils/format.ts` is the single source
+  for byte / number / duration / time formatting, so identical quantities render
+  identically everywhere.
+**Consequences**: One coherent identity per theme, verified in both dark and
+light: fonts load over the network (woff2 under `/assets`) and the canvas shares
+the DOM family; there is no Mantine indigo, no glow, and no glassmorphism;
+numerics are tabular mono and aligned. This ADR supersedes the decorative choices
+of ADR-009 (canvas rendering stays; its "glow effects" do not). Deferred to
+follow-up work: the signature instrument chart (graticule + crosshair live
+readout), panel tiers / hierarchy, unified empty/loading/error states, the logo
+mark redesign and node iconography, and the accessibility pass (focus rings,
+keyboard navigation, reduced-motion).

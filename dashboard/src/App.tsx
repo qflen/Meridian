@@ -112,8 +112,8 @@ function Dashboard() {
     <div className="min-h-screen">
       {/* Header */}
       <header className="app-header">
-        <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-3 min-w-0">
             {/* Transit-instrument mark: a graduated setting circle, the meridian
                 line running clear through it, an inset horizon chord, and a star
                 fixed on the meridian — the same crosshair the chart draws. */}
@@ -129,12 +129,14 @@ function Dashboard() {
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
-            {/* Connection status — a steady lamp when live, pulsing while transient */}
-            <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-3 sm:gap-4">
+            {/* Connection status — a steady lamp when live, pulsing while transient.
+                The text label carries the status, so it never relies on colour alone. */}
+            <div role="status" aria-live="polite" className="flex items-center gap-1.5">
               <span
+                aria-hidden="true"
                 className={`w-2 h-2 rounded-full ${connectionDotClass(state.connectionStatus)} ${
-                  state.connectionStatus === 'connected' ? '' : 'animate-pulse'
+                  state.connectionStatus === 'connected' ? '' : 'motion-safe:animate-pulse'
                 }`}
               />
               <span className="text-xs text-muted">

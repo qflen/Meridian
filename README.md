@@ -55,14 +55,19 @@ Live compression figures (blocks + in-memory head) are exposed on `/api/v1/stats
 
 ### Query Engine
 - **PromQL subset**: recursive-descent parser with operator precedence and unary `+`/`-`
+- **Range/matrix evaluation**: a query is evaluated as an instant query at each `step` across `[start, end]` and returned as a matrix — one point per step per series, in time order. `rate(x[5m])` is a real multi-point series, not a single number.
 - **Selectors**: instant, range, and bare label-only (`{job="x"}`); matchers `=`, `!=`, `=~`, `!~`; compound/decimal durations (`1h30m`, `1.5h`)
 - **`rate()`**: per-second average over the selector range — counter-reset corrected and extrapolated to the window edges, Prometheus-style
 - **`histogram_quantile()`**: linear interpolation within cumulative `le` buckets, grouped by the remaining labels
 - **Aggregations**: `sum`, `avg`, `min`, `max`, `count`, and `topk`/`bottomk`, with both `by` and `without` grouping
 - **Binary ops**: scalar↔vector and vector↔vector with label-set matching; `/` follows IEEE-754 (`x/0 → ±Inf`, `0/0 → NaN`)
 
-Range functions are evaluated at the query's `end` instant (one value per series);
-per-step matrix evaluation is on the roadmap (`PLAN.md` §5.5).
+Each step is a self-contained instant evaluation: an instant vector takes the most
+recent sample within a 5-minute look-back (a gap stays a gap, never a zero), and a
+range vector `x[5m]` takes the half-open window `(t-5m, t]`. An unset `step`
+auto-sizes so the range yields ~250 points; the step count is capped to bound work
+and pre-empt a query-of-death. Each leaf selector's data is fetched once over the
+whole range and sliced per step, so cost scales with steps, not with re-queries.
 
 ### Cluster
 - **Consistent hash ring**: SHA256 with virtual nodes
@@ -107,6 +112,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed component documentation.
 ```bash
 # Query (rolling 15-min window by default)
 curl "http://localhost:8080/api/v1/query?q=cpu_usage_percent"
+
+# Range query → matrix (one point per step across [start,end]); step is optional
+curl "http://localhost:8080/api/v1/query?q=rate(http_requests_total[5m])&start=<ms>&end=<ms>&step=30s"
 
 # Series & labels
 curl "http://localhost:8080/api/v1/series"

@@ -220,7 +220,13 @@ func TestCrashExactlyOnce_BlockDurableWALPresent(t *testing.T) {
 		t.Fatalf("expected 1 series, got %d", len(results))
 	}
 	if got := len(results[0].Points); got != 50 {
-		t.Fatalf("exactly-once violated: got %d points, want 50 (100 indicates double-count)", got)
+		t.Fatalf("exactly-once violated: got %d points, want 50", got)
+	}
+	// TotalSamples sums head + blocks. A double-count (block loaded AND its WAL
+	// segments replayed into the head) surfaces here as 100, even though a query
+	// would dedupe the identical timestamps and hide it.
+	if got := db.Stats().TotalSamples; got != 50 {
+		t.Fatalf("exactly-once violated: TotalSamples=%d, want 50 (100 indicates double-count)", got)
 	}
 }
 

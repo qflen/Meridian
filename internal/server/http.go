@@ -123,8 +123,12 @@ func (s *HTTPServer) Start(addr string) error {
 	return nil
 }
 
-// Stop gracefully shuts down the HTTP server.
+// Stop gracefully shuts down the HTTP server. It is a no-op if Start was never
+// called, so a startup that fails before Start does not panic on cleanup.
 func (s *HTTPServer) Stop() {
+	if s.httpServer == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s.httpServer.Shutdown(ctx)

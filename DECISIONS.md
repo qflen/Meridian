@@ -5,7 +5,8 @@
 **Status**: Accepted  
 **Context**: Need a systems language with good concurrency, fast compilation, and
 single-binary deployment.  
-**Decision**: Go 1.23 with zero CGO dependencies.  
+**Decision**: Go 1.25 with zero CGO dependencies. CI installs the toolchain from
+`go.mod` (`go-version-file`) so the build version never drifts from the module.  
 **Consequences**: Simple cross-compilation, no shared library issues in containers,
 goroutine-per-connection model fits well.
 

@@ -1,5 +1,6 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { getCanvasColors } from '../utils/canvasColors';
+import { canvasFont } from '../utils/canvasFont';
 
 interface Bucket {
   le: string;
@@ -75,7 +76,7 @@ export function LatencyHistogram() {
     // Draw "awaiting data" if all zeros
     if (displayBuckets.every((b) => b.count === 0)) {
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '11px Inter, sans-serif';
+      ctx.font = canvasFont(11, { family: 'sans' });
       ctx.textAlign = 'center';
       ctx.fillText('Run a query to see latency distribution', w / 2, h / 2);
 
@@ -83,7 +84,7 @@ export function LatencyHistogram() {
       displayBuckets.forEach((bucket, i) => {
         const x = pad.left + (i / displayBuckets.length) * plotW + 2;
         ctx.fillStyle = colors.textMuted;
-        ctx.font = '9px Inter, sans-serif';
+        ctx.font = canvasFont(9);
         ctx.textAlign = 'center';
         ctx.fillText(bucket.le, x + barW / 2, pad.top + plotH + 14);
       });
@@ -122,14 +123,14 @@ export function LatencyHistogram() {
 
       // Label
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '9px Inter, sans-serif';
+      ctx.font = canvasFont(9);
       ctx.textAlign = 'center';
       ctx.fillText(bucket.le, x + barW / 2, pad.top + plotH + 14);
     });
 
     // Y axis ticks
     ctx.fillStyle = colors.textMuted;
-    ctx.font = '9px Inter, sans-serif';
+    ctx.font = canvasFont(9);
     ctx.textAlign = 'right';
     for (let i = 0; i <= 4; i++) {
       const v = Math.round((maxCount / 4) * i);

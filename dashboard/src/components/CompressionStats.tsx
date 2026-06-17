@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
+import { canvasFont } from '../utils/canvasFont';
 import { compressionRatio } from '../utils/compression';
 
 function formatBytes(b: number): string {
@@ -65,11 +66,11 @@ export function CompressionStats() {
 
     // Center text
     ctx.fillStyle = colors.text;
-    ctx.font = 'bold 22px Inter, sans-serif';
+    ctx.font = canvasFont(22, { weight: 600 });
     ctx.textAlign = 'center';
     ctx.fillText(ratio > 0 ? `${ratio.toFixed(1)}x` : '--', cx, cy + 2);
     ctx.fillStyle = colors.textMuted;
-    ctx.font = '10px Inter, sans-serif';
+    ctx.font = canvasFont(10, { family: 'sans' });
     ctx.fillText('compression ratio', cx, cy + 18);
   }, [ratio]);
 

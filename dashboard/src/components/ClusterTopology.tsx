@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback } from 'react';
 import { ClusterNode } from '../types';
 import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
+import { canvasFont } from '../utils/canvasFont';
 
 const STATE_COLORS: Record<string, string> = {
   active: '#22c55e',
@@ -160,14 +161,14 @@ export function ClusterTopology() {
 
       // Role abbreviation inside the circle
       ctx.fillStyle = '#fff';
-      ctx.font = `bold ${nodeR > 8 ? 8 : 7}px Inter, sans-serif`;
+      ctx.font = canvasFont(nodeR > 8 ? 8 : 7, { weight: 600 });
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(ROLE_ICONS[node.role] || '??', nx, ny);
 
       // Label below/above
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '10px Inter, sans-serif';
+      ctx.font = canvasFont(10, { family: 'sans' });
       ctx.textAlign = 'center';
       ctx.textBaseline = 'alphabetic';
       const labelGap = nodeR + 14;
@@ -177,12 +178,12 @@ export function ClusterTopology() {
 
     // Center label
     ctx.fillStyle = colors.text;
-    ctx.font = 'bold 14px Inter, sans-serif';
+    ctx.font = canvasFont(14, { weight: 600 });
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(`${nodes.length}`, cx, cy - 6);
     ctx.fillStyle = colors.textMuted;
-    ctx.font = '10px Inter, sans-serif';
+    ctx.font = canvasFont(10, { family: 'sans' });
     ctx.fillText('services', cx, cy + 8);
   }, []);
 

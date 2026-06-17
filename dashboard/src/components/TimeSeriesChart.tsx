@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { Sample } from '../types';
 import { getCanvasColors } from '../utils/canvasColors';
+import { canvasFont } from '../utils/canvasFont';
 
 // Palette of visually distinct colors for multi-series
 const COLORS = [
@@ -89,7 +90,7 @@ export function TimeSeriesChart({
     // Title
     if (title) {
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '11px Inter, sans-serif';
+      ctx.font = canvasFont(11, { family: 'sans' });
       ctx.textAlign = 'left';
       ctx.fillText(title, pad.left, 14);
     }
@@ -108,7 +109,7 @@ export function TimeSeriesChart({
     if (!isFinite(minT)) {
       // No data - draw empty state
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '13px Inter, sans-serif';
+      ctx.font = canvasFont(13, { family: 'sans' });
       ctx.textAlign = 'center';
       ctx.fillText('No data', w / 2, h / 2);
       return;
@@ -139,7 +140,7 @@ export function TimeSeriesChart({
         ctx.stroke();
 
         ctx.fillStyle = colors.textMuted;
-        ctx.font = '10px Inter, sans-serif';
+        ctx.font = canvasFont(10);
         ctx.textAlign = 'right';
         ctx.fillText(formatValue(v), pad.left - 6, y + 3);
       }
@@ -155,7 +156,7 @@ export function TimeSeriesChart({
         ctx.stroke();
 
         ctx.fillStyle = colors.textMuted;
-        ctx.font = '10px Inter, sans-serif';
+        ctx.font = canvasFont(10);
         ctx.textAlign = 'center';
         ctx.fillText(formatTime(t), x, pad.top + plotH + 16);
       }
@@ -165,7 +166,7 @@ export function TimeSeriesChart({
     if (yLabel) {
       ctx.save();
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '10px Inter, sans-serif';
+      ctx.font = canvasFont(10, { family: 'sans' });
       ctx.translate(12, pad.top + plotH / 2);
       ctx.rotate(-Math.PI / 2);
       ctx.textAlign = 'center';
@@ -226,7 +227,7 @@ export function TimeSeriesChart({
 
     // Legend — render in rows so items never overlap
     if (showLegend && series.length > 0) {
-      ctx.font = '10px Inter, sans-serif';
+      ctx.font = canvasFont(10, { family: 'sans' });
       const legendBaseY = pad.top + plotH + 24;
       let lx = pad.left;
       let row = 0;

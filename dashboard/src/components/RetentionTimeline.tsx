@@ -1,6 +1,7 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
+import { canvasFont } from '../utils/canvasFont';
 import { BlockInfo } from '../types';
 
 export function RetentionTimeline() {
@@ -103,7 +104,7 @@ export function RetentionTimeline() {
 
       // Lane label
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '9px Inter, sans-serif';
+      ctx.font = canvasFont(9, { family: 'sans' });
       ctx.textAlign = 'right';
       const label = nodeId === 'all' ? 'head' : nodeId.replace('storage-', 'S');
       ctx.fillText(label, pad.left - 8, y + laneH / 2 + 3);
@@ -132,7 +133,7 @@ export function RetentionTimeline() {
           // Block id
           if (bw > 40) {
             ctx.fillStyle = colors.textMuted;
-            ctx.font = '8px Inter, sans-serif';
+            ctx.font = canvasFont(8);
             ctx.textAlign = 'center';
             ctx.fillText(b.id, x1 + bw / 2, y + laneH / 2 + 3);
           }
@@ -154,7 +155,7 @@ export function RetentionTimeline() {
       const x = pad.left + (i / ticks) * plotW;
       const d = new Date(t);
       ctx.fillStyle = colors.textMuted;
-      ctx.font = '9px Inter, sans-serif';
+      ctx.font = canvasFont(9);
       ctx.textAlign = 'center';
       ctx.fillText(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), x, pad.top + plotH + 16);
     }

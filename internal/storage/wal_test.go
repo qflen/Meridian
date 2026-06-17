@@ -347,6 +347,71 @@ func TestWALFrameIntegrity(t *testing.T) {
 	}
 }
 
+// TestWALMidSegmentLengthCorruption corrupts the length field of an early frame and
+// asserts that recovery resyncs to the next valid frame, so later intact frames are
+// still recovered. Before the fix, a single bad length returned nil and discarded
+// every subsequent frame.
+func TestWALMidSegmentLengthCorruption(t *testing.T) {
+	dir := t.TempDir()
+	w, err := OpenWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Five single-sample frames. Each is 8 (header) + 29 (payload) = 37 → padded to
+	// 40 bytes, so frame i begins at byte offset i*40.
+	for i := uint64(1); i <= 5; i++ {
+		if err := w.LogSamples([]Sample{{SeriesID: i, Timestamp: int64(i) * 1000, Value: float64(i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.Close()
+
+	segs, _ := filepath.Glob(filepath.Join(dir, "segment-*"))
+	var path string
+	for _, p := range segs {
+		if info, _ := os.Stat(p); info != nil && info.Size() > 0 {
+			path = p
+		}
+	}
+	if path == "" {
+		t.Fatal("no non-empty segment found")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const frameSize = 40
+	if len(data) < 2*frameSize {
+		t.Fatalf("segment too small (%d bytes) for the layout this test assumes", len(data))
+	}
+	// Corrupt the length field (bytes [4:8]) of the SECOND frame (offset 40).
+	binary.LittleEndian.PutUint32(data[frameSize+4:frameSize+8], 0xFFFFFFF0)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w2, err := OpenWAL(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	h := &testWALHandler{}
+	if err := w2.Replay(h); err != nil {
+		t.Fatal(err)
+	}
+
+	// Frame 2 is lost, but frames 1, 3, 4, 5 must be recovered.
+	got := make(map[uint64]bool)
+	for _, s := range h.samples {
+		got[s.SeriesID] = true
+	}
+	for _, want := range []uint64{1, 3, 4, 5} {
+		if !got[want] {
+			t.Fatalf("frame for series %d not recovered after mid-segment length corruption; recovered=%v", want, got)
+		}
+	}
+}
+
 func makeSamples(n int) []Sample {
 	samples := make([]Sample, n)
 	for i := range samples {

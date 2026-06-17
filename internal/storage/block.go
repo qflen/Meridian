@@ -17,11 +17,17 @@ import (
 
 // BlockMeta contains metadata about a persistent block.
 type BlockMeta struct {
-	ULID       string          `json:"ulid"`
-	MinTime    int64           `json:"min_time"`
-	MaxTime    int64           `json:"max_time"`
-	Stats      BlockStats      `json:"stats"`
-	Compaction CompactionMeta  `json:"compaction"`
+	ULID    string `json:"ulid"`
+	MinTime int64  `json:"min_time"`
+	MaxTime int64  `json:"max_time"`
+	// WALLowWaterMark records that this block durably covers every WAL segment with
+	// sequence <= this value. On replay the engine takes the max across all blocks
+	// and replays only segments beyond it, so a crash that leaves BOTH the block and
+	// its source WAL segments present does not double-count. Absent (0) on blocks
+	// written before this field existed, which conservatively replays the WAL.
+	WALLowWaterMark int            `json:"wal_low_water_mark"`
+	Stats           BlockStats     `json:"stats"`
+	Compaction      CompactionMeta `json:"compaction"`
 }
 
 // BlockStats holds counts for a block.
@@ -59,31 +65,41 @@ type blockSeries struct {
 }
 
 // WriteBlock flushes a head block's data into a persistent compressed block.
-func WriteBlock(blockDir string, head *HeadBlock) (*Block, error) {
+//
+// The write is crash-safe: all files are written into a temporary directory and
+// fsynced (files and dirs), then atomically renamed into place, then the parent dir
+// is fsynced. The rename is the single durable commit point — an interrupted write
+// leaves only a leftover temp dir (cleaned up on the next Open), never a
+// half-populated block. walLowWaterMark is recorded so replay can skip the WAL
+// segments this block covers.
+func WriteBlock(blockDir string, head *HeadBlock, walLowWaterMark int) (*Block, error) {
 	id := generateULID()
-	dir := filepath.Join(blockDir, id)
-	chunksDir := filepath.Join(dir, "chunks")
+	finalDir := filepath.Join(blockDir, id)
+	tmpDir := filepath.Join(blockDir, "."+id+".tmp")
+	chunksDir := filepath.Join(tmpDir, "chunks")
 
 	if err := os.MkdirAll(chunksDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create block dir: %w", err)
+		return nil, fmt.Errorf("create temp block dir: %w", err)
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			os.RemoveAll(tmpDir)
+		}
+	}()
 
 	allSeries := head.AllSeries()
-	if len(allSeries) == 0 {
-		os.RemoveAll(dir)
-		return nil, fmt.Errorf("no series to flush")
-	}
 
 	// Sort series by ID for deterministic output
 	sort.Slice(allSeries, func(i, j int) bool { return allSeries[i].ID < allSeries[j].ID })
 
 	var (
-		chunkData   []byte
-		indexData   []byte
-		totalSamps  int64
-		minTime     = int64(math.MaxInt64)
-		maxTime     = int64(math.MinInt64)
-		bSeries []blockSeries
+		chunkData  []byte
+		indexData  []byte
+		totalSamps int64
+		minTime    = int64(math.MaxInt64)
+		maxTime    = int64(math.MinInt64)
+		bSeries    []blockSeries
 	)
 
 	for _, s := range allSeries {
@@ -93,6 +109,11 @@ func WriteBlock(blockDir string, head *HeadBlock) (*Block, error) {
 			continue
 		}
 
+		if err := validateSeriesFields(s.Name, s.Labels); err != nil {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("series %q: %w", s.Name, err)
+		}
+
 		// Compress with Gorilla
 		enc := compress.NewEncoder()
 		for i := range s.Timestamps {
@@ -100,8 +121,18 @@ func WriteBlock(blockDir string, head *HeadBlock) (*Block, error) {
 		}
 		compressed := enc.Bytes()
 
-		seriesMinT := s.Timestamps[0]
-		seriesMaxT := s.Timestamps[len(s.Timestamps)-1]
+		// Compute true min/max by scan rather than trusting Timestamps[0]/[last]; the
+		// ingest path keeps series sorted, but a scan guarantees non-inverted bounds
+		// regardless, so Overlaps/retention can never silently drop or mis-expire data.
+		seriesMinT, seriesMaxT := s.Timestamps[0], s.Timestamps[0]
+		for _, t := range s.Timestamps {
+			if t < seriesMinT {
+				seriesMinT = t
+			}
+			if t > seriesMaxT {
+				seriesMaxT = t
+			}
+		}
 		sampleCount := len(s.Timestamps)
 		s.mu.Unlock()
 
@@ -131,21 +162,23 @@ func WriteBlock(blockDir string, head *HeadBlock) (*Block, error) {
 		}
 	}
 
-	// Write chunk file
-	if err := os.WriteFile(filepath.Join(chunksDir, "000001"), chunkData, 0o644); err != nil {
-		return nil, fmt.Errorf("write chunks: %w", err)
+	if len(bSeries) == 0 {
+		return nil, fmt.Errorf("no series to flush")
 	}
 
-	// Write index
-	if err := os.WriteFile(filepath.Join(dir, "index"), indexData, 0o644); err != nil {
+	// Write each file and fsync it before the rename.
+	if err := writeFileSync(filepath.Join(chunksDir, "000001"), chunkData); err != nil {
+		return nil, fmt.Errorf("write chunks: %w", err)
+	}
+	if err := writeFileSync(filepath.Join(tmpDir, "index"), indexData); err != nil {
 		return nil, fmt.Errorf("write index: %w", err)
 	}
 
-	// Write meta.json
 	meta := BlockMeta{
-		ULID:    id,
-		MinTime: minTime,
-		MaxTime: maxTime,
+		ULID:            id,
+		MinTime:         minTime,
+		MaxTime:         maxTime,
+		WALLowWaterMark: walLowWaterMark,
 		Stats: BlockStats{
 			NumSamples: totalSamps,
 			NumSeries:  len(bSeries),
@@ -153,15 +186,87 @@ func WriteBlock(blockDir string, head *HeadBlock) (*Block, error) {
 		},
 		Compaction: CompactionMeta{Level: 1},
 	}
-	metaJSON, _ := json.MarshalIndent(meta, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, "meta.json"), metaJSON, 0o644); err != nil {
+	metaJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal meta: %w", err)
+	}
+	if err := writeFileSync(filepath.Join(tmpDir, "meta.json"), metaJSON); err != nil {
 		return nil, fmt.Errorf("write meta: %w", err)
 	}
+	if err := writeFileSync(filepath.Join(tmpDir, "tombstones"), []byte{}); err != nil {
+		return nil, fmt.Errorf("write tombstones: %w", err)
+	}
 
-	// Write empty tombstones
-	os.WriteFile(filepath.Join(dir, "tombstones"), []byte{}, 0o644)
+	// Make the files durable, then atomically publish the block, then make the rename
+	// itself durable by fsyncing the parent directory.
+	if err := fsyncDir(chunksDir); err != nil {
+		return nil, fmt.Errorf("fsync chunks dir: %w", err)
+	}
+	if err := fsyncDir(tmpDir); err != nil {
+		return nil, fmt.Errorf("fsync temp dir: %w", err)
+	}
+	if err := os.Rename(tmpDir, finalDir); err != nil {
+		return nil, fmt.Errorf("commit block: %w", err)
+	}
+	committed = true
+	if err := fsyncDir(blockDir); err != nil {
+		return nil, fmt.Errorf("fsync block dir: %w", err)
+	}
 
-	return OpenBlock(dir)
+	return OpenBlock(finalDir)
+}
+
+// validateSeriesFields guards against names/labels that would overflow the uint16
+// length fields in the block index. Ingest validation rejects these earlier; this is
+// defense in depth so a block index can never be silently corrupted.
+func validateSeriesFields(name string, labels map[string]string) error {
+	if len(name) > maxFieldLen {
+		return fmt.Errorf("name length %d exceeds %d", len(name), maxFieldLen)
+	}
+	if len(labels) > maxFieldLen {
+		return fmt.Errorf("label count %d exceeds %d", len(labels), maxFieldLen)
+	}
+	for k, v := range labels {
+		if len(k) > maxFieldLen {
+			return fmt.Errorf("label name length %d exceeds %d", len(k), maxFieldLen)
+		}
+		if len(v) > maxFieldLen {
+			return fmt.Errorf("label value length %d exceeds %d", len(v), maxFieldLen)
+		}
+	}
+	return nil
+}
+
+// writeFileSync writes data to path (0644) and fsyncs the file before returning, so
+// the bytes are on stable storage rather than only in the page cache.
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// fsyncDir fsyncs a directory so that name changes within it (file creation, rename)
+// are durable.
+func fsyncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // OpenBlock opens a persistent block from disk.

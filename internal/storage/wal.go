@@ -4,9 +4,9 @@ package storage
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
-	"io"
 	"log"
 	"math"
 	"os"
@@ -74,6 +74,25 @@ func OpenWAL(dir string) (*WAL, error) {
 
 // LogSeries writes a series definition to the WAL.
 func (w *WAL) LogSeries(id uint64, name string, labels map[string]string) error {
+	// Defensive guard: every length-prefixed field is a uint16 on disk, so reject
+	// anything that would overflow it rather than silently truncating the frame.
+	// Ingest validation rejects these earlier; this keeps the WAL format honest even
+	// if a future caller skips that.
+	if len(name) > maxFieldLen {
+		return fmt.Errorf("WAL: series name length %d exceeds %d", len(name), maxFieldLen)
+	}
+	if len(labels) > maxFieldLen {
+		return fmt.Errorf("WAL: label count %d exceeds %d", len(labels), maxFieldLen)
+	}
+	for k, v := range labels {
+		if len(k) > maxFieldLen {
+			return fmt.Errorf("WAL: label name length %d exceeds %d", len(k), maxFieldLen)
+		}
+		if len(v) > maxFieldLen {
+			return fmt.Errorf("WAL: label value length %d exceeds %d", len(v), maxFieldLen)
+		}
+	}
+
 	// Encode: type(1) + seriesID(8) + nameLen(2) + name + numLabels(2) + labels
 	size := 1 + 8 + 2 + len(name) + 2
 	for k, v := range labels {
@@ -133,14 +152,26 @@ func (w *WAL) LogSamples(samples []Sample) error {
 }
 
 // Replay reads all WAL segments in order and calls the handler for each entry.
-// Corrupt or partial frames are skipped with a warning.
+// Corrupt or partial frames are skipped; recovery resyncs to the next valid frame.
 func (w *WAL) Replay(handler WALHandler) error {
+	return w.ReplayFrom(0, handler)
+}
+
+// ReplayFrom reads WAL segments with sequence strictly greater than afterSeq in
+// order, calling the handler for each entry. Segments at or below afterSeq are
+// already durably covered by a persisted block (their data is in the block), so
+// skipping them is what prevents double-counting on recovery. Segment sequences
+// start at 1, so afterSeq==0 replays everything.
+func (w *WAL) ReplayFrom(afterSeq int, handler WALHandler) error {
 	segs, err := w.listSegments()
 	if err != nil {
 		return err
 	}
 
 	for _, seg := range segs {
+		if seg.seq <= afterSeq {
+			continue
+		}
 		if err := w.replaySegment(seg.path, handler); err != nil {
 			return fmt.Errorf("replay segment %s: %w", seg.path, err)
 		}
@@ -148,40 +179,96 @@ func (w *WAL) Replay(handler WALHandler) error {
 	return nil
 }
 
-// Truncate deletes all existing WAL segments and starts fresh.
-func (w *WAL) Truncate() error {
+// Rotate seals the current segment and starts a new one. It returns the sequence
+// number of the highest sealed segment: every frame written before this call lives
+// in a segment with seq <= the returned value, and every subsequent write lands in
+// a segment with seq greater than it. The flush path uses this as a block's WAL
+// low-water-mark — the cut between data that belongs to the flushed block and data
+// that belongs to the fresh head.
+func (w *WAL) Rotate() (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.segment != nil {
-		w.segment.Close()
-		w.segment = nil
+	sealed := w.segmentSeq
+	if err := w.rotateSegmentLocked(); err != nil {
+		return 0, err
 	}
+	return sealed, nil
+}
+
+// RemoveSegmentsThrough deletes every WAL segment with sequence <= seq. It is
+// best-effort cleanup run after a block durably covers those segments; the open
+// segment (always seq > any sealed low-water-mark) is never removed. Failures are
+// aggregated and returned but are non-fatal: replay skips covered segments by
+// low-water-mark whether or not they were deleted.
+func (w *WAL) RemoveSegmentsThrough(seq int) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
 	segs, err := w.listSegments()
 	if err != nil {
 		return err
 	}
+	var errs []error
+	for _, s := range segs {
+		if s.seq <= seq && s.seq != w.segmentSeq {
+			if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Truncate deletes all existing WAL segments and starts fresh. The flush path uses
+// Rotate + RemoveSegmentsThrough instead; Truncate remains for explicit resets.
+func (w *WAL) Truncate() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var errs []error
+	if w.segment != nil {
+		if err := w.segment.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close segment: %w", err))
+		}
+		w.segment = nil
+	}
+
+	segs, err := w.listSegments()
+	if err != nil {
+		return errors.Join(append(errs, err)...)
+	}
 	for _, seg := range segs {
-		os.Remove(seg.path)
+		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
 	}
 
 	w.segmentSeq++
-	return w.openSegment()
+	if err := w.openSegment(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
-// Close flushes and closes the WAL.
+// Close flushes and closes the WAL. Sync and Close errors are aggregated, and the
+// segment is always closed (even if Sync fails) so the file descriptor never leaks.
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.segment != nil {
-		if err := w.segment.Sync(); err != nil {
-			return err
-		}
-		return w.segment.Close()
+	if w.segment == nil {
+		return nil
 	}
-	return nil
+	var errs []error
+	if err := w.segment.Sync(); err != nil {
+		errs = append(errs, fmt.Errorf("sync: %w", err))
+	}
+	if err := w.segment.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close: %w", err))
+	}
+	w.segment = nil
+	return errors.Join(errs...)
 }
 
 // Size returns the total size of all WAL segments in bytes.
@@ -200,6 +287,10 @@ func (w *WAL) Size() int64 {
 func (w *WAL) writeFrame(payload []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.segment == nil {
+		return fmt.Errorf("WAL: no open segment")
+	}
 
 	// Frame: CRC32(4) + Length(4) + Payload + Padding
 	frameLen := walFrameHeader + len(payload)
@@ -236,12 +327,30 @@ func (w *WAL) rotateSegment() error {
 }
 
 func (w *WAL) rotateSegmentLocked() error {
-	if w.segment != nil {
-		w.segment.Sync()
-		w.segment.Close()
-	}
+	old := w.segment
+	oldSeq := w.segmentSeq
+
+	// Open the new segment first. openSegment only mutates w.segment/w.segmentSize on
+	// success, so a failed open leaves the current segment intact — the WAL is never
+	// left "open" with a nil segment.
 	w.segmentSeq++
-	return w.openSegment()
+	if err := w.openSegment(); err != nil {
+		w.segmentSeq = oldSeq
+		return fmt.Errorf("rotate WAL segment: %w", err)
+	}
+
+	// Retire the old segment. Every frame already fsynced on write, so these errors
+	// are non-fatal to durability; aggregate and surface them rather than dropping.
+	var errs []error
+	if old != nil {
+		if err := old.Sync(); err != nil {
+			errs = append(errs, fmt.Errorf("sync segment %06d: %w", oldSeq, err))
+		}
+		if err := old.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close segment %06d: %w", oldSeq, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (w *WAL) openSegment() error {
@@ -292,57 +401,49 @@ func (w *WAL) listSegments() ([]walSegment, error) {
 	return segs, nil
 }
 
+// replaySegment reads a segment frame-by-frame, recovering as much as possible from
+// a corrupt or torn segment. Frames are 8-byte aligned, so on an implausible length
+// field, a frame that runs past the data, or a CRC mismatch, recovery re-anchors at
+// the next 8-byte boundary and keeps scanning — a single bad frame no longer
+// discards every valid frame that follows it.
 func (w *WAL) replaySegment(path string, handler WALHandler) error {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
-	defer f.Close()
 
-	headerBuf := make([]byte, walFrameHeader)
-	for {
-		_, err := io.ReadFull(f, headerBuf)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return nil // end of segment
-		}
-		if err != nil {
-			return err
-		}
-
-		expectedCRC := binary.LittleEndian.Uint32(headerBuf[0:4])
-		payloadLen := binary.LittleEndian.Uint32(headerBuf[4:8])
-
-		if payloadLen > walSegmentMaxSize {
-			log.Printf("WAL: skipping corrupt frame (payload length %d)", payloadLen)
-			return nil // can't recover position
-		}
+	off := 0
+	for off+walFrameHeader <= len(data) {
+		expectedCRC := binary.LittleEndian.Uint32(data[off : off+4])
+		payloadLen := binary.LittleEndian.Uint32(data[off+4 : off+8])
 
 		frameLen := walFrameHeader + int(payloadLen)
 		padded := (frameLen + walAlignment - 1) / walAlignment * walAlignment
-		remaining := padded - walFrameHeader
 
-		payload := make([]byte, remaining)
-		_, err = io.ReadFull(f, payload)
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			log.Printf("WAL: skipping truncated frame at end of segment")
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-
-		actualPayload := payload[:payloadLen]
-		actualCRC := crc32.ChecksumIEEE(actualPayload)
-		if actualCRC != expectedCRC {
-			log.Printf("WAL: skipping corrupt frame (CRC mismatch: expected %x, got %x)", expectedCRC, actualCRC)
+		// Implausible length, or a frame that would run past the segment (a torn tail
+		// or a corrupt length field): re-anchor at the next aligned boundary.
+		if payloadLen == 0 || payloadLen > walSegmentMaxSize || off+padded > len(data) {
+			off += walAlignment
 			continue
 		}
 
-		if err := w.decodeEntry(actualPayload, handler); err != nil {
-			log.Printf("WAL: error decoding entry: %v", err)
+		payload := data[off+walFrameHeader : off+walFrameHeader+int(payloadLen)]
+		if crc32.ChecksumIEEE(payload) != expectedCRC {
+			// Corrupt frame: a flipped payload bit, or a corrupt length that happened to
+			// fit. Skip one alignment unit and keep scanning for the next valid frame.
+			off += walAlignment
 			continue
 		}
+
+		if err := w.decodeEntry(payload, handler); err != nil {
+			log.Printf("WAL: error decoding entry at offset %d: %v", off, err)
+		}
+		off += padded
 	}
+	return nil
 }
 
 func (w *WAL) decodeEntry(payload []byte, handler WALHandler) error {
@@ -417,9 +518,10 @@ func (w *WAL) decodeSamples(data []byte, handler WALHandler) error {
 	}
 	count := int(binary.LittleEndian.Uint32(data[0:4]))
 	off := 4
-	expected := off + count*24
-	if expected > len(data) {
-		return fmt.Errorf("samples data truncated: need %d bytes, have %d", expected, len(data))
+	// Validate count against the available bytes BEFORE multiplying, so count*24
+	// cannot overflow a 32-bit int on 32-bit builds.
+	if maxCount := (len(data) - off) / 24; count > maxCount {
+		return fmt.Errorf("samples data truncated: count %d exceeds capacity %d", count, maxCount)
 	}
 
 	samples := make([]Sample, count)

@@ -173,10 +173,16 @@ func TestRateCounterResetAcrossSteps(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
 
-	// Counter rising ~10/s but reset at ts=30s (200 → 50).
-	samples := map[int64]float64{0: 0, 10_000: 100, 20_000: 200, 30_000: 50, 40_000: 150, 50_000: 250, 60_000: 350}
-	for ts, v := range samples {
-		db.Ingest("c_total", map[string]string{"job": "x"}, ts, v)
+	// Counter rising ~10/s but reset at ts=30s (200 → 50). Ingest in timestamp order:
+	// the storage layer rejects out-of-order samples, so a map's random iteration
+	// order would otherwise drop points.
+	samples := []storage.Point{
+		{Timestamp: 0, Value: 0}, {Timestamp: 10_000, Value: 100}, {Timestamp: 20_000, Value: 200},
+		{Timestamp: 30_000, Value: 50}, {Timestamp: 40_000, Value: 150}, {Timestamp: 50_000, Value: 250},
+		{Timestamp: 60_000, Value: 350},
+	}
+	for _, s := range samples {
+		db.Ingest("c_total", map[string]string{"job": "x"}, s.Timestamp, s.Value)
 	}
 
 	engine := NewEngine(db)

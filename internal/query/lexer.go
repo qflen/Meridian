@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/meridiandb/meridian/internal/config"
 )
 
 // TokenType identifies the type of a lexed token.
@@ -189,8 +191,8 @@ func (l *Lexer) readString() (Token, error) {
 	return Token{}, fmt.Errorf("unterminated string at position %d", startPos)
 }
 
-func (l *Lexer) readNumber() (Token, error) {
-	startPos := l.pos
+// consumeNumber advances over a run of digits with at most one decimal point.
+func (l *Lexer) consumeNumber() {
 	hasDot := false
 	for l.pos < len(l.input) {
 		ch := l.input[l.pos]
@@ -208,22 +210,37 @@ func (l *Lexer) readNumber() (Token, error) {
 		}
 		break
 	}
-
-	lit := l.input[startPos:l.pos]
-
-	// Check if it's a duration (number followed by s/m/h/d)
-	if l.pos < len(l.input) && isDurationSuffix(l.input[l.pos]) && !hasDot {
-		return l.readDuration(startPos, lit)
-	}
-
-	return Token{Type: TokenNumber, Literal: lit, Pos: startPos}, nil
 }
 
-func (l *Lexer) readDuration(startPos int, numPart string) (Token, error) {
-	suffix := l.input[l.pos]
-	l.pos++
-	lit := numPart + string(suffix)
-	return Token{Type: TokenDuration, Literal: lit, Pos: startPos}, nil
+func (l *Lexer) readNumber() (Token, error) {
+	startPos := l.pos
+	l.consumeNumber()
+
+	// A duration is one or more <number><unit> groups: 5m, 1h30m, 1.5h, 7d.
+	if l.pos < len(l.input) && isDurationSuffix(l.input[l.pos]) {
+		return l.readDuration(startPos)
+	}
+
+	return Token{Type: TokenNumber, Literal: l.input[startPos:l.pos], Pos: startPos}, nil
+}
+
+// readDuration consumes a full compound duration starting just after the first
+// numeric part (already consumed). It accepts repeated <number><unit> groups so
+// "1h30m" becomes a single token rather than two.
+func (l *Lexer) readDuration(startPos int) (Token, error) {
+	for {
+		if l.pos >= len(l.input) || !isDurationSuffix(l.input[l.pos]) {
+			return Token{}, fmt.Errorf("invalid duration %q at position %d", l.input[startPos:l.pos], startPos)
+		}
+		l.pos++ // consume the unit
+		// Continue only if another <number><unit> group follows.
+		if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
+			l.consumeNumber()
+			continue
+		}
+		break
+	}
+	return Token{Type: TokenDuration, Literal: l.input[startPos:l.pos], Pos: startPos}, nil
 }
 
 func (l *Lexer) readIdent() (Token, error) {
@@ -255,37 +272,13 @@ func isIdentChar(ch byte) bool {
 }
 
 func isDurationSuffix(ch byte) bool {
-	return ch == 's' || ch == 'm' || ch == 'h' || ch == 'd'
+	return ch == 's' || ch == 'm' || ch == 'h' || ch == 'd' || ch == 'w'
 }
 
-// ParseDuration parses a PromQL duration string like "5m" or "1h30m".
+// ParseDuration parses a PromQL duration string like "5m", "1h30m", or "1.5h".
+// It delegates to config.ParseDuration so the query and config layers share one
+// duration grammar (compound units, decimals, and the d/w suffixes that Go's
+// time.ParseDuration does not understand).
 func ParseDuration(s string) (time.Duration, error) {
-	if len(s) == 0 {
-		return 0, fmt.Errorf("empty duration")
-	}
-	last := s[len(s)-1]
-	numStr := s[:len(s)-1]
-
-	var multiplier time.Duration
-	switch last {
-	case 's':
-		multiplier = time.Second
-	case 'm':
-		multiplier = time.Minute
-	case 'h':
-		multiplier = time.Hour
-	case 'd':
-		multiplier = 24 * time.Hour
-	default:
-		return 0, fmt.Errorf("unknown duration suffix: %c", last)
-	}
-
-	var n int
-	for _, ch := range numStr {
-		if ch < '0' || ch > '9' {
-			return 0, fmt.Errorf("invalid duration: %s", s)
-		}
-		n = n*10 + int(ch-'0')
-	}
-	return time.Duration(n) * multiplier, nil
+	return config.ParseDuration(s)
 }

@@ -90,6 +90,26 @@ func (p *Parser) parseUnaryExpr() (Expr, error) {
 		}
 		return p.parseVectorOrRange()
 
+	case TokenMinus, TokenPlus:
+		// Unary sign on the operand that follows.
+		p.advance()
+		operand, err := p.parseUnaryExpr()
+		if err != nil {
+			return nil, err
+		}
+		if tok.Type == TokenPlus {
+			return operand, nil
+		}
+		// Fold a literal; otherwise negate the vector via 0 - operand.
+		if nl, ok := operand.(*NumberLiteral); ok {
+			return &NumberLiteral{Value: -nl.Value}, nil
+		}
+		return &BinaryExpr{Op: "-", Left: &NumberLiteral{Value: 0}, Right: operand}, nil
+
+	case TokenLBrace:
+		// Bare label-only selector, e.g. {job="x"}.
+		return p.finishSelector("")
+
 	case TokenLParen:
 		p.advance()
 		expr, err := p.parseExpr()
@@ -205,7 +225,12 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 func (p *Parser) parseVectorOrRange() (Expr, error) {
 	name := p.peek().Literal
 	p.advance()
+	return p.finishSelector(name)
+}
 
+// finishSelector parses the matcher braces (if any) for the given metric name
+// and an optional trailing range [duration]. name is "" for a bare selector.
+func (p *Parser) finishSelector(name string) (Expr, error) {
 	vs, err := p.parseVectorSelectorFrom(name)
 	if err != nil {
 		return nil, err

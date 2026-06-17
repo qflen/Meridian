@@ -96,13 +96,8 @@ export function LatencyHistogram() {
       const x = pad.left + (i / displayBuckets.length) * plotW + 2;
       const y = pad.top + plotH - barH;
 
-      // Bar gradient
-      const gradient = ctx.createLinearGradient(x, y, x, y + barH);
-      gradient.addColorStop(0, '#5c7cfa');
-      gradient.addColorStop(1, '#4263eb');
-      ctx.fillStyle = gradient;
-
-      // Rounded top
+      // Solid accent bar with a rounded top
+      ctx.fillStyle = colors.accent;
       const cornerR = Math.min(3, barW / 2);
       ctx.beginPath();
       ctx.moveTo(x + cornerR, y);
@@ -113,13 +108,6 @@ export function LatencyHistogram() {
       ctx.lineTo(x, y + cornerR);
       ctx.quadraticCurveTo(x, y, x + cornerR, y);
       ctx.fill();
-
-      // Glow
-      ctx.save();
-      ctx.shadowColor = '#5c7cfa';
-      ctx.shadowBlur = 4;
-      ctx.fillRect(x, y, barW, 1);
-      ctx.restore();
 
       // Label
       ctx.fillStyle = colors.textMuted;

@@ -3,6 +3,7 @@ import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
 import { formatTime } from '../utils/format';
+import { CATEGORICAL } from '../utils/chartPalette';
 import { BlockInfo } from '../types';
 
 export function RetentionTimeline() {
@@ -97,11 +98,11 @@ export function RetentionTimeline() {
     const laneCount = Math.max(nodeIds.length, 1);
     const laneH = plotH / laneCount;
 
-    const nodeColors = ['#5c7cfa', '#22c55e', '#f59e0b', '#a855f7', '#f97316'];
+    const laneColors = [colors.accent, ...CATEGORICAL];
 
     nodeIds.forEach((nodeId, lane) => {
       const y = pad.top + lane * laneH;
-      const color = nodeColors[lane % nodeColors.length];
+      const color = laneColors[lane % laneColors.length];
 
       // Lane label
       ctx.fillStyle = colors.textMuted;
@@ -109,10 +110,6 @@ export function RetentionTimeline() {
       ctx.textAlign = 'right';
       const label = nodeId === 'all' ? 'head' : nodeId.replace('storage-', 'S');
       ctx.fillText(label, pad.left - 8, y + laneH / 2 + 3);
-
-      // Lane background
-      ctx.fillStyle = lane % 2 === 0 ? 'rgba(255,255,255,0.02)' : 'transparent';
-      ctx.fillRect(pad.left, y, plotW, laneH);
 
       // Blocks in this lane
       displayBlocks

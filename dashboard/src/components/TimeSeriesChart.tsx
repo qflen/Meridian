@@ -3,12 +3,7 @@ import { Sample } from '../types';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
 import { formatNumber, formatTime } from '../utils/format';
-
-// Palette of visually distinct colors for multi-series
-const COLORS = [
-  '#5c7cfa', '#22c55e', '#f59e0b', '#ef4444', '#a855f7',
-  '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1',
-];
+import { CATEGORICAL } from '../utils/chartPalette';
 
 interface SeriesData {
   label: string;
@@ -71,6 +66,9 @@ export function TimeSeriesChart({
 
     // Resolve CSS variables for canvas (canvas cannot use var() directly)
     const colors = getCanvasColors(canvas);
+    // The primary/live trace takes the single accent; extra series fall back to
+    // the restrained categorical secondaries.
+    const palette = [colors.accent, ...CATEGORICAL];
 
     // Clear
     ctx.clearRect(0, 0, w, h);
@@ -173,12 +171,8 @@ export function TimeSeriesChart({
     // Draw series
     series.forEach((s, si) => {
       if (s.samples.length < 2) return;
-      const color = s.color || COLORS[si % COLORS.length];
+      const color = s.color || palette[si % palette.length];
 
-      // Glow effect
-      ctx.save();
-      ctx.shadowColor = color;
-      ctx.shadowBlur = 6;
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.5;
       ctx.lineJoin = 'round';
@@ -194,7 +188,6 @@ export function TimeSeriesChart({
         else ctx.lineTo(x, y);
       }
       ctx.stroke();
-      ctx.restore();
 
       // Area fill
       if (drawCount > 1) {
@@ -221,7 +214,7 @@ export function TimeSeriesChart({
       let row = 0;
 
       for (let i = 0; i < Math.min(series.length, 12); i++) {
-        const color = series[i].color || COLORS[i % COLORS.length];
+        const color = series[i].color || palette[i % palette.length];
         const label = series[i].label.length > 28
           ? series[i].label.slice(0, 26) + '..'
           : series[i].label;

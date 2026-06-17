@@ -33,26 +33,22 @@ export function CompressionStats() {
     const r = Math.min(w, h) * 0.35;
 
     // Background arc
-    ctx.lineWidth = 12;
+    ctx.lineWidth = 10;
     ctx.lineCap = 'round';
     ctx.strokeStyle = colors.gridColor;
     ctx.beginPath();
     ctx.arc(cx, cy, r, Math.PI * 0.8, Math.PI * 2.2);
     ctx.stroke();
 
-    // Ratio arc (~30x covers well-populated head + flushed blocks)
+    // Ratio arc — the sweep length encodes the ratio; the color is the single
+    // accent, not a decorative rainbow. (~30x covers head + flushed blocks.)
     const maxRatio = 30;
     const progress = Math.min(ratio / maxRatio, 1);
     const startAngle = Math.PI * 0.8;
     const endAngle = startAngle + progress * Math.PI * 1.4;
 
-    const gradient = ctx.createLinearGradient(cx - r, cy, cx + r, cy);
-    gradient.addColorStop(0, '#5c7cfa');
-    gradient.addColorStop(0.5, '#22c55e');
-    gradient.addColorStop(1, '#f59e0b');
-
-    ctx.strokeStyle = gradient;
-    ctx.lineWidth = 12;
+    ctx.strokeStyle = colors.accent;
+    ctx.lineWidth = 10;
     ctx.lineCap = 'round';
     ctx.beginPath();
     ctx.arc(cx, cy, r, startAngle, endAngle);

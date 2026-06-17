@@ -1,9 +1,10 @@
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect, useCallback, useState } from 'react';
 import { Sample } from '../types';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
 import { formatNumber, formatTime } from '../utils/format';
 import { CATEGORICAL } from '../utils/chartPalette';
+import { nearestSampleIndex, nearestSample } from '../utils/nearestSample';
 
 interface SeriesData {
   label: string;
@@ -18,7 +19,37 @@ interface Props {
   animated?: boolean;
   yLabel?: string;
   title?: string;
+  /**
+   * `instrument` is the signature treatment — a finer graticule, instrument
+   * tick marks, and a cursor crosshair with a live readout. Reserved for the
+   * one primary chart; every other chart stays `plain` and quiet.
+   */
+  variant?: 'plain' | 'instrument';
 }
+
+/** Plot geometry shared between the base render and the crosshair pass. */
+interface Geom {
+  pad: { top: number; right: number; bottom: number; left: number };
+  plotW: number;
+  plotH: number;
+  minT: number;
+  tRange: number;
+  minV: number;
+  maxV: number;
+}
+
+interface ReadoutPoint {
+  label: string;
+  color: string;
+  value: number;
+}
+
+const prefersReducedMotion = () =>
+  typeof window !== 'undefined' &&
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const MAX_READOUT_ROWS = 10;
 
 export function TimeSeriesChart({
   series,
@@ -27,12 +58,26 @@ export function TimeSeriesChart({
   animated = true,
   yLabel,
   title,
+  variant = 'plain',
 }: Props) {
+  const instrument = variant === 'instrument';
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const rafRef = useRef(0);
+  const sweepRafRef = useRef(0);
   const progressRef = useRef(0);
   const hasAnimatedRef = useRef(false);
+
+  // Crosshair plumbing — all refs so the pointer handlers stay stable and read
+  // the latest data without re-subscribing on every data tick.
+  const geomRef = useRef<Geom | null>(null);
+  const paletteRef = useRef<string[]>([]);
+  const seriesRef = useRef<SeriesData[]>(series);
+  seriesRef.current = series;
+  const cursorRef = useRef<{ t: number } | null>(null);
+  const pointerXRef = useRef(0);
+  const hoverRafRef = useRef(0);
+  const renderRef = useRef<() => void>(() => {});
+  const [readout, setReadout] = useState<{ t: number; points: ReadoutPoint[] } | null>(null);
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
@@ -60,16 +105,14 @@ export function TimeSeriesChart({
     const plotW = w - pad.left - pad.right;
     const plotH = h - pad.top - pad.bottom;
 
-    // Resolve CSS variables for canvas (canvas cannot use var() directly)
     const colors = getCanvasColors(canvas);
     // The primary/live trace takes the single accent; extra series fall back to
     // the restrained categorical secondaries.
     const palette = [colors.accent, ...CATEGORICAL];
+    paletteRef.current = palette;
 
-    // Clear
     ctx.clearRect(0, 0, w, h);
 
-    // Title
     if (title) {
       ctx.fillStyle = colors.textMuted;
       ctx.font = canvasFont(11, { family: 'sans' });
@@ -89,7 +132,7 @@ export function TimeSeriesChart({
     }
 
     if (!isFinite(minT)) {
-      // No data - draw empty state
+      geomRef.current = null;
       ctx.fillStyle = colors.textMuted;
       ctx.font = canvasFont(13, { family: 'sans' });
       ctx.textAlign = 'center';
@@ -103,44 +146,80 @@ export function TimeSeriesChart({
     maxV += vRange * 0.05;
     const tRange = maxT - minT || 1;
 
+    geomRef.current = { pad, plotW, plotH, minT, tRange, minV, maxV };
+
     const toX = (t: number) => pad.left + ((t - minT) / tRange) * plotW;
     const toY = (v: number) => pad.top + plotH - ((v - minV) / (maxV - minV)) * plotH;
 
-    // Grid
+    // Grid + axes
     if (showGrid) {
+      const yTicks = 5;
+      const xTicks = Math.min(6, Math.max(2, Math.floor(plotW / 100)));
+
+      // Minor graticule subdivisions (instrument only): one faint line between
+      // each pair of majors, both axes.
+      if (instrument) {
+        ctx.strokeStyle = colors.gridFaint;
+        ctx.lineWidth = 0.5;
+        for (let i = 0; i < yTicks; i++) {
+          const y = toY(minV + ((i + 0.5) / yTicks) * (maxV - minV));
+          ctx.beginPath();
+          ctx.moveTo(pad.left, y);
+          ctx.lineTo(pad.left + plotW, y);
+          ctx.stroke();
+        }
+        for (let i = 0; i < xTicks; i++) {
+          const x = toX(minT + ((i + 0.5) / xTicks) * tRange);
+          ctx.beginPath();
+          ctx.moveTo(x, pad.top);
+          ctx.lineTo(x, pad.top + plotH);
+          ctx.stroke();
+        }
+      }
+
+      // Major lines + tabular-mono labels + instrument tick marks
       ctx.strokeStyle = colors.gridColor;
       ctx.lineWidth = 0.5;
-
-      // Horizontal grid lines
-      const yTicks = 5;
       for (let i = 0; i <= yTicks; i++) {
         const v = minV + (i / yTicks) * (maxV - minV);
         const y = toY(v);
+        ctx.strokeStyle = colors.gridColor;
         ctx.beginPath();
         ctx.moveTo(pad.left, y);
         ctx.lineTo(pad.left + plotW, y);
         ctx.stroke();
-
+        if (instrument) {
+          ctx.strokeStyle = colors.gridStrong;
+          ctx.beginPath();
+          ctx.moveTo(pad.left - 4, y);
+          ctx.lineTo(pad.left, y);
+          ctx.stroke();
+        }
         ctx.fillStyle = colors.textMuted;
         ctx.font = canvasFont(10);
         ctx.textAlign = 'right';
-        ctx.fillText(formatNumber(v), pad.left - 6, y + 3);
+        ctx.fillText(formatNumber(v), pad.left - (instrument ? 8 : 6), y + 3);
       }
 
-      // Vertical grid lines
-      const xTicks = Math.min(6, Math.max(2, Math.floor(plotW / 100)));
       for (let i = 0; i <= xTicks; i++) {
         const t = minT + (i / xTicks) * tRange;
         const x = toX(t);
+        ctx.strokeStyle = colors.gridColor;
         ctx.beginPath();
         ctx.moveTo(x, pad.top);
         ctx.lineTo(x, pad.top + plotH);
         ctx.stroke();
-
+        if (instrument) {
+          ctx.strokeStyle = colors.gridStrong;
+          ctx.beginPath();
+          ctx.moveTo(x, pad.top + plotH);
+          ctx.lineTo(x, pad.top + plotH + 4);
+          ctx.stroke();
+        }
         ctx.fillStyle = colors.textMuted;
         ctx.font = canvasFont(10);
         ctx.textAlign = 'center';
-        ctx.fillText(formatTime(t), x, pad.top + plotH + 16);
+        ctx.fillText(formatTime(t, { seconds: false }), x, pad.top + plotH + (instrument ? 18 : 16));
       }
     }
 
@@ -156,8 +235,8 @@ export function TimeSeriesChart({
       ctx.restore();
     }
 
-    // Plot border
-    ctx.strokeStyle = colors.gridColor;
+    // Plot frame
+    ctx.strokeStyle = instrument ? colors.gridStrong : colors.gridColor;
     ctx.lineWidth = 1;
     ctx.strokeRect(pad.left, pad.top, plotW, plotH);
 
@@ -185,9 +264,10 @@ export function TimeSeriesChart({
       }
       ctx.stroke();
 
-      // Area fill
-      if (drawCount > 1) {
-        ctx.globalAlpha = 0.08;
+      // Calm area fill. In instrument mode only the primary accent trace is
+      // filled, so a multi-series plot stays legible rather than muddy.
+      if (drawCount > 1 && (!instrument || si === 0)) {
+        ctx.globalAlpha = instrument ? 0.07 : 0.08;
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.moveTo(toX(s.samples[0].timestamp), toY(s.samples[0].value));
@@ -201,6 +281,41 @@ export function TimeSeriesChart({
         ctx.globalAlpha = 1;
       }
     });
+
+    // Crosshair (instrument only) — drawn over the traces.
+    const cursor = cursorRef.current;
+    if (instrument && cursor) {
+      const cx = Math.max(pad.left, Math.min(toX(cursor.t), pad.left + plotW));
+      ctx.save();
+      ctx.strokeStyle = colors.textMuted;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(cx, pad.top);
+      ctx.lineTo(cx, pad.top + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+
+      // A marker dot per series at its nearest sample, ringed in the surface
+      // colour so it reads on top of the trace.
+      series.forEach((s, si) => {
+        const ns = nearestSample(s.samples, cursor.t);
+        if (!ns) return;
+        const color = s.color || palette[si % palette.length];
+        const dx = toX(ns.timestamp);
+        const dy = toY(ns.value);
+        ctx.beginPath();
+        ctx.arc(dx, dy, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = colors.surface;
+        ctx.stroke();
+      });
+      ctx.restore();
+    }
 
     // Legend — render in rows so items never overlap
     if (showLegend && series.length > 0) {
@@ -230,15 +345,69 @@ export function TimeSeriesChart({
         lx += itemWidth;
       }
     }
-  }, [series, showGrid, showLegend, animated, yLabel, title]);
+  }, [series, showGrid, showLegend, animated, yLabel, title, instrument]);
+
+  renderRef.current = render;
+
+  // Recompute the snapped cursor + readout for the current pointer position,
+  // coalesced to one update per frame. Reads everything from refs so the
+  // handler identity is stable across data ticks.
+  const updateHover = useCallback(() => {
+    hoverRafRef.current = 0;
+    const geom = geomRef.current;
+    if (!geom) return;
+    const data = seriesRef.current;
+    const primary = data.find((s) => s.samples.length > 0);
+    if (!primary) {
+      cursorRef.current = null;
+      setReadout(null);
+      return;
+    }
+    const { pad, plotW, minT, tRange } = geom;
+    const xc = Math.max(pad.left, Math.min(pointerXRef.current, pad.left + plotW));
+    const tCursor = minT + ((xc - pad.left) / plotW) * tRange;
+    const snap = primary.samples[nearestSampleIndex(primary.samples, tCursor)];
+    cursorRef.current = { t: snap.timestamp };
+
+    const palette = paletteRef.current;
+    const points: ReadoutPoint[] = [];
+    data.forEach((s, i) => {
+      const ns = nearestSample(s.samples, snap.timestamp);
+      if (ns) points.push({ label: s.label, color: s.color || palette[i % palette.length], value: ns.value });
+    });
+    renderRef.current();
+    setReadout({ t: snap.timestamp, points });
+  }, []);
+
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      const canvas = canvasRef.current;
+      if (!canvas || !geomRef.current) return;
+      pointerXRef.current = e.clientX - canvas.getBoundingClientRect().left;
+      if (hoverRafRef.current === 0) hoverRafRef.current = requestAnimationFrame(updateHover);
+    },
+    [updateHover],
+  );
+
+  const clearHover = useCallback(() => {
+    if (hoverRafRef.current !== 0) {
+      cancelAnimationFrame(hoverRafRef.current);
+      hoverRafRef.current = 0;
+    }
+    if (cursorRef.current) {
+      cursorRef.current = null;
+      renderRef.current();
+    }
+    setReadout(null);
+  }, []);
 
   useEffect(() => {
     const hasData = series.some((s) => s.samples.length > 0);
 
-    // Sweep in once, the first time real data arrives. Inferring "first data"
-    // from the previous series length re-ran the 600ms sweep every time a chart
-    // emptied and refilled; a one-shot latch animates exactly once.
-    if (animated && hasData && !hasAnimatedRef.current) {
+    // Sweep in once, the first time real data arrives, unless the viewer asked
+    // for reduced motion. A one-shot latch animates exactly once (not on every
+    // empty→refill), and an idle chart schedules no frames.
+    if (animated && hasData && !hasAnimatedRef.current && !prefersReducedMotion()) {
       hasAnimatedRef.current = true;
       progressRef.current = 0;
       const start = performance.now();
@@ -248,18 +417,23 @@ export function TimeSeriesChart({
         progressRef.current = Math.min((now - start) / duration, 1);
         render();
         if (progressRef.current < 1) {
-          rafRef.current = requestAnimationFrame(animate);
+          sweepRafRef.current = requestAnimationFrame(animate);
         }
       };
-      rafRef.current = requestAnimationFrame(animate);
+      sweepRafRef.current = requestAnimationFrame(animate);
     } else {
-      // Subsequent updates: render immediately without animation
       progressRef.current = 1;
       render();
     }
 
-    return () => cancelAnimationFrame(rafRef.current);
+    return () => cancelAnimationFrame(sweepRafRef.current);
   }, [series, render, animated]);
+
+  // Data changed — a held crosshair would point at a stale time, so drop it.
+  useEffect(() => {
+    cursorRef.current = null;
+    setReadout(null);
+  }, [series]);
 
   // Resize handling
   useEffect(() => {
@@ -274,8 +448,31 @@ export function TimeSeriesChart({
   }, [render]);
 
   return (
-    <div ref={containerRef} className="w-full h-full min-h-0">
-      <canvas ref={canvasRef} className="block w-full h-full" />
+    <div ref={containerRef} className="relative w-full h-full min-h-0">
+      <canvas
+        ref={canvasRef}
+        className={`block w-full h-full ${instrument ? 'cursor-crosshair' : ''}`}
+        onPointerMove={instrument ? handlePointerMove : undefined}
+        onPointerLeave={instrument ? clearHover : undefined}
+        onPointerCancel={instrument ? clearHover : undefined}
+      />
+      {instrument && readout && readout.points.length > 0 && (
+        <div className="pointer-events-none absolute top-2 right-2 rounded-md border bg-surface px-2.5 py-1.5 max-w-[55%]">
+          <div className="text-2xs font-mono tabular-nums text-muted mb-1">{formatTime(readout.t)}</div>
+          <div className="space-y-0.5">
+            {readout.points.slice(0, MAX_READOUT_ROWS).map((p, i) => (
+              <div key={`${p.label}-${i}`} className="flex items-center gap-2 text-2xs font-mono tabular-nums">
+                <span className="w-2 h-2 rounded-[1px] shrink-0" style={{ backgroundColor: p.color }} />
+                <span className="text-muted truncate">{p.label}</span>
+                <span className="ml-auto pl-2 text-text">{formatNumber(p.value)}</span>
+              </div>
+            ))}
+            {readout.points.length > MAX_READOUT_ROWS && (
+              <div className="text-2xs font-mono text-muted">+{readout.points.length - MAX_READOUT_ROWS} more</div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

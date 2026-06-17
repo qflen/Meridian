@@ -157,7 +157,7 @@ function Dashboard() {
         >
           {chartSeries.length > 0 ? (
             <div className="flex-1 min-h-0">
-              <TimeSeriesChart series={chartSeries} />
+              <TimeSeriesChart series={chartSeries} variant="instrument" />
             </div>
           ) : (
             <div className="flex-1 min-h-0 flex items-center justify-center text-sm text-muted">

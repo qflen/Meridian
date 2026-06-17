@@ -97,8 +97,10 @@ type StatsResponse struct {
 	HeadSamples       int64   `json:"head_samples"`
 	HeadSeries        int     `json:"head_series"`
 	WALSize           int64   `json:"wal_size"`
-	IngestionRate     int64   `json:"ingestion_rate"`
-	Uptime            string  `json:"uptime"`
+	// IngestionRate is a windowed samples/sec rate (not a cumulative count); per-node
+	// rates sum to the cluster rate when aggregated.
+	IngestionRate int64  `json:"ingestion_rate"`
+	Uptime        string `json:"uptime"`
 }
 
 // MatcherToStorage converts a MatcherJSON to a storage.LabelMatcher.

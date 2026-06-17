@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,16 +21,24 @@ type TSDBOptions struct {
 	BlockDuration   time.Duration
 	RetentionPeriod time.Duration
 	FlushInterval   time.Duration
+	// RateWindow is the rolling window over which IngestionRate is averaged
+	// (default 5s). RateSampleInterval is how often the background sampler feeds the
+	// rate meter (default 1s). The cumulative counter behind IngestedTotal is
+	// unaffected by these.
+	RateWindow         time.Duration
+	RateSampleInterval time.Duration
 }
 
 // DefaultTSDBOptions returns sensible defaults.
 func DefaultTSDBOptions() TSDBOptions {
 	return TSDBOptions{
-		WALDir:          "./data/wal",
-		BlockDir:        "./data/blocks",
-		BlockDuration:   15 * time.Minute,
-		RetentionPeriod: 15 * 24 * time.Hour,
-		FlushInterval:   30 * time.Second,
+		WALDir:             "./data/wal",
+		BlockDir:           "./data/blocks",
+		BlockDuration:      15 * time.Minute,
+		RetentionPeriod:    15 * 24 * time.Hour,
+		FlushInterval:      30 * time.Second,
+		RateWindow:         5 * time.Second,
+		RateSampleInterval: 1 * time.Second,
 	}
 }
 
@@ -93,6 +102,7 @@ type TSDB struct {
 
 	ingested    atomic.Int64
 	outOfOrder  atomic.Int64
+	rate        *rateMeter
 	flushTicker *time.Ticker
 	done        chan struct{}
 	closed      atomic.Bool
@@ -112,6 +122,12 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 	if opts.FlushInterval == 0 {
 		opts.FlushInterval = 30 * time.Second
 	}
+	if opts.RateWindow == 0 {
+		opts.RateWindow = 5 * time.Second
+	}
+	if opts.RateSampleInterval == 0 {
+		opts.RateSampleInterval = 1 * time.Second
+	}
 
 	if err := os.MkdirAll(opts.BlockDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create block dir: %w", err)
@@ -128,6 +144,7 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 		opts:      opts,
 		wal:       wal,
 		head:      head,
+		rate:      newRateMeter(opts.RateWindow),
 		startTime: time.Now(),
 		done:      make(chan struct{}),
 	}
@@ -149,7 +166,26 @@ func Open(dataDir string, opts TSDBOptions) (*TSDB, error) {
 	db.flushTicker = time.NewTicker(opts.FlushInterval)
 	go db.flushLoop()
 
+	// Start the rolling ingestion-rate sampler.
+	go db.rateLoop()
+
 	return db, nil
+}
+
+// rateLoop feeds the rate meter the cumulative ingested count at a fixed interval so
+// IngestionRate reflects recent throughput and decays toward zero when idle.
+func (db *TSDB) rateLoop() {
+	ticker := time.NewTicker(db.opts.RateSampleInterval)
+	defer ticker.Stop()
+	db.rate.observe(db.ingested.Load(), time.Now())
+	for {
+		select {
+		case <-db.done:
+			return
+		case <-ticker.C:
+			db.rate.observe(db.ingested.Load(), time.Now())
+		}
+	}
 }
 
 // HandleSeries implements WALHandler for replay. It restores the series under the
@@ -399,8 +435,18 @@ func (db *TSDB) StartTime() time.Time {
 	return db.startTime
 }
 
-// IngestionRate returns the total number of ingested samples.
+// IngestionRate returns the current ingestion rate in samples/sec, averaged over a
+// short rolling window (RateWindow). It reflects recent throughput and decays toward
+// zero when ingestion stops — unlike IngestedTotal, it is not cumulative. The value
+// is rounded to whole samples/sec. See the ADR on ingestion-rate semantics.
 func (db *TSDB) IngestionRate() int64 {
+	return int64(math.Round(db.rate.rate(time.Now())))
+}
+
+// IngestedTotal returns the cumulative number of samples ingested since startup.
+// This is the monotonic source for the Prometheus meridian_samples_ingested_total
+// counter; it never decreases (until process restart).
+func (db *TSDB) IngestedTotal() int64 {
 	return db.ingested.Load()
 }
 

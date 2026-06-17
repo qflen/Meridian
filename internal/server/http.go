@@ -394,7 +394,7 @@ func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(w, "# HELP meridian_samples_ingested_total Total samples ingested since startup.\n")
 	fmt.Fprintf(w, "# TYPE meridian_samples_ingested_total counter\n")
-	fmt.Fprintf(w, "meridian_samples_ingested_total{node=%q} %d\n", node, s.db.IngestionRate())
+	fmt.Fprintf(w, "meridian_samples_ingested_total{node=%q} %d\n", node, s.db.IngestedTotal())
 
 	fmt.Fprintf(w, "# HELP meridian_out_of_order_samples_total Samples rejected for arriving out of order.\n")
 	fmt.Fprintf(w, "# TYPE meridian_out_of_order_samples_total counter\n")

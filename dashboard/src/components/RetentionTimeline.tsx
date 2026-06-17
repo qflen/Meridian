@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback, useState } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
+import { formatTime } from '../utils/format';
 import { BlockInfo } from '../types';
 
 export function RetentionTimeline() {
@@ -153,11 +154,10 @@ export function RetentionTimeline() {
     for (let i = 0; i <= ticks; i++) {
       const t = minT + (i / ticks) * tRange;
       const x = pad.left + (i / ticks) * plotW;
-      const d = new Date(t);
       ctx.fillStyle = colors.textMuted;
       ctx.font = canvasFont(9);
       ctx.textAlign = 'center';
-      ctx.fillText(d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), x, pad.top + plotH + 16);
+      ctx.fillText(formatTime(t, { seconds: false }), x, pad.top + plotH + 16);
     }
   }, [displayBlocks]);
 

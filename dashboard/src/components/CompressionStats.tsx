@@ -3,13 +3,7 @@ import { useDashboard } from '../state/DashboardContext';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
 import { compressionRatio } from '../utils/compression';
-
-function formatBytes(b: number): string {
-  if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
-  if (b >= 1e6) return (b / 1e6).toFixed(2) + ' MB';
-  if (b >= 1e3) return (b / 1e3).toFixed(2) + ' KB';
-  return b + ' B';
-}
+import { formatBytes } from '../utils/format';
 
 export function CompressionStats() {
   const { state } = useDashboard();

@@ -2,13 +2,7 @@ import { useDashboard } from '../state/DashboardContext';
 import { TimeSeriesChart } from './TimeSeriesChart';
 import { useRef, useEffect, useState } from 'react';
 import { Sample } from '../types';
-
-function formatBytes(b: number): string {
-  if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB';
-  if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB';
-  if (b >= 1e3) return (b / 1e3).toFixed(1) + ' KB';
-  return b + ' B';
-}
+import { formatBytes } from '../utils/format';
 
 export function IngestionMonitor() {
   const { state } = useDashboard();

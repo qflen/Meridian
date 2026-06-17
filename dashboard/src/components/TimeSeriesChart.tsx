@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback } from 'react';
 import { Sample } from '../types';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
+import { formatNumber, formatTime } from '../utils/format';
 
 // Palette of visually distinct colors for multi-series
 const COLORS = [
@@ -24,19 +25,6 @@ interface Props {
   animated?: boolean;
   yLabel?: string;
   title?: string;
-}
-
-function formatValue(v: number): string {
-  if (Math.abs(v) >= 1e9) return (v / 1e9).toFixed(1) + 'G';
-  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
-  if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K';
-  if (Math.abs(v) < 0.01 && v !== 0) return v.toExponential(1);
-  return v.toFixed(v % 1 === 0 ? 0 : 2);
-}
-
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 export function TimeSeriesChart({
@@ -142,7 +130,7 @@ export function TimeSeriesChart({
         ctx.fillStyle = colors.textMuted;
         ctx.font = canvasFont(10);
         ctx.textAlign = 'right';
-        ctx.fillText(formatValue(v), pad.left - 6, y + 3);
+        ctx.fillText(formatNumber(v), pad.left - 6, y + 3);
       }
 
       // Vertical grid lines

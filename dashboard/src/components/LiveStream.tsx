@@ -1,6 +1,7 @@
 import { useRef, useEffect } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { LiveEntry, liveRowKey } from '../utils/liveStream';
+import { formatNumber, formatTime } from '../utils/format';
 
 export function LiveStream() {
   const { state } = useDashboard();
@@ -22,17 +23,6 @@ export function LiveStream() {
       listRef.current.scrollTop = 0;
     }
   }, [display.length]);
-
-  const formatTs = (ts: number) => {
-    const d = new Date(ts);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  };
-
-  const formatVal = (v: number) => {
-    if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + 'M';
-    if (Math.abs(v) >= 1e3) return (v / 1e3).toFixed(1) + 'K';
-    return v.toFixed(v % 1 === 0 ? 0 : 2);
-  };
 
   return (
     <div className="card flex flex-col h-[294px]">
@@ -63,10 +53,10 @@ export function LiveStream() {
             key={liveRowKey(e)}
             className="flex items-center gap-2 px-2 py-1 rounded cursor-default transition-colors hover:bg-text/5"
           >
-            <span className="w-24 shrink-0 whitespace-nowrap text-muted">{formatTs(e.ts)}</span>
+            <span className="w-24 shrink-0 whitespace-nowrap text-muted">{formatTime(e.ts)}</span>
             <span className="flex-1 break-all text-text">{e.key}</span>
             <span className="text-accent font-medium w-16 text-right shrink-0">
-              {formatVal(e.value)}
+              {formatNumber(e.value)}
             </span>
           </div>
         ))}

@@ -12,6 +12,7 @@ import { RetentionTimeline } from './components/RetentionTimeline';
 import { LiveStream } from './components/LiveStream';
 import { ThemeToggle } from './components/ThemeToggle';
 import { ConnectionStatus } from './types';
+import { formatDuration } from './utils/format';
 
 function connectionDotClass(status: ConnectionStatus): string {
   switch (status) {
@@ -120,7 +121,7 @@ function Dashboard() {
             {/* Uptime */}
             {state.stats && Number.isFinite(state.stats.uptimeSeconds) && (
               <span className="text-xs text-muted tabular-nums">
-                Up {Math.floor(state.stats.uptimeSeconds / 60)}m
+                Up {formatDuration(state.stats.uptimeSeconds)}
               </span>
             )}
 

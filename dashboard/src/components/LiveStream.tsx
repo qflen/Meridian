@@ -1,9 +1,21 @@
 import { useRef, useEffect } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { Panel } from './Panel';
+import { Placeholder } from './Placeholder';
 import { LiveEntry, liveRowKey } from '../utils/liveStream';
 import { formatNumber, formatTime } from '../utils/format';
 import { PANEL_BODY } from '../utils/layout';
+import { ConnectionStatus } from '../types';
+
+function emptyCopy(status: ConnectionStatus): { title: string; hint: string } {
+  if (status === 'reconnecting') {
+    return { title: 'Live stream interrupted.', hint: 'Reconnecting to the server…' };
+  }
+  if (status === 'connecting') {
+    return { title: 'Connecting to the live stream…', hint: 'This should only take a moment.' };
+  }
+  return { title: 'No live samples yet.', hint: 'Samples appear here as they stream in.' };
+}
 
 export function LiveStream() {
   const { state } = useDashboard();
@@ -42,11 +54,7 @@ export function LiveStream() {
   return (
     <Panel tier="secondary" title="Live Stream" meta={connectionChip} bodyHeight={PANEL_BODY.ticker}>
       <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto font-mono text-xs tabular-nums space-y-px">
-        {display.length === 0 && (
-          <div className="italic py-8 text-center text-xs text-muted">
-            Waiting for live data...
-          </div>
-        )}
+        {display.length === 0 && <Placeholder {...emptyCopy(state.connectionStatus)} />}
         {display.map((e) => (
           <div
             key={liveRowKey(e)}

@@ -1,6 +1,7 @@
 import { useDashboard } from '../state/DashboardContext';
 import { TimeSeriesChart } from './TimeSeriesChart';
 import { Panel } from './Panel';
+import { Placeholder } from './Placeholder';
 import { useRef, useEffect, useState } from 'react';
 import { Sample } from '../types';
 import { formatBytes } from '../utils/format';
@@ -48,12 +49,16 @@ export function IngestionMonitor() {
         </div>
       </div>
       <div className="flex-1 min-h-0">
-        <TimeSeriesChart
-          series={[{ label: 'Ingestion Rate', samples: rateHistory }]}
-          showLegend={false}
-          yLabel="samples/s"
-          title="Ingestion Throughput"
-        />
+        {rateHistory.length > 0 ? (
+          <TimeSeriesChart
+            series={[{ label: 'Ingestion Rate', samples: rateHistory }]}
+            showLegend={false}
+            yLabel="samples/s"
+            title="Ingestion Throughput"
+          />
+        ) : (
+          <Placeholder title="No throughput recorded yet." hint="The ingestion rate plots here once samples arrive." />
+        )}
       </div>
     </Panel>
   );

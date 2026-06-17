@@ -71,6 +71,8 @@ export function QueryEditor() {
         <button
           type="submit"
           disabled={loading || !input.trim()}
+          aria-busy={loading}
+          aria-label={loading ? 'Running query' : 'Execute query'}
           className="btn-primary flex items-center gap-2 disabled:opacity-50"
         >
           {loading ? (
@@ -85,8 +87,11 @@ export function QueryEditor() {
       </form>
 
       {state.queryError && (
-        <div className="mt-2 px-3 py-2 rounded-md text-sm bg-crit/10 border border-crit/30 text-crit">
-          {state.queryError}
+        <div
+          role="alert"
+          className="mt-2 px-3 py-2 rounded-md text-sm bg-crit/10 border border-crit/30 text-crit"
+        >
+          <span className="font-medium">Query failed:</span> {state.queryError}
         </div>
       )}
     </div>

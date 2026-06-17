@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { TimeSeriesChart } from './TimeSeriesChart';
 import { Panel } from './Panel';
+import { Placeholder } from './Placeholder';
 import { PANEL_BODY } from '../utils/layout';
 
 interface MetricMeta {
@@ -77,11 +78,12 @@ export function MetricExplorer() {
       />
       <div className="flex gap-3 flex-1 min-h-0">
         <div className="w-1/2 overflow-y-auto space-y-0.5 pr-2">
-          {filtered.length === 0 && (
-            <div className="text-xs italic py-4 text-center text-muted">
-              {metrics.length === 0 ? 'Connect to server to browse metrics' : 'No matching metrics'}
-            </div>
-          )}
+          {filtered.length === 0 &&
+            (metrics.length === 0 ? (
+              <Placeholder title="No metrics to browse yet." hint="They appear once the server starts reporting." />
+            ) : (
+              <Placeholder title="No metrics match this filter." hint="Clear the filter to see them all." />
+            ))}
           {filtered.map((m) => (
             <button
               key={m.name}
@@ -102,10 +104,10 @@ export function MetricExplorer() {
             <div className="w-full h-full">
               <TimeSeriesChart series={liveData} showLegend={false} />
             </div>
+          ) : selected ? (
+            <Placeholder title="Waiting for samples…" hint="Live values for this metric will plot here." />
           ) : (
-            <div className="h-full flex items-center justify-center text-xs italic text-muted">
-              {selected ? 'Waiting for data...' : 'Select a metric'}
-            </div>
+            <Placeholder title="Select a metric to preview." hint="Pick one on the left to plot its live values." />
           )}
         </div>
       </div>

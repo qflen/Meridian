@@ -132,11 +132,9 @@ export function TimeSeriesChart({
     }
 
     if (!isFinite(minT)) {
+      // No samples — the canvas is left blank; callers render a shared
+      // Placeholder over the empty body so every empty state reads alike.
       geomRef.current = null;
-      ctx.fillStyle = colors.textMuted;
-      ctx.font = canvasFont(13, { family: 'sans' });
-      ctx.textAlign = 'center';
-      ctx.fillText('No data', w / 2, h / 2);
       return;
     }
 

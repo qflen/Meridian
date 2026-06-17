@@ -11,6 +11,7 @@ import { RetentionTimeline } from './components/RetentionTimeline';
 import { LiveStream } from './components/LiveStream';
 import { ThemeToggle } from './components/ThemeToggle';
 import { Panel } from './components/Panel';
+import { Placeholder } from './components/Placeholder';
 import { ConnectionStatus } from './types';
 import { formatDuration, formatNumber } from './utils/format';
 import { PANEL_BODY } from './utils/layout';
@@ -35,6 +36,23 @@ function connectionLabel(status: ConnectionStatus): string {
     default:
       return 'Connecting…';
   }
+}
+
+/**
+ * A quiet banner that surfaces a dropped stream. The header lamp covers the
+ * brief initial connect; this only appears once a live connection is actually
+ * lost and the client is retrying with backoff.
+ */
+function ConnectionBanner({ status }: { status: ConnectionStatus }) {
+  if (status !== 'reconnecting') return null;
+  return (
+    <div role="status" aria-live="polite" className="border-b border-warn/30 bg-warn/10 text-warn">
+      <div className="max-w-[1600px] mx-auto px-4 py-1.5 flex items-center gap-2 text-xs">
+        <span className="w-1.5 h-1.5 rounded-full bg-warn motion-safe:animate-pulse" aria-hidden="true" />
+        Connection to the server was lost — reconnecting…
+      </div>
+    </div>
+  );
 }
 
 function Dashboard() {
@@ -137,6 +155,8 @@ function Dashboard() {
         </div>
       </header>
 
+      <ConnectionBanner status={state.connectionStatus} />
+
       {/* Main content */}
       <main className="max-w-[1600px] mx-auto px-4 py-4 space-y-3 sm:space-y-4">
         {/* PRIMARY — the query and its result are the dominant surface */}
@@ -156,13 +176,40 @@ function Dashboard() {
           bodyHeight={PANEL_BODY.signature}
         >
           {chartSeries.length > 0 ? (
-            <div className="flex-1 min-h-0">
+            // Never blank a good chart on a later failure — keep the last result
+            // and show a small running chip while the next query is in flight.
+            <div className="relative flex-1 min-h-0">
               <TimeSeriesChart series={chartSeries} variant="instrument" />
+              {state.queryLoading && (
+                <div className="pointer-events-none absolute top-2 left-2 flex items-center gap-1.5 rounded border bg-surface px-2 py-1 text-2xs font-mono text-muted">
+                  <span className="h-3 w-3 rounded-full border border-muted/30 border-t-accent motion-safe:animate-spin" />
+                  Running…
+                </div>
+              )}
             </div>
+          ) : state.queryLoading ? (
+            <Placeholder kind="loading" title="Running query…" />
+          ) : state.queryError ? (
+            <Placeholder
+              kind="error"
+              title="That query didn't run"
+              hint="See the message above the chart, then adjust the expression and run it again."
+            />
+          ) : state.queryResult ? (
+            <Placeholder
+              title="No series match this query."
+              hint="Check the metric name and label filters, then run it again."
+            />
           ) : (
-            <div className="flex-1 min-h-0 flex items-center justify-center text-sm text-muted">
-              Run a query to plot a series.
-            </div>
+            <Placeholder
+              title="Run a query to plot a series."
+              hint={
+                <>
+                  Enter a PromQL expression above — e.g.{' '}
+                  <code className="font-mono text-text">rate(http_requests_total[5m])</code>.
+                </>
+              }
+            />
           )}
         </Panel>
 

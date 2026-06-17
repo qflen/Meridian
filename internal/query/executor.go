@@ -3,6 +3,9 @@ package query
 import (
 	"context"
 	"fmt"
+	"math"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/meridiandb/meridian/internal/storage"
@@ -207,6 +210,10 @@ func (e *Engine) evalAggregate(ctx context.Context, ae *AggregateExpr, start, en
 }
 
 func (e *Engine) evalBinary(ctx context.Context, be *BinaryExpr, start, end int64) ([]ResultSeries, error) {
+	if !isBinaryOp(be.Op) {
+		return nil, fmt.Errorf("unsupported binary operator %q", be.Op)
+	}
+
 	left, err := e.eval(ctx, be.Left, start, end)
 	if err != nil {
 		return nil, err
@@ -216,50 +223,139 @@ func (e *Engine) evalBinary(ctx context.Context, be *BinaryExpr, start, end int6
 		return nil, err
 	}
 
-	// Scalar on right: apply to each point of each left series
-	if len(right) == 1 && len(right[0].Points) == 1 {
-		scalar := right[0].Points[0].Value
-		var results []ResultSeries
-		for _, ls := range left {
-			var points []storage.Point
-			for _, p := range ls.Points {
-				points = append(points, storage.Point{
-					Timestamp: p.Timestamp,
-					Value:     applyBinaryOp(be.Op, p.Value, scalar),
-				})
+	leftScalar := isScalarExpr(be.Left)
+	rightScalar := isScalarExpr(be.Right)
+
+	switch {
+	case leftScalar && rightScalar:
+		// scalar OP scalar → scalar
+		return []ResultSeries{{
+			Name:   "",
+			Labels: map[string]string{},
+			Points: []storage.Point{{Timestamp: end, Value: applyBinaryOp(be.Op, scalarValue(left), scalarValue(right))}},
+		}}, nil
+	case rightScalar:
+		return scaleSeries(left, be.Op, scalarValue(right), false), nil
+	case leftScalar:
+		return scaleSeries(right, be.Op, scalarValue(left), true), nil
+	default:
+		return vectorMatch(be.Op, left, right), nil
+	}
+}
+
+// isBinaryOp reports whether op is a supported arithmetic operator.
+func isBinaryOp(op string) bool {
+	switch op {
+	case "+", "-", "*", "/":
+		return true
+	}
+	return false
+}
+
+// isScalarExpr reports whether expr evaluates to a PromQL scalar (a literal or
+// an arithmetic combination of scalars) rather than an instant vector.
+func isScalarExpr(expr Expr) bool {
+	switch e := expr.(type) {
+	case *NumberLiteral:
+		return true
+	case *BinaryExpr:
+		return isScalarExpr(e.Left) && isScalarExpr(e.Right)
+	}
+	return false
+}
+
+// scalarValue extracts the single value from a scalar result.
+func scalarValue(series []ResultSeries) float64 {
+	if len(series) == 0 || len(series[0].Points) == 0 {
+		return math.NaN()
+	}
+	return series[0].Points[0].Value
+}
+
+// scaleSeries applies a scalar to every point of every series. When scalarLeft
+// is true the scalar is the left operand (scalar OP series), else the right.
+func scaleSeries(series []ResultSeries, op string, scalar float64, scalarLeft bool) []ResultSeries {
+	results := make([]ResultSeries, 0, len(series))
+	for _, s := range series {
+		points := make([]storage.Point, len(s.Points))
+		for i, p := range s.Points {
+			v := applyBinaryOp(op, p.Value, scalar)
+			if scalarLeft {
+				v = applyBinaryOp(op, scalar, p.Value)
 			}
-			results = append(results, ResultSeries{
-				Name:   ls.Name,
-				Labels: ls.Labels,
-				Points: points,
-			})
+			points[i] = storage.Point{Timestamp: p.Timestamp, Value: v}
 		}
-		return results, nil
+		results = append(results, ResultSeries{Name: s.Name, Labels: s.Labels, Points: points})
+	}
+	return results
+}
+
+// vectorMatch applies op between two instant vectors, pairing series with an
+// identical label set (the metric name is ignored) and timestamps that align.
+// Unmatched series and unmatched timestamps are dropped, per PromQL.
+func vectorMatch(op string, left, right []ResultSeries) []ResultSeries {
+	index := make(map[string]ResultSeries, len(right))
+	for _, rs := range right {
+		index[labelSignature(rs.Labels)] = rs
 	}
 
-	// Scalar on left: apply to each point of each right series
-	if len(left) == 1 && len(left[0].Points) == 1 {
-		scalar := left[0].Points[0].Value
-		var results []ResultSeries
-		for _, rs := range right {
-			var points []storage.Point
-			for _, p := range rs.Points {
-				points = append(points, storage.Point{
-					Timestamp: p.Timestamp,
-					Value:     applyBinaryOp(be.Op, scalar, p.Value),
-				})
-			}
-			results = append(results, ResultSeries{
-				Name:   rs.Name,
-				Labels: rs.Labels,
-				Points: points,
-			})
+	var results []ResultSeries
+	for _, ls := range left {
+		rs, ok := index[labelSignature(ls.Labels)]
+		if !ok {
+			continue
 		}
-		return results, nil
+		rpts := make(map[int64]float64, len(rs.Points))
+		for _, p := range rs.Points {
+			rpts[p.Timestamp] = p.Value
+		}
+		var points []storage.Point
+		for _, lp := range ls.Points {
+			rv, ok := rpts[lp.Timestamp]
+			if !ok {
+				continue
+			}
+			points = append(points, storage.Point{Timestamp: lp.Timestamp, Value: applyBinaryOp(op, lp.Value, rv)})
+		}
+		if len(points) > 0 {
+			results = append(results, ResultSeries{Name: "", Labels: dropName(ls.Labels), Points: points})
+		}
 	}
+	return results
+}
 
-	// Vector-vector: match series by labels
-	return left, nil
+// labelSignature is a stable key over a label set, excluding the metric name,
+// used to pair series in a vector-to-vector operation.
+func labelSignature(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		if k == "__name__" {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for _, k := range keys {
+		sb.WriteString(k)
+		sb.WriteByte('=')
+		sb.WriteString(labels[k])
+		sb.WriteByte(0)
+	}
+	return sb.String()
+}
+
+// dropName returns a copy of labels without the metric-name label, matching
+// PromQL's rule that arithmetic between two vectors drops __name__.
+func dropName(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels))
+	for k, v := range labels {
+		if k == "__name__" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 func applyBinaryOp(op string, a, b float64) float64 {
@@ -271,12 +367,10 @@ func applyBinaryOp(op string, a, b float64) float64 {
 	case "*":
 		return a * b
 	case "/":
-		if b == 0 {
-			return 0
-		}
+		// Let IEEE-754 define the edges: x/0 = ±Inf, 0/0 = NaN.
 		return a / b
 	}
-	return 0
+	return math.NaN()
 }
 
 func groupKey(labels map[string]string, grouping []string) string {

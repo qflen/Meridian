@@ -13,8 +13,6 @@ interface SeriesData {
 
 interface Props {
   series: SeriesData[];
-  width?: number;
-  height?: number;
   showGrid?: boolean;
   showLegend?: boolean;
   animated?: boolean;
@@ -24,8 +22,6 @@ interface Props {
 
 export function TimeSeriesChart({
   series,
-  width: propWidth,
-  height: propHeight,
   showGrid = true,
   showLegend = true,
   animated = true,
@@ -278,12 +274,8 @@ export function TimeSeriesChart({
   }, [render]);
 
   return (
-    <div ref={containerRef} className="w-full" style={{ height: propHeight || 240 }}>
-      <canvas
-        ref={canvasRef}
-        className="w-full h-full"
-        style={{ width: propWidth || '100%', height: propHeight || 240 }}
-      />
+    <div ref={containerRef} className="w-full h-full min-h-0">
+      <canvas ref={canvasRef} className="block w-full h-full" />
     </div>
   );
 }

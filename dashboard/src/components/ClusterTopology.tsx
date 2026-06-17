@@ -1,9 +1,11 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { ClusterNode } from '../types';
 import { useDashboard } from '../state/DashboardContext';
+import { Panel } from './Panel';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
 import { CATEGORICAL } from '../utils/chartPalette';
+import { PANEL_BODY } from '../utils/layout';
 
 // Roles draw from the shared muted categorical palette; node STATE
 // (active/dead/…) is colored from the status tokens inside render() so it
@@ -212,10 +214,9 @@ export function ClusterTopology() {
   );
 
   return (
-    <div className="card h-[294px]">
-      <h3 className="text-sm font-semibold mb-2">Cluster Topology</h3>
-      <div ref={containerRef} className="w-full" style={{ height: 180 }}>
-        <canvas ref={canvasRef} className="w-full h-full" style={{ height: 180 }} />
+    <Panel tier="secondary" title="Cluster Topology" bodyHeight={PANEL_BODY.monitor}>
+      <div ref={containerRef} className="w-full flex-1 min-h-0">
+        <canvas ref={canvasRef} className="block w-full h-full" />
       </div>
       <div className="flex gap-3 mt-2 justify-center flex-wrap">
         {Object.entries(ROLE_COLORS)
@@ -230,6 +231,6 @@ export function ClusterTopology() {
             </div>
           ))}
       </div>
-    </div>
+    </Panel>
   );
 }

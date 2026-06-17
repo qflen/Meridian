@@ -1,8 +1,10 @@
 import { useDashboard } from '../state/DashboardContext';
 import { TimeSeriesChart } from './TimeSeriesChart';
+import { Panel } from './Panel';
 import { useRef, useEffect, useState } from 'react';
 import { Sample } from '../types';
 import { formatBytes } from '../utils/format';
+import { PANEL_BODY } from '../utils/layout';
 
 export function IngestionMonitor() {
   const { state } = useDashboard();
@@ -26,9 +28,8 @@ export function IngestionMonitor() {
   }, [stats]);
 
   return (
-    <div className="card">
-      <h3 className="text-sm font-semibold mb-3">Ingestion Monitor</h3>
-      <div className="grid grid-cols-4 gap-4 mb-4">
+    <Panel tier="secondary" title="Ingestion Monitor" bodyHeight={PANEL_BODY.monitor}>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
         <div>
           <div className="stat-value">{stats ? stats.ingestionRate.toLocaleString() : '--'}</div>
           <div className="stat-label">samples/sec</div>
@@ -46,13 +47,14 @@ export function IngestionMonitor() {
           <div className="stat-label">WAL segments</div>
         </div>
       </div>
-      <TimeSeriesChart
-        series={[{ label: 'Ingestion Rate', samples: rateHistory }]}
-        height={140}
-        showLegend={false}
-        yLabel="samples/s"
-        title="Ingestion Throughput"
-      />
-    </div>
+      <div className="flex-1 min-h-0">
+        <TimeSeriesChart
+          series={[{ label: 'Ingestion Rate', samples: rateHistory }]}
+          showLegend={false}
+          yLabel="samples/s"
+          title="Ingestion Throughput"
+        />
+      </div>
+    </Panel>
   );
 }

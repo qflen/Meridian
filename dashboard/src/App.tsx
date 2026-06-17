@@ -10,8 +10,10 @@ import { LatencyHistogram } from './components/LatencyHistogram';
 import { RetentionTimeline } from './components/RetentionTimeline';
 import { LiveStream } from './components/LiveStream';
 import { ThemeToggle } from './components/ThemeToggle';
+import { Panel } from './components/Panel';
 import { ConnectionStatus } from './types';
-import { formatDuration } from './utils/format';
+import { formatDuration, formatNumber } from './utils/format';
+import { PANEL_BODY } from './utils/layout';
 
 function connectionDotClass(status: ConnectionStatus): string {
   switch (status) {
@@ -72,6 +74,22 @@ function Dashboard() {
     });
   })();
 
+  const result = state.queryResult;
+  const resultMeta =
+    chartSeries.length > 0 && result ? (
+      <>
+        <span className="text-text">{result.data.length}</span> series
+        {result.stats && (
+          <>
+            {' · '}
+            <span className="text-text">{formatNumber(result.stats.samplesFetched)}</span> samples
+            {' · '}
+            <span className="text-text">{result.stats.executionMs}</span> ms
+          </>
+        )}
+      </>
+    ) : null;
+
   return (
     <div className="min-h-screen">
       {/* Header */}
@@ -120,49 +138,52 @@ function Dashboard() {
       </header>
 
       {/* Main content */}
-      <main className="max-w-[1600px] mx-auto px-4 py-4 space-y-4">
-        {/* Query bar */}
-        <div className="card relative z-10">
+      <main className="max-w-[1600px] mx-auto px-4 py-4 space-y-3 sm:space-y-4">
+        {/* PRIMARY — the query and its result are the dominant surface */}
+        <Panel tier="primary" className="relative z-10">
           <QueryEditor />
-        </div>
+        </Panel>
 
-        {/* Query result chart */}
-        {chartSeries.length > 0 && (
-          <div className="card">
-            <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-semibold">Query Result</h3>
-              <span className="text-xs text-muted tabular-nums">
-                {state.queryResult?.data?.length ?? 0} series
-                {state.queryResult?.stats &&
-                  ` | ${state.queryResult.stats.samplesFetched} samples in ${state.queryResult.stats.executionMs}ms`}
-              </span>
+        <Panel
+          tier="primary"
+          eyebrow="Query Result"
+          title={
+            <span className="font-mono text-sm font-medium text-text">
+              {state.query || 'No query yet'}
+            </span>
+          }
+          meta={resultMeta}
+          bodyHeight={PANEL_BODY.signature}
+        >
+          {chartSeries.length > 0 ? (
+            <div className="flex-1 min-h-0">
+              <TimeSeriesChart series={chartSeries} />
             </div>
-            <TimeSeriesChart series={chartSeries} height={280} />
-          </div>
-        )}
+          ) : (
+            <div className="flex-1 min-h-0 flex items-center justify-center text-sm text-muted">
+              Run a query to plot a series.
+            </div>
+          )}
+        </Panel>
 
-        {/* Top row: Ingestion + Compression + Latency */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2">
-            <IngestionMonitor />
-          </div>
-          <CompressionStats />
-        </div>
-
-        {/* Middle row: Live (wide) + Cluster + Histogram */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="lg:col-span-2">
-            <LiveStream />
-          </div>
+        {/* SECONDARY — live monitors */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 sm:gap-4">
+          <IngestionMonitor />
           <ClusterTopology />
-          <LatencyHistogram />
         </div>
 
-        {/* Bottom row: Explorer + Retention */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <MetricExplorer />
-          <RetentionTimeline />
+        <LiveStream />
+
+        {/* TERTIARY — dense readouts */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+          <CompressionStats />
+          <LatencyHistogram />
+          <div className="sm:col-span-2">
+            <RetentionTimeline />
+          </div>
         </div>
+
+        <MetricExplorer />
       </main>
 
       {/* Footer */}

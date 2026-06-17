@@ -1,6 +1,8 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
+import { Panel } from './Panel';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
+import { PANEL_BODY } from '../utils/layout';
 
 interface Bucket {
   le: string;
@@ -140,11 +142,10 @@ export function LatencyHistogram() {
   }, [render]);
 
   return (
-    <div className="card h-[294px]">
-      <h3 className="text-sm font-semibold mb-2">Query Latency Distribution</h3>
-      <div ref={containerRef} style={{ height: 180 }}>
-        <canvas ref={canvasRef} className="w-full h-full" style={{ height: 180 }} />
+    <Panel tier="tertiary" title="Query Latency Distribution" bodyHeight={PANEL_BODY.compact}>
+      <div ref={containerRef} className="flex-1 min-h-0">
+        <canvas ref={canvasRef} className="block w-full h-full" />
       </div>
-    </div>
+    </Panel>
   );
 }

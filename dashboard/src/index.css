@@ -61,17 +61,14 @@ body {
 
 @layer components {
   /*
-   * Base panel: a single coherent instrument surface. Solid (no glass blur),
-   * one hairline border, tight radius, no lifted shadow. Panel tiers come later.
+   * Base instrument surface: solid (no glass blur), one hairline border, tight
+   * radius, no lifted shadow. Padding and heading scale are layered on per tier
+   * by the Panel component, so hierarchy reads through size and density alone.
    */
-  .card {
-    @apply rounded-md p-4;
+  .panel {
+    @apply rounded-md;
     border: 1px solid rgb(var(--color-border));
     background: rgb(var(--color-surface));
-  }
-
-  .card h3 {
-    color: rgb(var(--color-text));
   }
 
   .btn-primary {

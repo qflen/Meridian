@@ -1,7 +1,9 @@
 import { useRef, useEffect } from 'react';
 import { useDashboard } from '../state/DashboardContext';
+import { Panel } from './Panel';
 import { LiveEntry, liveRowKey } from '../utils/liveStream';
 import { formatNumber, formatTime } from '../utils/format';
+import { PANEL_BODY } from '../utils/layout';
 
 export function LiveStream() {
   const { state } = useDashboard();
@@ -24,24 +26,21 @@ export function LiveStream() {
     }
   }, [display.length]);
 
+  const connectionChip =
+    state.connectionStatus === 'connected' ? (
+      <span className="flex items-center gap-1.5 text-xs text-ok">
+        <span className="w-1.5 h-1.5 rounded-full bg-ok" />
+        Connected
+      </span>
+    ) : (
+      <span className="flex items-center gap-1.5 text-xs text-muted">
+        <span className="w-1.5 h-1.5 rounded-full bg-muted motion-safe:animate-pulse" />
+        {state.connectionStatus === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}
+      </span>
+    );
+
   return (
-    <div className="card flex flex-col h-[294px]">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold">Live Stream</h3>
-        <div className="flex items-center gap-2">
-          {state.connectionStatus === 'connected' ? (
-            <span className="flex items-center gap-1.5 text-xs text-ok">
-              <span className="w-1.5 h-1.5 rounded-full bg-ok" />
-              Connected
-            </span>
-          ) : (
-            <span className="flex items-center gap-1.5 text-xs text-muted">
-              <span className="w-1.5 h-1.5 rounded-full bg-muted animate-pulse" />
-              {state.connectionStatus === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}
-            </span>
-          )}
-        </div>
-      </div>
+    <Panel tier="secondary" title="Live Stream" meta={connectionChip} bodyHeight={PANEL_BODY.ticker}>
       <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto font-mono text-xs tabular-nums space-y-px">
         {display.length === 0 && (
           <div className="italic py-8 text-center text-xs text-muted">
@@ -61,6 +60,6 @@ export function LiveStream() {
           </div>
         ))}
       </div>
-    </div>
+    </Panel>
   );
 }

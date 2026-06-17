@@ -87,19 +87,19 @@ export function CompressionStats() {
 
   return (
     <div className="card">
-      <h3 className="text-sm font-semibold mb-2" style={{ color: 'rgb(var(--color-text))' }}>Gorilla Compression</h3>
+      <h3 className="text-sm font-semibold mb-2">Gorilla Compression</h3>
       <div ref={containerRef} style={{ height: 160 }}>
         <canvas ref={canvasRef} className="w-full h-full" style={{ height: 160 }} />
       </div>
       <div className="grid grid-cols-2 gap-3 mt-2">
         <div className="text-center">
-          <div className="text-sm font-bold" style={{ color: 'rgb(var(--color-text))' }}>
+          <div className="text-sm font-bold font-mono tabular-nums text-text">
             {stats ? formatBytes(stats.rawBytes) : '--'}
           </div>
           <div className="stat-label">raw size</div>
         </div>
         <div className="text-center">
-          <div className="text-sm font-bold text-meridian-400">
+          <div className="text-sm font-bold font-mono tabular-nums text-accent">
             {stats ? formatBytes(stats.compressedBytes) : '--'}
           </div>
           <div className="stat-label">compressed</div>

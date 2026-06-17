@@ -222,7 +222,7 @@ export function ClusterTopology() {
 
   return (
     <div className="card h-[294px]">
-      <h3 className="text-sm font-semibold mb-2" style={{ color: 'rgb(var(--color-text))' }}>Cluster Topology</h3>
+      <h3 className="text-sm font-semibold mb-2">Cluster Topology</h3>
       <div ref={containerRef} className="w-full" style={{ height: 180 }}>
         <canvas ref={canvasRef} className="w-full h-full" style={{ height: 180 }} />
       </div>
@@ -235,7 +235,7 @@ export function ClusterTopology() {
                 className="inline-block w-2 h-2 rounded-full"
                 style={{ backgroundColor: color }}
               />
-              <span className="text-xs capitalize" style={{ color: 'rgb(var(--color-text-muted))' }}>{role}</span>
+              <span className="text-xs capitalize text-muted">{role}</span>
             </div>
           ))}
       </div>

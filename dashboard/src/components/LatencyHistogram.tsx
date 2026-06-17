@@ -152,7 +152,7 @@ export function LatencyHistogram() {
 
   return (
     <div className="card h-[294px]">
-      <h3 className="text-sm font-semibold mb-2" style={{ color: 'rgb(var(--color-text))' }}>Query Latency Distribution</h3>
+      <h3 className="text-sm font-semibold mb-2">Query Latency Distribution</h3>
       <div ref={containerRef} style={{ height: 180 }}>
         <canvas ref={canvasRef} className="w-full h-full" style={{ height: 180 }} />
       </div>

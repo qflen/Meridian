@@ -37,38 +37,35 @@ export function LiveStream() {
   return (
     <div className="card flex flex-col h-[294px]">
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Live Stream</h3>
+        <h3 className="text-sm font-semibold">Live Stream</h3>
         <div className="flex items-center gap-2">
           {state.connectionStatus === 'connected' ? (
-            <span className="flex items-center gap-1.5 text-xs" style={{ color: 'rgb(var(--color-success))' }}>
-              <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ backgroundColor: 'rgb(var(--color-success))' }} />
+            <span className="flex items-center gap-1.5 text-xs text-ok">
+              <span className="w-1.5 h-1.5 rounded-full bg-ok" />
               Connected
             </span>
           ) : (
-            <span className="flex items-center gap-1.5 text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
-              <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'rgb(var(--color-text-muted))' }} />
+            <span className="flex items-center gap-1.5 text-xs text-muted">
+              <span className="w-1.5 h-1.5 rounded-full bg-muted animate-pulse" />
               {state.connectionStatus === 'reconnecting' ? 'Reconnecting…' : 'Connecting…'}
             </span>
           )}
         </div>
       </div>
-      <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto font-mono text-xs space-y-px">
+      <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto font-mono text-xs tabular-nums space-y-px">
         {display.length === 0 && (
-          <div className="italic py-8 text-center text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
+          <div className="italic py-8 text-center text-xs text-muted">
             Waiting for live data...
           </div>
         )}
         {display.map((e) => (
           <div
             key={liveRowKey(e)}
-            className="flex items-center gap-2 px-2 py-1 rounded transition-colors"
-            style={{ cursor: 'default' }}
-            onMouseEnter={(el) => el.currentTarget.style.background = 'rgb(var(--color-text) / 0.06)'}
-            onMouseLeave={(el) => el.currentTarget.style.background = 'transparent'}
+            className="flex items-center gap-2 px-2 py-1 rounded cursor-default transition-colors hover:bg-text/5"
           >
-            <span className="w-24 shrink-0 whitespace-nowrap" style={{ color: 'rgb(var(--color-text-muted))' }}>{formatTs(e.ts)}</span>
-            <span className="flex-1 break-all" style={{ color: 'rgb(var(--color-text))' }}>{e.key}</span>
-            <span className="text-meridian-400 font-medium w-16 text-right shrink-0">
+            <span className="w-24 shrink-0 whitespace-nowrap text-muted">{formatTs(e.ts)}</span>
+            <span className="flex-1 break-all text-text">{e.key}</span>
+            <span className="text-accent font-medium w-16 text-right shrink-0">
               {formatVal(e.value)}
             </span>
           </div>

@@ -51,20 +51,8 @@ export function QueryEditor() {
             spellCheck={false}
           />
           {showSuggestions && input === '' && (
-            <div
-              className="absolute top-full left-0 right-0 mt-1 z-50 rounded-lg shadow-xl"
-              style={{
-                border: '1px solid rgb(var(--color-border))',
-                background: 'rgb(var(--color-surface))',
-              }}
-            >
-              <div
-                className="px-3 py-1.5 text-xs"
-                style={{
-                  color: 'rgb(var(--color-text-muted))',
-                  borderBottom: '1px solid rgb(var(--color-border))',
-                }}
-              >
+            <div className="absolute top-full left-0 right-0 mt-1 z-50 rounded-md border bg-surface shadow-md">
+              <div className="px-3 py-1.5 text-xs text-muted border-b">
                 Example queries
               </div>
               {EXAMPLE_QUERIES.map((q) => (
@@ -72,10 +60,7 @@ export function QueryEditor() {
                   key={q}
                   type="button"
                   onMouseDown={() => selectSuggestion(q)}
-                  className="block w-full text-left px-3 py-2 font-mono text-sm transition-colors"
-                  style={{ color: 'rgb(var(--color-text))' }}
-                  onMouseEnter={(e) => e.currentTarget.style.background = 'rgb(var(--color-text) / 0.06)'}
-                  onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                  className="block w-full text-left px-3 py-2 font-mono text-sm text-text transition-colors hover:bg-text/5"
                 >
                   {q}
                 </button>
@@ -100,14 +85,7 @@ export function QueryEditor() {
       </form>
 
       {state.queryError && (
-        <div
-          className="mt-2 px-3 py-2 rounded-lg text-sm"
-          style={{
-            background: 'rgb(var(--color-danger) / 0.1)',
-            border: '1px solid rgb(var(--color-danger) / 0.3)',
-            color: 'rgb(var(--color-danger))',
-          }}
-        >
+        <div className="mt-2 px-3 py-2 rounded-md text-sm bg-crit/10 border border-crit/30 text-crit">
           {state.queryError}
         </div>
       )}

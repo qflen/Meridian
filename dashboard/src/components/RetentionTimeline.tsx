@@ -175,8 +175,8 @@ export function RetentionTimeline() {
   return (
     <div className="card">
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Retention Timeline</h3>
-        <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
+        <h3 className="text-sm font-semibold">Retention Timeline</h3>
+        <span className="text-xs text-muted tabular-nums">
           {blocks.length > 0 ? `${blocks.length} blocks` : state.stats ? `${state.stats.blockCount} blocks` : '--'}
         </span>
       </div>

@@ -13,14 +13,14 @@ import { LiveStream } from './components/LiveStream';
 import { ThemeToggle } from './components/ThemeToggle';
 import { ConnectionStatus } from './types';
 
-function connectionDotColor(status: ConnectionStatus): string {
+function connectionDotClass(status: ConnectionStatus): string {
   switch (status) {
     case 'connected':
-      return 'rgb(var(--color-success))';
+      return 'bg-ok';
     case 'reconnecting':
-      return 'rgb(var(--color-warning))';
+      return 'bg-warn';
     default:
-      return 'rgb(var(--color-text-muted))';
+      return 'bg-muted';
   }
 }
 
@@ -79,8 +79,8 @@ function Dashboard() {
       <header className="app-header">
         <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <svg viewBox="0 0 32 32" className="w-7 h-7">
-              <circle cx="16" cy="16" r="14" fill="#4c6ef5" />
+            <svg viewBox="0 0 32 32" className="w-7 h-7 text-accent">
+              <circle cx="16" cy="16" r="14" fill="currentColor" />
               <path
                 d="M8 20 L14 12 L18 16 L24 8"
                 stroke="white"
@@ -91,7 +91,7 @@ function Dashboard() {
             </svg>
             <div>
               <h1 className="text-base font-bold tracking-tight">Meridian</h1>
-              <p className="text-[10px] -mt-0.5" style={{ color: 'rgb(var(--color-text-muted))' }}>Distributed Time-Series Database</p>
+              <p className="text-2xs -mt-0.5 text-muted">Distributed Time-Series Database</p>
             </div>
           </div>
 
@@ -105,24 +105,21 @@ function Dashboard() {
               )}
             </div>
 
-            {/* Connection status — third "reconnecting" state reuses the dot */}
+            {/* Connection status — a steady lamp when live, pulsing while transient */}
             <div className="flex items-center gap-1.5">
               <span
-                className={`w-2 h-2 rounded-full ${
-                  state.connectionStatus === 'connected' || state.connectionStatus === 'reconnecting'
-                    ? 'animate-pulse'
-                    : ''
+                className={`w-2 h-2 rounded-full ${connectionDotClass(state.connectionStatus)} ${
+                  state.connectionStatus === 'connected' ? '' : 'animate-pulse'
                 }`}
-                style={{ backgroundColor: connectionDotColor(state.connectionStatus) }}
               />
-              <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
+              <span className="text-xs text-muted">
                 {connectionLabel(state.connectionStatus)}
               </span>
             </div>
 
             {/* Uptime */}
             {state.stats && Number.isFinite(state.stats.uptimeSeconds) && (
-              <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
+              <span className="text-xs text-muted tabular-nums">
                 Up {Math.floor(state.stats.uptimeSeconds / 60)}m
               </span>
             )}
@@ -143,8 +140,8 @@ function Dashboard() {
         {chartSeries.length > 0 && (
           <div className="card">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-semibold" style={{ color: 'rgb(var(--color-text))' }}>Query Result</h3>
-              <span className="text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
+              <h3 className="text-sm font-semibold">Query Result</h3>
+              <span className="text-xs text-muted tabular-nums">
                 {state.queryResult?.data?.length ?? 0} series
                 {state.queryResult?.stats &&
                   ` | ${state.queryResult.stats.samplesFetched} samples in ${state.queryResult.stats.executionMs}ms`}

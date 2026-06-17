@@ -307,6 +307,10 @@ func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE meridian_samples_ingested_total counter\n")
 	fmt.Fprintf(w, "meridian_samples_ingested_total{node=%q} %d\n", node, s.db.IngestionRate())
 
+	fmt.Fprintf(w, "# HELP meridian_out_of_order_samples_total Samples rejected for arriving out of order.\n")
+	fmt.Fprintf(w, "# TYPE meridian_out_of_order_samples_total counter\n")
+	fmt.Fprintf(w, "meridian_out_of_order_samples_total{node=%q} %d\n", node, s.db.OutOfOrderTotal())
+
 	fmt.Fprintf(w, "# HELP meridian_head_samples Samples currently resident in the in-memory head block.\n")
 	fmt.Fprintf(w, "# TYPE meridian_head_samples gauge\n")
 	fmt.Fprintf(w, "meridian_head_samples{node=%q} %d\n", node, stats.HeadSamples)

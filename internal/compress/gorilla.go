@@ -430,6 +430,14 @@ func (d *Decoder) readValueBits() (float64, bool) {
 		if sigBits == 0 {
 			sigBits = 64
 		}
+		// Defensive bounds-check (decode path only): a valid block always has
+		// leading + sigBits <= 64. Malformed input would otherwise underflow the
+		// trailing computation and silently corrupt the output; reject it instead.
+		if int(leading)+int(sigBits) > 64 {
+			d.err = fmt.Errorf("invalid value block: leading=%d + sigBits=%d > 64", leading, sigBits)
+			d.done = true
+			return 0, false
+		}
 		trailing := 64 - leading - sigBits
 
 		v, ok3 := d.readBits(uint(sigBits))

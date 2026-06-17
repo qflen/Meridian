@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { TimeSeriesChart } from './TimeSeriesChart';
+import { Panel } from './Panel';
+import { Placeholder } from './Placeholder';
+import { PANEL_BODY } from '../utils/layout';
 
 interface MetricMeta {
   name: string;
@@ -60,11 +63,12 @@ export function MetricExplorer() {
     : [];
 
   return (
-    <div className="card">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold">Metric Explorer</h3>
-        <span className="text-xs text-muted tabular-nums">{metrics.length} metrics</span>
-      </div>
+    <Panel
+      tier="tertiary"
+      title="Metric Explorer"
+      meta={`${metrics.length} metrics`}
+      bodyHeight={PANEL_BODY.explorer}
+    >
       <input
         type="text"
         value={filter}
@@ -72,13 +76,14 @@ export function MetricExplorer() {
         placeholder="Filter metrics..."
         className="input w-full mb-3 text-xs"
       />
-      <div className="flex gap-3 h-64">
+      <div className="flex gap-3 flex-1 min-h-0">
         <div className="w-1/2 overflow-y-auto space-y-0.5 pr-2">
-          {filtered.length === 0 && (
-            <div className="text-xs italic py-4 text-center text-muted">
-              {metrics.length === 0 ? 'Connect to server to browse metrics' : 'No matching metrics'}
-            </div>
-          )}
+          {filtered.length === 0 &&
+            (metrics.length === 0 ? (
+              <Placeholder title="No metrics to browse yet." hint="They appear once the server starts reporting." />
+            ) : (
+              <Placeholder title="No metrics match this filter." hint="Clear the filter to see them all." />
+            ))}
           {filtered.map((m) => (
             <button
               key={m.name}
@@ -94,16 +99,18 @@ export function MetricExplorer() {
             </button>
           ))}
         </div>
-        <div className="w-1/2 flex items-center justify-center">
+        <div className="w-1/2 min-h-0">
           {selected && liveData.length > 0 ? (
-            <TimeSeriesChart series={liveData} height={240} showLegend={false} />
-          ) : (
-            <div className="text-xs italic text-muted">
-              {selected ? 'Waiting for data...' : 'Select a metric'}
+            <div className="w-full h-full">
+              <TimeSeriesChart series={liveData} showLegend={false} />
             </div>
+          ) : selected ? (
+            <Placeholder title="Waiting for samples…" hint="Live values for this metric will plot here." />
+          ) : (
+            <Placeholder title="Select a metric to preview." hint="Pick one on the left to plot its live values." />
           )}
         </div>
       </div>
-    </div>
+    </Panel>
   );
 }

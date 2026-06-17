@@ -1,10 +1,12 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
 import { useDashboard } from '../state/DashboardContext';
+import { Panel } from './Panel';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
 import { formatTime } from '../utils/format';
 import { CATEGORICAL } from '../utils/chartPalette';
 import { BlockInfo } from '../types';
+import { PANEL_BODY } from '../utils/layout';
 
 export function RetentionTimeline() {
   const { state } = useDashboard();
@@ -170,17 +172,14 @@ export function RetentionTimeline() {
     return () => ro.disconnect();
   }, [render]);
 
+  const blockMeta =
+    blocks.length > 0 ? `${blocks.length} blocks` : state.stats ? `${state.stats.blockCount} blocks` : '--';
+
   return (
-    <div className="card">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold">Retention Timeline</h3>
-        <span className="text-xs text-muted tabular-nums">
-          {blocks.length > 0 ? `${blocks.length} blocks` : state.stats ? `${state.stats.blockCount} blocks` : '--'}
-        </span>
+    <Panel tier="tertiary" title="Retention Timeline" meta={blockMeta} bodyHeight={PANEL_BODY.compact}>
+      <div ref={containerRef} className="flex-1 min-h-0">
+        <canvas ref={canvasRef} className="block w-full h-full" />
       </div>
-      <div ref={containerRef} style={{ height: 160 }}>
-        <canvas ref={canvasRef} className="w-full h-full" style={{ height: 160 }} />
-      </div>
-    </div>
+    </Panel>
   );
 }

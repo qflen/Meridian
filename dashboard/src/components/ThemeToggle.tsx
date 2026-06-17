@@ -17,19 +17,22 @@ export function ThemeToggle() {
   };
 
   return (
-    <div className="flex items-center gap-1 rounded-md p-0.5 border">
+    <div role="group" aria-label="Color theme" className="flex items-center gap-1 rounded-md p-0.5 border">
       {THEMES.map((t) => (
         <button
           key={t.value}
+          type="button"
           onClick={() => setTheme(t.value)}
-          title={t.label}
+          title={`${t.label} theme`}
+          aria-label={`${t.label} theme`}
+          aria-pressed={state.theme === t.value}
           className={`rounded p-1.5 transition-colors ${
             state.theme === t.value
               ? 'bg-accent text-white'
               : 'text-muted hover:text-text'
           }`}
         >
-          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
             <path strokeLinecap="round" strokeLinejoin="round" d={t.icon} />
           </svg>
         </button>

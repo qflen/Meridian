@@ -1,9 +1,11 @@
 import { useRef, useEffect, useCallback } from 'react';
 import { useDashboard } from '../state/DashboardContext';
+import { Panel } from './Panel';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
 import { compressionRatio } from '../utils/compression';
 import { formatBytes } from '../utils/format';
+import { PANEL_BODY } from '../utils/layout';
 
 export function CompressionStats() {
   const { state } = useDashboard();
@@ -77,10 +79,9 @@ export function CompressionStats() {
   }, [render]);
 
   return (
-    <div className="card">
-      <h3 className="text-sm font-semibold mb-2">Gorilla Compression</h3>
-      <div ref={containerRef} style={{ height: 160 }}>
-        <canvas ref={canvasRef} className="w-full h-full" style={{ height: 160 }} />
+    <Panel tier="tertiary" title="Gorilla Compression" bodyHeight={PANEL_BODY.compact}>
+      <div ref={containerRef} className="flex-1 min-h-0">
+        <canvas ref={canvasRef} className="block w-full h-full" />
       </div>
       <div className="grid grid-cols-2 gap-3 mt-2">
         <div className="text-center">
@@ -96,6 +97,6 @@ export function CompressionStats() {
           <div className="stat-label">compressed</div>
         </div>
       </div>
-    </div>
+    </Panel>
   );
 }

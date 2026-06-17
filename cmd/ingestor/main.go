@@ -17,6 +17,7 @@ import (
 	"time"
 
 	pb "github.com/meridiandb/meridian/internal/ingestion/proto"
+	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
 )
 
@@ -44,8 +45,7 @@ func main() {
 
 	// Start HTTP server
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", srv.handleHealth)
-	mux.HandleFunc("/api/internal/ingest", srv.handleHTTPIngest)
+	srv.registerRoutes(mux)
 
 	httpServer := &http.Server{Addr: httpAddr, Handler: corsMiddleware(mux)}
 	go func() {
@@ -71,6 +71,17 @@ type ingestorServer struct {
 	nodeID    string
 	storage   *service.StorageClient
 	startTime time.Time
+}
+
+func (s *ingestorServer) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/internal/ingest", s.handleHTTPIngest)
+	mux.HandleFunc("/metrics", s.handleMetrics)
+}
+
+func (s *ingestorServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	server.WriteServiceMetrics(w, s.nodeID, "ingestor", time.Since(s.startTime))
 }
 
 func (s *ingestorServer) handleHealth(w http.ResponseWriter, r *http.Request) {

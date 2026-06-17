@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/meridiandb/meridian/internal/query"
+	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
 )
 
@@ -35,12 +36,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", srv.handleHealth)
-	mux.HandleFunc("/api/internal/query", srv.handleQuery)
-	mux.HandleFunc("/api/internal/series", srv.handleSeries)
-	mux.HandleFunc("/api/internal/labels", srv.handleLabels)
-	mux.HandleFunc("/api/internal/label/", srv.handleLabelValues)
-	mux.HandleFunc("/api/internal/latency", srv.handleLatency)
+	srv.registerRoutes(mux)
 
 	httpServer := &http.Server{Addr: httpAddr, Handler: corsMiddleware(mux)}
 	go func() {
@@ -67,6 +63,21 @@ type querierServer struct {
 	storage   *service.StorageClient
 	latency   *service.LatencyTracker
 	startTime time.Time
+}
+
+func (s *querierServer) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/api/internal/query", s.handleQuery)
+	mux.HandleFunc("/api/internal/series", s.handleSeries)
+	mux.HandleFunc("/api/internal/labels", s.handleLabels)
+	mux.HandleFunc("/api/internal/label/", s.handleLabelValues)
+	mux.HandleFunc("/api/internal/latency", s.handleLatency)
+	mux.HandleFunc("/metrics", s.handleMetrics)
+}
+
+func (s *querierServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	server.WriteServiceMetrics(w, s.nodeID, "querier", time.Since(s.startTime))
 }
 
 func (s *querierServer) handleHealth(w http.ResponseWriter, r *http.Request) {

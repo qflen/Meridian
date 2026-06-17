@@ -92,6 +92,7 @@ func (gw *gatewayServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/cluster", gw.handleCluster)
 	mux.HandleFunc("/api/v1/blocks", gw.handleBlocks)
 	mux.HandleFunc("/api/v1/query_latency", gw.handleLatency)
+	mux.HandleFunc("/metrics", gw.handleMetrics)
 	mux.HandleFunc("/ws/metrics", gw.handleWSMetrics)
 
 	// Serve dashboard static files
@@ -262,6 +263,14 @@ func (gw *gatewayServer) handleLatency(w http.ResponseWriter, r *http.Request) {
 
 func (gw *gatewayServer) handleWSMetrics(w http.ResponseWriter, r *http.Request) {
 	server.HandleWSUpgrade(gw.wsHub, w, r)
+}
+
+func (gw *gatewayServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	server.WriteServiceMetrics(w, gw.nodeID, "gateway", time.Since(gw.startTime))
+	fmt.Fprintf(w, "# HELP meridian_ws_clients Connected dashboard WebSocket clients.\n")
+	fmt.Fprintf(w, "# TYPE meridian_ws_clients gauge\n")
+	fmt.Fprintf(w, "meridian_ws_clients{node=%q,role=\"gateway\"} %d\n", gw.nodeID, gw.wsHub.ClientCount())
 }
 
 // broadcastLoop periodically polls storage nodes for stats and series data,

@@ -19,14 +19,75 @@ const ROLE_COLORS: Record<string, string> = {
   unknown: '#8A8F99',
 };
 
-const ROLE_ICONS: Record<string, string> = {
-  gateway: 'GW',
-  ingestor: 'IN',
-  storage: 'ST',
-  querier: 'QR',
-  compactor: 'CP',
-  unknown: '??',
-};
+// Each role reads as a distinct shape rather than a two-letter code: gateway a
+// diamond (routing), ingestor a down-triangle (intake), storage a square
+// (block), querier a circle (lens), compactor a hexagon (merge). The legend
+// (RoleGlyph) mirrors these exactly.
+function nodeShapePath(
+  ctx: CanvasRenderingContext2D,
+  role: string,
+  x: number,
+  y: number,
+  r: number,
+): void {
+  ctx.beginPath();
+  switch (role) {
+    case 'gateway': // diamond
+      ctx.moveTo(x, y - r);
+      ctx.lineTo(x + r, y);
+      ctx.lineTo(x, y + r);
+      ctx.lineTo(x - r, y);
+      ctx.closePath();
+      break;
+    case 'ingestor': { // down-triangle
+      const t = r * 1.08;
+      ctx.moveTo(x - t, y - t * 0.7);
+      ctx.lineTo(x + t, y - t * 0.7);
+      ctx.lineTo(x, y + t);
+      ctx.closePath();
+      break;
+    }
+    case 'storage': { // square
+      const s = r * 0.92;
+      ctx.rect(x - s, y - s, s * 2, s * 2);
+      break;
+    }
+    case 'compactor': // hexagon
+      for (let i = 0; i < 6; i++) {
+        const a = (Math.PI / 3) * i - Math.PI / 6;
+        const px = x + Math.cos(a) * r;
+        const py = y + Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      break;
+    case 'querier': // circle (lens)
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      break;
+    default: // unknown — a smaller circle
+      ctx.arc(x, y, r * 0.7, 0, Math.PI * 2);
+  }
+}
+
+/** DOM mirror of nodeShapePath, used by the legend so it matches the canvas. */
+function RoleGlyph({ role, color }: { role: string; color: string }) {
+  const cls = 'w-2.5 h-2.5 shrink-0';
+  switch (role) {
+    case 'gateway':
+      return <svg viewBox="0 0 16 16" className={cls} aria-hidden="true"><polygon points="8,1 15,8 8,15 1,8" fill={color} /></svg>;
+    case 'ingestor':
+      return <svg viewBox="0 0 16 16" className={cls} aria-hidden="true"><polygon points="2,4 14,4 8,15" fill={color} /></svg>;
+    case 'storage':
+      return <svg viewBox="0 0 16 16" className={cls} aria-hidden="true"><rect x="2" y="2" width="12" height="12" fill={color} /></svg>;
+    case 'compactor':
+      return <svg viewBox="0 0 16 16" className={cls} aria-hidden="true"><polygon points="13.6,4.8 13.6,11.2 8,14.5 2.4,11.2 2.4,4.8 8,1.5" fill={color} /></svg>;
+    case 'querier':
+      return <svg viewBox="0 0 16 16" className={cls} aria-hidden="true"><circle cx="8" cy="8" r="6.5" fill={color} /></svg>;
+    default:
+      return <svg viewBox="0 0 16 16" className={cls} aria-hidden="true"><circle cx="8" cy="8" r="4.5" fill={color} /></svg>;
+  }
+}
 
 export function ClusterTopology() {
   const { state, dispatch } = useDashboard();
@@ -138,25 +199,16 @@ export function ClusterTopology() {
             ? colors.danger
             : colors.warning; // joining / leaving
       const roleColor = ROLE_COLORS[node.role] || ROLE_COLORS.unknown;
-      const nodeR = node.state === 'active' ? 10 : 7;
+      const nodeR = node.state === 'active' ? 9 : 6.5;
 
-      // Node circle: role color when active, status color otherwise
+      // Role shape, filled with the role colour when active or the status
+      // colour otherwise, on a hairline border.
+      nodeShapePath(ctx, node.role, nx, ny, nodeR);
       ctx.fillStyle = node.state === 'active' ? roleColor : stateColor;
-      ctx.beginPath();
-      ctx.arc(nx, ny, nodeR, 0, Math.PI * 2);
       ctx.fill();
-
-      // Hairline border
       ctx.strokeStyle = colors.border;
       ctx.lineWidth = 1;
       ctx.stroke();
-
-      // Role abbreviation inside the circle
-      ctx.fillStyle = '#fff';
-      ctx.font = canvasFont(nodeR > 8 ? 8 : 7, { weight: 600 });
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(ROLE_ICONS[node.role] || '??', nx, ny);
 
       // Label below/above
       ctx.fillStyle = colors.textMuted;
@@ -223,10 +275,7 @@ export function ClusterTopology() {
           .filter(([role]) => role !== 'unknown')
           .map(([role, color]) => (
             <div key={role} className="flex items-center gap-1.5">
-              <span
-                className="inline-block w-2 h-2 rounded-full"
-                style={{ backgroundColor: color }}
-              />
+              <RoleGlyph role={role} color={color} />
               <span className="text-xs capitalize text-muted">{role}</span>
             </div>
           ))}

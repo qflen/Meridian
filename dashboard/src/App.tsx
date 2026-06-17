@@ -114,15 +114,14 @@ function Dashboard() {
       <header className="app-header">
         <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <svg viewBox="0 0 32 32" className="w-7 h-7 text-accent">
-              <circle cx="16" cy="16" r="14" fill="currentColor" />
-              <path
-                d="M8 20 L14 12 L18 16 L24 8"
-                stroke="white"
-                strokeWidth="2.5"
-                fill="none"
-                strokeLinecap="round"
-              />
+            {/* Transit-instrument mark: a graduated setting circle, the meridian
+                line running clear through it, an inset horizon chord, and a star
+                fixed on the meridian — the same crosshair the chart draws. */}
+            <svg viewBox="0 0 32 32" className="w-7 h-7 text-accent" fill="none" stroke="currentColor" aria-hidden="true">
+              <circle cx="16" cy="16" r="10.5" strokeWidth="1.6" />
+              <line x1="16" y1="3" x2="16" y2="29" strokeWidth="1.6" strokeLinecap="round" />
+              <line x1="9" y1="16" x2="23" y2="16" strokeWidth="1.4" strokeLinecap="round" />
+              <circle cx="16" cy="10.5" r="1.9" fill="currentColor" stroke="none" />
             </svg>
             <div>
               <h1 className="text-base font-bold tracking-tight">Meridian</h1>

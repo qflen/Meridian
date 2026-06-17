@@ -34,71 +34,243 @@ type ResultSeries struct {
 	Points []storage.Point
 }
 
-// Execute runs a PromQL-subset query and returns the result series.
+const (
+	// defaultLookbackDelta is the staleness window for instant-vector selection:
+	// at evaluation time t a series contributes its most recent sample with
+	// timestamp in [t-delta, t]. A series with no sample in that window produces a
+	// gap (no point), never a zero. 5m matches Prometheus's default look-back delta.
+	// See ADR-014.
+	defaultLookbackDelta = 5 * time.Minute
+
+	// defaultStepPoints is the target number of points across [start,end] when the
+	// caller does not specify a step; the step is sized so the range yields about
+	// this many evaluations.
+	defaultStepPoints = 250
+
+	// minStep floors the auto-derived step so a tiny range cannot explode into
+	// sub-second sampling.
+	minStep = time.Second
+
+	// maxStepCount caps the number of evaluation steps per query. It bounds both
+	// CPU and output size, pre-empting a DoS via attacker-controlled start/end/step.
+	maxStepCount = 11000
+)
+
+// Execute evaluates a PromQL-subset query as a range query: it evaluates the
+// expression as an instant query at each step t in {start, start+step, ..., end}
+// and assembles a matrix — one point list per series, keyed by label set, in time
+// order. A series contributes a point at step t only when it has data there
+// (within the look-back window for instant vectors), so gaps remain gaps.
+//
+// When start == end a single instant is evaluated. When step <= 0 a step is
+// derived so the range yields roughly defaultStepPoints points (floored at 1s).
 func (e *Engine) Execute(ctx context.Context, query string, start, end int64, step time.Duration) ([]ResultSeries, error) {
 	expr, err := Parse(query)
 	if err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
-
-	plan := Plan(expr, start, end, step)
-	// Pass the original start through. The planner's TimeRange records the widest
-	// data span a future stepped evaluator will need to fetch (start - maxRange);
-	// the per-selector range window is applied exactly once, in evalRange, so it
-	// must not be pre-subtracted here as well.
-	return e.eval(ctx, plan.Expr, start, end)
-}
-
-func (e *Engine) eval(ctx context.Context, expr Expr, start, end int64) ([]ResultSeries, error) {
-	switch ex := expr.(type) {
-	case *VectorSelector:
-		return e.evalVector(ctx, ex, start, end)
-	case *RangeSelector:
-		return e.evalRange(ctx, ex, start, end)
-	case *FunctionCall:
-		return e.evalFunction(ctx, ex, start, end)
-	case *AggregateExpr:
-		return e.evalAggregate(ctx, ex, start, end)
-	case *BinaryExpr:
-		return e.evalBinary(ctx, ex, start, end)
-	case *NumberLiteral:
-		return []ResultSeries{{
-			Name:   "",
-			Labels: map[string]string{},
-			Points: []storage.Point{{Timestamp: end, Value: ex.Value}},
-		}}, nil
+	if start > end {
+		return nil, fmt.Errorf("invalid range: start %d is after end %d", start, end)
 	}
-	return nil, fmt.Errorf("unsupported expression type: %T", expr)
-}
 
-func (e *Engine) evalVector(ctx context.Context, vs *VectorSelector, start, end int64) ([]ResultSeries, error) {
-	matchers := convertMatchers(vs.Name, vs.Matchers)
-	ss, err := e.ds.Query(ctx, matchers, start, end)
+	stepMs := step.Milliseconds()
+	if stepMs <= 0 {
+		stepMs = defaultStepMs(start, end)
+	}
+
+	// Number of steps on the grid {start, start+step, ..., <=end}. start==end gives
+	// exactly one step (a single instant evaluation).
+	nSteps := int((end-start)/stepMs) + 1
+	if nSteps > maxStepCount {
+		return nil, fmt.Errorf("query would evaluate %d steps, exceeding the maximum of %d; widen the step or narrow the range", nSteps, maxStepCount)
+	}
+
+	ec, err := e.newEvalContext(ctx, expr, start, end, stepMs)
 	if err != nil {
 		return nil, err
 	}
 
-	results := make([]ResultSeries, len(ss))
-	for i, s := range ss {
-		results[i] = ResultSeries{
-			Name:   s.Name,
-			Labels: s.Labels,
-			Points: s.Points,
+	asm := newMatrixAssembler()
+	for i := 0; i < nSteps; i++ {
+		t := start + int64(i)*stepMs
+		vec, err := e.evalInstant(ec, expr, t)
+		if err != nil {
+			return nil, err
+		}
+		asm.add(vec)
+	}
+	return asm.matrix(), nil
+}
+
+// defaultStepMs sizes an auto step so [start,end] yields ~defaultStepPoints points,
+// floored at minStep.
+func defaultStepMs(start, end int64) int64 {
+	floor := minStep.Milliseconds()
+	span := end - start
+	if span <= 0 {
+		return floor
+	}
+	s := span / defaultStepPoints
+	if s < floor {
+		s = floor
+	}
+	return s
+}
+
+// evalContext carries per-Execute state: the request context, the look-back delta,
+// and the data pre-fetched once per leaf selector. Per-step evaluation slices this
+// in memory rather than re-querying storage, so a range query is one fetch per
+// selector, not one per step.
+type evalContext struct {
+	ctx      context.Context
+	lookback int64                                 // staleness window, ms
+	fetched  map[*VectorSelector]storage.SeriesSet // full-window data per leaf selector
+}
+
+// newEvalContext fetches every leaf selector's full needed window exactly once.
+// The window spans [start - maxRange - lookback, end]: the planner widens the
+// lower bound to start-maxRange (its block-pruning span, covering the widest range
+// selector); extending it by the look-back delta also covers instant-vector
+// staleness at t=start. Every step is then answered by slicing this single fetch —
+// no storage round-trip per step (avoids an N+1 over steps). Matchers are pushed
+// down per selector so each leaf prunes on its own predicates.
+func (e *Engine) newEvalContext(ctx context.Context, expr Expr, start, end, stepMs int64) (*evalContext, error) {
+	lookback := defaultLookbackDelta.Milliseconds()
+	ec := &evalContext{
+		ctx:      ctx,
+		lookback: lookback,
+		fetched:  make(map[*VectorSelector]storage.SeriesSet),
+	}
+
+	plan := Plan(expr, start, end, time.Duration(stepMs)*time.Millisecond)
+	fetchStart := plan.TimeRange[0] - lookback
+	fetchEnd := plan.TimeRange[1]
+	for _, vs := range collectSelectors(expr) {
+		if _, ok := ec.fetched[vs]; ok {
+			continue // same selector node referenced twice — fetch once
+		}
+		ss, err := e.ds.Query(ctx, convertMatchers(vs.Name, vs.Matchers), fetchStart, fetchEnd)
+		if err != nil {
+			return nil, err
+		}
+		// Per-step lookback and window slicing assume time-sorted points. Storage
+		// already sorts, but guard against an unsorted DataSource defensively.
+		for i := range ss {
+			pts := ss[i].Points
+			if !sort.SliceIsSorted(pts, func(a, b int) bool { return pts[a].Timestamp < pts[b].Timestamp }) {
+				sort.Slice(pts, func(a, b int) bool { return pts[a].Timestamp < pts[b].Timestamp })
+			}
+		}
+		ec.fetched[vs] = ss
+	}
+	return ec, nil
+}
+
+// collectSelectors walks the AST and returns every leaf vector selector, including
+// the one wrapped by each range selector.
+func collectSelectors(expr Expr) []*VectorSelector {
+	var out []*VectorSelector
+	var walk func(Expr)
+	walk = func(ex Expr) {
+		switch n := ex.(type) {
+		case *VectorSelector:
+			out = append(out, n)
+		case *RangeSelector:
+			out = append(out, n.Vector)
+		case *FunctionCall:
+			for _, a := range n.Args {
+				walk(a)
+			}
+		case *AggregateExpr:
+			walk(n.Expr)
+			if n.Param != nil {
+				walk(n.Param)
+			}
+		case *BinaryExpr:
+			walk(n.Left)
+			walk(n.Right)
 		}
 	}
-	return results, nil
+	walk(expr)
+	return out
 }
 
-func (e *Engine) evalRange(ctx context.Context, rs *RangeSelector, start, end int64) ([]ResultSeries, error) {
-	// A range vector m[d] evaluated at instant `end` covers (end-d, end]. We anchor
-	// the window at `end` rather than `start` so rate()/range functions read exactly
-	// one selector-width of samples regardless of how wide [start,end] is. This is
-	// the single place the range duration is subtracted (see Execute).
-	rangeStart := end - rs.Duration.Milliseconds()
-	return e.evalVector(ctx, rs.Vector, rangeStart, end)
+// evalInstant evaluates expr at a single instant t and returns the instant vector
+// as ResultSeries each carrying at most one point stamped at t (a range selector
+// is the exception: it yields the raw windowed samples for a range function). All
+// the per-timestamp helpers are reused unchanged; they collapse naturally to one
+// point when each input series holds a single sample at t.
+func (e *Engine) evalInstant(ec *evalContext, expr Expr, t int64) ([]ResultSeries, error) {
+	if err := ec.ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch ex := expr.(type) {
+	case *NumberLiteral:
+		return []ResultSeries{{
+			Name:   "",
+			Labels: map[string]string{},
+			Points: []storage.Point{{Timestamp: t, Value: ex.Value}},
+		}}, nil
+	case *VectorSelector:
+		return e.instantVector(ec, ex, t), nil
+	case *RangeSelector:
+		return e.rangeVector(ec, ex, t), nil
+	case *FunctionCall:
+		return e.evalFunctionInstant(ec, ex, t)
+	case *AggregateExpr:
+		return e.evalAggregateInstant(ec, ex, t)
+	case *BinaryExpr:
+		return e.evalBinaryInstant(ec, ex, t)
+	}
+	return nil, fmt.Errorf("unsupported expression type: %T", expr)
 }
 
-func (e *Engine) evalFunction(ctx context.Context, fc *FunctionCall, start, end int64) ([]ResultSeries, error) {
+// instantVector returns, for each matching series, its most recent sample with
+// timestamp in [t-lookback, t], stamped at t. A series with no sample in that
+// window contributes no point (a gap), per PromQL staleness — never a zero.
+func (e *Engine) instantVector(ec *evalContext, vs *VectorSelector, t int64) []ResultSeries {
+	ss := ec.fetched[vs]
+	var out []ResultSeries
+	for _, s := range ss {
+		// Largest index with Timestamp <= t (points are time-sorted).
+		i := sort.Search(len(s.Points), func(k int) bool { return s.Points[k].Timestamp > t }) - 1
+		if i < 0 {
+			continue // no sample at or before t
+		}
+		if s.Points[i].Timestamp < t-ec.lookback {
+			continue // newest sample is older than the look-back delta → stale gap
+		}
+		out = append(out, ResultSeries{
+			Name:   s.Name,
+			Labels: s.Labels,
+			Points: []storage.Point{{Timestamp: t, Value: s.Points[i].Value}},
+		})
+	}
+	return out
+}
+
+// rangeVector returns, for each matching series, the raw samples in (t-rangeDur, t]
+// with their original timestamps — the half-open window Prometheus feeds to range
+// functions. It is only meaningful as a function argument (e.g. rate(x[5m])); the
+// pure helper is then called with window end = t.
+func (e *Engine) rangeVector(ec *evalContext, rs *RangeSelector, t int64) []ResultSeries {
+	ss := ec.fetched[rs.Vector]
+	lo := t - rs.Duration.Milliseconds()
+	var out []ResultSeries
+	for _, s := range ss {
+		a := sort.Search(len(s.Points), func(k int) bool { return s.Points[k].Timestamp > lo }) // exclude lo
+		b := sort.Search(len(s.Points), func(k int) bool { return s.Points[k].Timestamp > t })  // include t
+		if a >= b {
+			continue
+		}
+		pts := make([]storage.Point, b-a)
+		copy(pts, s.Points[a:b])
+		out = append(out, ResultSeries{Name: s.Name, Labels: s.Labels, Points: pts})
+	}
+	return out
+}
+
+func (e *Engine) evalFunctionInstant(ec *evalContext, fc *FunctionCall, t int64) ([]ResultSeries, error) {
 	switch fc.Name {
 	case "rate":
 		if len(fc.Args) != 1 {
@@ -108,21 +280,21 @@ func (e *Engine) evalFunction(ctx context.Context, fc *FunctionCall, start, end 
 		if !ok {
 			return nil, fmt.Errorf("rate() requires a range vector argument, e.g. rate(metric[5m])")
 		}
-		series, err := e.eval(ctx, fc.Args[0], start, end)
+		series, err := e.evalInstant(ec, fc.Args[0], t)
 		if err != nil {
 			return nil, err
 		}
 		rangeMs := rs.Duration.Milliseconds()
 		var results []ResultSeries
 		for _, s := range series {
-			v, ok := rate(s.Points, rangeMs, end)
+			v, ok := rate(s.Points, rangeMs, t)
 			if !ok {
 				continue
 			}
 			results = append(results, ResultSeries{
 				Name:   s.Name,
 				Labels: s.Labels,
-				Points: []storage.Point{{Timestamp: end, Value: v}},
+				Points: []storage.Point{{Timestamp: t, Value: v}},
 			})
 		}
 		return results, nil
@@ -135,23 +307,23 @@ func (e *Engine) evalFunction(ctx context.Context, fc *FunctionCall, start, end 
 		if !ok {
 			return nil, fmt.Errorf("histogram_quantile() first argument must be a number")
 		}
-		series, err := e.eval(ctx, fc.Args[1], start, end)
+		series, err := e.evalInstant(ec, fc.Args[1], t)
 		if err != nil {
 			return nil, err
 		}
 		return histogramQuantile(phiExpr.Value, series), nil
 
 	default:
-		// Treat unknown function names as aggregate ops if they match
+		// Treat an unknown single-argument function name as an aggregate op.
 		if len(fc.Args) == 1 {
-			return e.evalAggregate(ctx, &AggregateExpr{Op: fc.Name, Expr: fc.Args[0]}, start, end)
+			return e.evalAggregateInstant(ec, &AggregateExpr{Op: fc.Name, Expr: fc.Args[0]}, t)
 		}
 		return nil, fmt.Errorf("unknown function: %s", fc.Name)
 	}
 }
 
-func (e *Engine) evalAggregate(ctx context.Context, ae *AggregateExpr, start, end int64) ([]ResultSeries, error) {
-	series, err := e.eval(ctx, ae.Expr, start, end)
+func (e *Engine) evalAggregateInstant(ec *evalContext, ae *AggregateExpr, t int64) ([]ResultSeries, error) {
+	series, err := e.evalInstant(ec, ae.Expr, t)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +332,7 @@ func (e *Engine) evalAggregate(ctx context.Context, ae *AggregateExpr, start, en
 	if ae.Op == "topk" || ae.Op == "bottomk" {
 		k := 0
 		if ae.Param != nil {
-			pv, err := e.eval(ctx, ae.Param, start, end)
+			pv, err := e.evalInstant(ec, ae.Param, t)
 			if err != nil {
 				return nil, err
 			}
@@ -321,16 +493,16 @@ func (e *Engine) evalTopK(op string, k int, series []ResultSeries, grouping []st
 	return results
 }
 
-func (e *Engine) evalBinary(ctx context.Context, be *BinaryExpr, start, end int64) ([]ResultSeries, error) {
+func (e *Engine) evalBinaryInstant(ec *evalContext, be *BinaryExpr, t int64) ([]ResultSeries, error) {
 	if !isBinaryOp(be.Op) {
 		return nil, fmt.Errorf("unsupported binary operator %q", be.Op)
 	}
 
-	left, err := e.eval(ctx, be.Left, start, end)
+	left, err := e.evalInstant(ec, be.Left, t)
 	if err != nil {
 		return nil, err
 	}
-	right, err := e.eval(ctx, be.Right, start, end)
+	right, err := e.evalInstant(ec, be.Right, t)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +516,7 @@ func (e *Engine) evalBinary(ctx context.Context, be *BinaryExpr, start, end int6
 		return []ResultSeries{{
 			Name:   "",
 			Labels: map[string]string{},
-			Points: []storage.Point{{Timestamp: end, Value: applyBinaryOp(be.Op, scalarValue(left), scalarValue(right))}},
+			Points: []storage.Point{{Timestamp: t, Value: applyBinaryOp(be.Op, scalarValue(left), scalarValue(right))}},
 		}}, nil
 	case rightScalar:
 		return scaleSeries(left, be.Op, scalarValue(right), false), nil
@@ -457,6 +629,24 @@ func labelSignature(labels map[string]string) string {
 	return sb.String()
 }
 
+// seriesSignature is a stable key over a full label set, including the metric
+// name, used to identify a series across steps when assembling the matrix.
+func seriesSignature(labels map[string]string) string {
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for _, k := range keys {
+		sb.WriteString(k)
+		sb.WriteByte('=')
+		sb.WriteString(labels[k])
+		sb.WriteByte(0)
+	}
+	return sb.String()
+}
+
 // dropName returns a copy of labels without the metric-name label, matching
 // PromQL's rule that arithmetic between two vectors drops __name__.
 func dropName(labels map[string]string) map[string]string {
@@ -483,4 +673,44 @@ func applyBinaryOp(op string, a, b float64) float64 {
 		return a / b
 	}
 	return math.NaN()
+}
+
+// matrixAssembler collects the per-step instant vectors into a matrix. Series are
+// keyed by their full label set, kept in first-appearance order, and accumulate
+// strictly time-increasing points (a step that omits a series simply leaves a gap;
+// duplicate or out-of-order timestamps from a degenerate top-level range selector
+// are dropped).
+type matrixAssembler struct {
+	order []string
+	byKey map[string]*ResultSeries
+}
+
+func newMatrixAssembler() *matrixAssembler {
+	return &matrixAssembler{byKey: make(map[string]*ResultSeries)}
+}
+
+func (m *matrixAssembler) add(vec []ResultSeries) {
+	for _, s := range vec {
+		key := seriesSignature(s.Labels)
+		rs, ok := m.byKey[key]
+		if !ok {
+			rs = &ResultSeries{Name: s.Name, Labels: s.Labels}
+			m.byKey[key] = rs
+			m.order = append(m.order, key)
+		}
+		for _, p := range s.Points {
+			if n := len(rs.Points); n > 0 && p.Timestamp <= rs.Points[n-1].Timestamp {
+				continue // keep points strictly increasing in time
+			}
+			rs.Points = append(rs.Points, p)
+		}
+	}
+}
+
+func (m *matrixAssembler) matrix() []ResultSeries {
+	out := make([]ResultSeries, 0, len(m.order))
+	for _, key := range m.order {
+		out = append(out, *m.byKey[key])
+	}
+	return out
 }

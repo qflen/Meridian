@@ -47,8 +47,10 @@ func TestRateCounterReset(t *testing.T) {
 	}
 }
 
-// TestRateSparseInWideWindowEndToEnd drives the same scenario through the engine
-// to confirm the range duration is threaded in and the window is anchored at end.
+// TestRateSparseInWideWindowEndToEnd drives the scenario through the engine to
+// confirm the range duration is threaded in and the window is anchored at the
+// evaluation instant. The half-open window (0, 300000] excludes the sample at
+// ts=0, but extrapolation-to-zero still yields the same 5.0/s.
 func TestRateSparseInWideWindowEndToEnd(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()

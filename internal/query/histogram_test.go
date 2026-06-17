@@ -46,7 +46,7 @@ func TestHistogramQuantileEndToEnd(t *testing.T) {
 	db.Ingest(bkt, map[string]string{"le": "+Inf"}, ts, 6)
 	engine := NewEngine(db)
 
-	res, err := engine.Execute(context.Background(), "histogram_quantile(0.5, "+bkt+")", 0, 2000, 15*time.Second)
+	res, err := engine.Execute(context.Background(), "histogram_quantile(0.5, "+bkt+")", 1000, 1000, 15*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

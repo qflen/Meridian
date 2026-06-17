@@ -7,9 +7,12 @@ import (
 )
 
 // TestRangeWindowAppliedOnce guards against the range duration being subtracted
-// twice (once in the planner, once in evalRange). A point that sits just outside
-// the [dur] window must be excluded; with the double-subtraction bug the window
-// was twice as wide and the point leaked in.
+// twice (once in the planner, once when slicing the window). A point that sits
+// just outside the [dur] window must be excluded; with the double-subtraction bug
+// the window was twice as wide (10m) and the point leaked in.
+//
+// A range vector m[5m] at instant t covers the half-open window (t-5m, t] (the
+// Prometheus convention): the lower edge is exclusive, the upper edge inclusive.
 func TestRangeWindowAppliedOnce(t *testing.T) {
 	db := setupTestDB(t)
 	defer db.Close()
@@ -17,10 +20,10 @@ func TestRangeWindowAppliedOnce(t *testing.T) {
 	const minute = int64(60_000)
 	end := 10 * minute // 600000
 
-	// Window for metric[5m] evaluated at `end` is [end-5m, end] = [300000, 600000].
-	db.Ingest("metric", map[string]string{"host": "a"}, 4*minute, 1) // 240000: outside, must be dropped
-	db.Ingest("metric", map[string]string{"host": "a"}, 5*minute, 2) // 300000: lower edge, included
-	db.Ingest("metric", map[string]string{"host": "a"}, 7*minute, 3) // 420000: inside
+	// Window for metric[5m] evaluated at `end` is (end-5m, end] = (300000, 600000].
+	db.Ingest("metric", map[string]string{"host": "a"}, 4*minute, 1)  // 240000: outside, must be dropped (would leak in at 10m)
+	db.Ingest("metric", map[string]string{"host": "a"}, 5*minute, 2)  // 300000: lower edge, EXCLUDED (half-open)
+	db.Ingest("metric", map[string]string{"host": "a"}, 7*minute, 3)  // 420000: inside
 	db.Ingest("metric", map[string]string{"host": "a"}, 10*minute, 4) // 600000: upper edge, included
 
 	engine := NewEngine(db)
@@ -33,12 +36,13 @@ func TestRangeWindowAppliedOnce(t *testing.T) {
 		t.Fatalf("expected 1 series, got %d", len(results))
 	}
 	pts := results[0].Points
-	if len(pts) != 3 {
-		t.Fatalf("expected 3 points in [end-5m, end], got %d: %+v", len(pts), pts)
+	if len(pts) != 2 {
+		t.Fatalf("expected 2 points in (end-5m, end], got %d: %+v", len(pts), pts)
 	}
 	for _, p := range pts {
-		if p.Timestamp < 5*minute {
-			t.Fatalf("point at %d is outside the 5m window and should have been excluded", p.Timestamp)
+		// Both 240000 (5m window) and 300000 (half-open lower edge) must be gone.
+		if p.Timestamp <= 5*minute {
+			t.Fatalf("point at %d is outside the (end-5m, end] window and should have been excluded", p.Timestamp)
 		}
 	}
 }

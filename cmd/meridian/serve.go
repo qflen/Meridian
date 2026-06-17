@@ -116,6 +116,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 	httpServer := server.NewHTTPServer(db, nodeID, peerHTTPAddrs)
+	httpServer.SetQueryTimeout(cfg.Server.QueryTimeout.Std())
 	if err := httpServer.Start(cfg.Server.HTTPAddr); err != nil {
 		return fmt.Errorf("start HTTP server: %w", err)
 	}

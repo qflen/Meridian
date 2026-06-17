@@ -4,6 +4,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,6 +18,10 @@ import (
 	"github.com/meridiandb/meridian/internal/storage"
 )
 
+// defaultQueryTimeout bounds how long a single /api/v1/query may run before the
+// engine context is cancelled. It is configurable via SetQueryTimeout.
+const defaultQueryTimeout = 30 * time.Second
+
 // HTTPServer serves the REST API, dashboard, and WebSocket endpoints.
 type HTTPServer struct {
 	db         *storage.TSDB
@@ -24,10 +29,11 @@ type HTTPServer struct {
 	wsHub      *WebSocketHub
 	mux        *http.ServeMux
 	httpServer *http.Server
-	startTime  time.Time
-	nodeID     string
-	peerAddrs  []string // HTTP addresses of cluster peers
-	latency    *latencyTracker
+	startTime    time.Time
+	nodeID       string
+	peerAddrs    []string // HTTP addresses of cluster peers
+	latency      *latencyTracker
+	queryTimeout time.Duration
 }
 
 // latencyTracker records query execution latency into histogram buckets.
@@ -69,13 +75,22 @@ func NewHTTPServer(db *storage.TSDB, nodeID string, peerAddrs []string) *HTTPSer
 		wsHub:     NewWebSocketHub(),
 		mux:       http.NewServeMux(),
 		startTime: time.Now(),
-		nodeID:    nodeID,
-		peerAddrs: peerAddrs,
-		latency:   newLatencyTracker(),
+		nodeID:       nodeID,
+		peerAddrs:    peerAddrs,
+		latency:      newLatencyTracker(),
+		queryTimeout: defaultQueryTimeout,
 	}
 
 	s.registerRoutes()
 	return s
+}
+
+// SetQueryTimeout overrides the per-query execution deadline. A value <= 0 leaves
+// the current timeout unchanged.
+func (s *HTTPServer) SetQueryTimeout(d time.Duration) {
+	if d > 0 {
+		s.queryTimeout = d
+	}
 }
 
 // Start begins serving HTTP requests.
@@ -193,30 +208,68 @@ func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
+	// A panic anywhere in parse/plan/execute must not drop the connection; turn it
+	// into a 500 so a single pathological query cannot take down the server.
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("query handler panic: %v", rec)
+			writeError(w, http.StatusInternalServerError, "internal error during query execution")
+		}
+	}()
+
 	q := r.URL.Query().Get("q")
 	if q == "" {
 		writeError(w, http.StatusBadRequest, "missing query parameter 'q'")
 		return
 	}
 
-	start := parseTimestamp(r.URL.Query().Get("start"), time.Now().Add(-1*time.Hour).UnixMilli())
-	end := parseTimestamp(r.URL.Query().Get("end"), time.Now().UnixMilli())
-	// An unset or unparseable step is left at 0 so the engine derives one from
-	// [start,end] (~250 points); an explicit duration (e.g. "30s") is honored.
+	now := time.Now()
+	start, err := parseTimestampParam(r.URL.Query().Get("start"), now.Add(-1*time.Hour).UnixMilli())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid 'start' parameter: "+err.Error())
+		return
+	}
+	end, err := parseTimestampParam(r.URL.Query().Get("end"), now.UnixMilli())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid 'end' parameter: "+err.Error())
+		return
+	}
+	if end < start {
+		writeError(w, http.StatusBadRequest, "invalid range: 'end' must be greater than or equal to 'start'")
+		return
+	}
+	// An absent step is left at 0 so the engine auto-sizes one from [start,end]
+	// (~250 points). A present-but-unparseable step is a client error, not a silent
+	// default. The engine caps the resulting step count internally.
 	var step time.Duration
 	if stepStr := r.URL.Query().Get("step"); stepStr != "" {
-		if d, err := query.ParseDuration(stepStr); err == nil {
-			step = d
+		d, perr := query.ParseDuration(stepStr)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, "invalid 'step' parameter: "+perr.Error())
+			return
 		}
+		step = d
 	}
 
+	// Bound execution time at the HTTP boundary; the engine honours ctx cancellation
+	// per evaluation step and per storage fetch.
+	ctx, cancel := context.WithTimeout(r.Context(), s.queryTimeout)
+	defer cancel()
+
 	startExec := time.Now()
-	results, err := s.engine.Execute(r.Context(), q, start, end, step)
+	results, err := s.engine.Execute(ctx, q, start, end, step)
 	execTime := time.Since(startExec)
 	s.latency.record(execTime)
 
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		switch {
+		case errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded):
+			writeError(w, http.StatusGatewayTimeout, "query exceeded the time limit")
+		case errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled):
+			writeError(w, http.StatusServiceUnavailable, "query canceled")
+		default:
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
 		return
 	}
 
@@ -465,15 +518,19 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	})
 }
 
-func parseTimestamp(s string, defaultVal int64) int64 {
+// parseTimestampParam parses a millisecond Unix timestamp from a query parameter.
+// An empty string yields defaultVal (the parameter was absent); a non-empty but
+// unparseable string returns an error so malformed input is rejected with 400
+// rather than silently falling back to a default.
+func parseTimestampParam(s string, defaultVal int64) (int64, error) {
 	if s == "" {
-		return defaultVal
+		return defaultVal, nil
 	}
 	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return defaultVal
+		return 0, fmt.Errorf("%q is not a millisecond timestamp", s)
 	}
-	return v
+	return v, nil
 }
 
 func findDashboardDir() string {

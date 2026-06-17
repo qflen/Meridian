@@ -100,10 +100,13 @@ type Config struct {
 	Log          LogConfig          `yaml:"log"`
 }
 
-// ServerConfig holds HTTP and gRPC listen addresses.
+// ServerConfig holds HTTP and gRPC listen addresses plus HTTP API limits.
 type ServerConfig struct {
 	HTTPAddr string `yaml:"http_addr"`
 	GRPCAddr string `yaml:"grpc_addr"`
+	// QueryTimeout bounds how long a single /api/v1/query may run. Zero leaves the
+	// server default (30s) in place.
+	QueryTimeout Duration `yaml:"query_timeout"`
 }
 
 // StorageConfig holds storage engine parameters.
@@ -154,8 +157,9 @@ type LogConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
-			HTTPAddr: "0.0.0.0:8080",
-			GRPCAddr: "0.0.0.0:9090",
+			HTTPAddr:     "0.0.0.0:8080",
+			GRPCAddr:     "0.0.0.0:9090",
+			QueryTimeout: Duration(30 * time.Second),
 		},
 		Storage: StorageConfig{
 			DataDir:       "./data",

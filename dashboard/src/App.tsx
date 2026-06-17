@@ -1,6 +1,5 @@
 import { useDashboard } from './state/DashboardContext';
 import { useMetricStream } from './hooks/useMetricStream';
-import { useFrameMetrics } from './hooks/useFrameMetrics';
 import { QueryEditor } from './components/QueryEditor';
 import { TimeSeriesChart } from './components/TimeSeriesChart';
 import { MetricExplorer } from './components/MetricExplorer';
@@ -39,7 +38,6 @@ function connectionLabel(status: ConnectionStatus): string {
 function Dashboard() {
   const { state } = useDashboard();
   useMetricStream();
-  const frameMetrics = useFrameMetrics();
 
   // Build chart series from query result — use short legend labels
   const chartSeries = (() => {
@@ -97,15 +95,6 @@ function Dashboard() {
           </div>
 
           <div className="flex items-center gap-4">
-            {/* Frame metrics */}
-            <div className="hidden md:flex items-center gap-3 text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
-              <span>{frameMetrics.fps} fps</span>
-              <span>{frameMetrics.frameTime}ms</span>
-              {frameMetrics.droppedFrames > 0 && (
-                <span style={{ color: 'rgb(var(--color-warning))' }}>{frameMetrics.droppedFrames} dropped</span>
-              )}
-            </div>
-
             {/* Connection status — a steady lamp when live, pulsing while transient */}
             <div className="flex items-center gap-1.5">
               <span
@@ -177,10 +166,9 @@ function Dashboard() {
       </main>
 
       {/* Footer */}
-      <footer className="border-t mt-8" style={{ borderColor: 'rgb(var(--color-border))' }}>
-        <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
-          <span>Meridian TSDB v0.1.0</span>
-          <span>Canvas-rendered at 60fps | Zero chart dependencies</span>
+      <footer className="border-t mt-8">
+        <div className="max-w-[1600px] mx-auto px-4 py-3 text-xs text-muted">
+          Meridian v0.1.0 — distributed time-series database
         </div>
       </footer>
     </div>

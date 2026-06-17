@@ -7,33 +7,71 @@ import (
 	"github.com/meridiandb/meridian/internal/storage"
 )
 
-// rate computes the per-second rate of increase over a range of counter values.
-func rate(points []storage.Point) []storage.Point {
-	if len(points) < 2 {
-		return nil
+// rate computes the per-second average rate of increase of a counter over the
+// window [end-rangeMs, end]. It divides the increase by the selector range (not
+// the sample span), corrects for counter resets, and extrapolates to the window
+// edges the way Prometheus does. The bool reports whether a value was produced.
+//
+// It takes the window end explicitly rather than reading it from the samples so
+// it composes with a per-step matrix evaluator: each step calls rate() with the
+// samples in that step's window and the step's timestamp.
+func rate(points []storage.Point, rangeMs, end int64) (float64, bool) {
+	if len(points) < 2 || rangeMs <= 0 {
+		return 0, false
 	}
 
 	first := points[0]
 	last := points[len(points)-1]
-	durationSec := float64(last.Timestamp-first.Timestamp) / 1000.0
-	if durationSec <= 0 {
-		return nil
+	sampledInterval := float64(last.Timestamp-first.Timestamp) / 1000.0
+	if sampledInterval <= 0 {
+		return 0, false
 	}
 
-	// Handle counter resets: sum up all positive increases
-	var totalIncrease float64
-	for i := 1; i < len(points); i++ {
-		diff := points[i].Value - points[i-1].Value
-		if diff >= 0 {
-			totalIncrease += diff
+	// Total increase across the window. On a counter reset (a decrease), the
+	// post-reset value is itself the increase since the prior cycle, so add it.
+	var increase float64
+	prev := first.Value
+	for _, p := range points[1:] {
+		if p.Value < prev {
+			increase += p.Value
 		} else {
-			// Counter reset: assume the new value is the increase
-			totalIncrease += points[i].Value
+			increase += p.Value - prev
+		}
+		prev = p.Value
+	}
+
+	rangeStart := end - rangeMs
+	durationToStart := float64(first.Timestamp-rangeStart) / 1000.0
+	durationToEnd := float64(end-last.Timestamp) / 1000.0
+	averageInterval := sampledInterval / float64(len(points)-1)
+
+	// A counter cannot be negative, so if the first sample is small relative to
+	// the increase, assume the series began at zero shortly before it and only
+	// extrapolate back that far.
+	if increase > 0 && first.Value >= 0 {
+		durationToZero := sampledInterval * (first.Value / increase)
+		if durationToZero < durationToStart {
+			durationToStart = durationToZero
 		}
 	}
 
-	rateVal := totalIncrease / durationSec
-	return []storage.Point{{Timestamp: last.Timestamp, Value: rateVal}}
+	// Extrapolate to each window edge, but no further than half a sample interval
+	// past the outermost samples.
+	threshold := averageInterval * 1.1
+	extrapolated := sampledInterval
+	if durationToStart < threshold {
+		extrapolated += durationToStart
+	} else {
+		extrapolated += averageInterval / 2
+	}
+	if durationToEnd < threshold {
+		extrapolated += durationToEnd
+	} else {
+		extrapolated += averageInterval / 2
+	}
+
+	factor := (extrapolated / sampledInterval) / (float64(rangeMs) / 1000.0)
+	return increase * factor, true
 }
 
 // aggregateFunc applies an aggregation operation across multiple series. It is

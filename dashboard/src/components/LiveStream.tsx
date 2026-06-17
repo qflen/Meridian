@@ -1,12 +1,13 @@
 import { useRef, useEffect } from 'react';
 import { useDashboard } from '../state/DashboardContext';
+import { LiveEntry, liveRowKey } from '../utils/liveStream';
 
 export function LiveStream() {
   const { state } = useDashboard();
   const listRef = useRef<HTMLDivElement>(null);
 
   // Collect recent samples from all live metrics
-  const entries: { key: string; ts: number; value: number }[] = [];
+  const entries: LiveEntry[] = [];
   state.liveMetrics.forEach((samples, key) => {
     const recent = samples.slice(-3);
     for (const s of recent) {
@@ -57,9 +58,9 @@ export function LiveStream() {
             Waiting for live data...
           </div>
         )}
-        {display.map((e, i) => (
+        {display.map((e) => (
           <div
-            key={`${e.key}-${e.ts}-${i}`}
+            key={liveRowKey(e)}
             className="flex items-center gap-2 px-2 py-1 rounded transition-colors"
             style={{ cursor: 'default' }}
             onMouseEnter={(el) => el.currentTarget.style.background = 'rgb(var(--color-text) / 0.06)'}

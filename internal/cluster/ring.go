@@ -18,7 +18,7 @@ type Ring struct {
 }
 
 type ringEntry struct {
-	hash   uint32
+	hash   uint64
 	nodeID string
 }
 
@@ -33,11 +33,16 @@ func NewRing(virtualNodes int) *Ring {
 	}
 }
 
-// AddNode adds a node to the ring with virtual node entries.
+// AddNode adds a node to the ring with virtual node entries. Re-adding an existing
+// node ID updates its record (e.g. its state) without duplicating ring entries.
 func (r *Ring) AddNode(node Node) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if _, exists := r.nodes[node.ID]; exists {
+		r.nodes[node.ID] = node
+		return
+	}
 	r.nodes[node.ID] = node
 
 	for i := 0; i < r.virtualNodes; i++ {
@@ -46,8 +51,20 @@ func (r *Ring) AddNode(node Node) {
 		r.ring = append(r.ring, ringEntry{hash: hash, nodeID: node.ID})
 	}
 
+	r.sortRing()
+}
+
+// sortRing orders ring entries by hash, breaking ties on nodeID so the ring layout
+// is a deterministic function of its membership — independent of insertion order.
+// Without the tie-break, two virtual nodes colliding on the same 64-bit hash would
+// resolve in append order, making replica sets depend on the sequence of AddNode
+// calls rather than on the set of members.
+func (r *Ring) sortRing() {
 	sort.Slice(r.ring, func(i, j int) bool {
-		return r.ring[i].hash < r.ring[j].hash
+		if r.ring[i].hash != r.ring[j].hash {
+			return r.ring[i].hash < r.ring[j].hash
+		}
+		return r.ring[i].nodeID < r.ring[j].nodeID
 	})
 }
 
@@ -67,12 +84,28 @@ func (r *Ring) RemoveNode(id string) {
 	r.ring = filtered
 }
 
-// GetNodes returns the N nodes responsible for the given key (for replication).
+// SetState updates the lifecycle state of an already-registered node. It is the hook
+// the health monitor uses to mark nodes Active/Dead so routing excludes the dead.
+// Unknown node IDs are ignored.
+func (r *Ring) SetState(id string, state NodeState) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if n, ok := r.nodes[id]; ok {
+		n.State = state
+		r.nodes[id] = n
+	}
+}
+
+// GetNodes returns up to replication distinct nodes responsible for the given key,
+// walking the ring clockwise from the key's hash. Nodes in the Dead or Leaving state
+// are skipped, so the result holds only replicas that can currently serve the key.
+// The returned slice can therefore be shorter than replication when fewer live nodes
+// exist — callers compare its length against the write/read quorum.
 func (r *Ring) GetNodes(key string, replication int) []Node {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	if len(r.ring) == 0 {
+	if len(r.ring) == 0 || replication <= 0 {
 		return nil
 	}
 
@@ -89,18 +122,21 @@ func (r *Ring) GetNodes(key string, replication int) []Node {
 
 	for i := 0; i < len(r.ring) && len(result) < replication; i++ {
 		entry := r.ring[(idx+i)%len(r.ring)]
-		if !seen[entry.nodeID] {
-			seen[entry.nodeID] = true
-			if node, ok := r.nodes[entry.nodeID]; ok {
-				result = append(result, node)
-			}
+		if seen[entry.nodeID] {
+			continue
 		}
+		seen[entry.nodeID] = true
+		node, ok := r.nodes[entry.nodeID]
+		if !ok || node.State == NodeDead || node.State == NodeLeaving {
+			continue
+		}
+		result = append(result, node)
 	}
 
 	return result
 }
 
-// GetNode returns the primary node for the given key.
+// GetNode returns the primary live node for the given key, or nil if none is live.
 func (r *Ring) GetNode(key string) *Node {
 	nodes := r.GetNodes(key, 1)
 	if len(nodes) == 0 {
@@ -109,13 +145,29 @@ func (r *Ring) GetNode(key string) *Node {
 	return &nodes[0]
 }
 
-// Nodes returns all registered physical nodes.
+// Nodes returns all registered physical nodes regardless of state.
 func (r *Ring) Nodes() []Node {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	result := make([]Node, 0, len(r.nodes))
 	for _, n := range r.nodes {
+		result = append(result, n)
+	}
+	return result
+}
+
+// LiveNodes returns every node that is neither Dead nor Leaving — the set a scatter
+// read may safely query. The order is unspecified.
+func (r *Ring) LiveNodes() []Node {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make([]Node, 0, len(r.nodes))
+	for _, n := range r.nodes {
+		if n.State == NodeDead || n.State == NodeLeaving {
+			continue
+		}
 		result = append(result, n)
 	}
 	return result
@@ -128,7 +180,11 @@ func (r *Ring) NodeCount() int {
 	return len(r.nodes)
 }
 
-func hashKey(key string) uint32 {
+// hashKey maps a key onto the 64-bit ring. Sixty-four bits make a same-position
+// collision between two physical nodes astronomically unlikely, so a key's replica
+// set is determined by ring position alone (with sortRing's nodeID tie-break as the
+// deterministic fallback if a collision ever did occur).
+func hashKey(key string) uint64 {
 	h := sha256.Sum256([]byte(key))
-	return binary.BigEndian.Uint32(h[:4])
+	return binary.BigEndian.Uint64(h[:8])
 }

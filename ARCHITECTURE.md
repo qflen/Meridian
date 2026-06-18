@@ -22,7 +22,7 @@ clustering, and visualization.
 │   └──────────┘  └──────────┘  └────────────────────┘   │
 ├─────────────────────────────────────────────────────────┤
 │                  Cluster Layer                           │
-│   Consistent Hash Ring  │  Coordinator  │  Gossip       │
+│  Hash Ring  │  Quorum Replication  │  Read-Repair        │
 ├─────────────────────────────────────────────────────────┤
 │               Retention & Downsampling                   │
 │   TTL Enforcer  │  5s→1m→1h Rollups                     │
@@ -125,13 +125,34 @@ full storage metric set, and the cumulative `meridian_samples_ingested_total` co
 is kept distinct from the windowed ingestion rate reported on `/api/v1/stats`
 (ADR-017, ADR-019).
 
-### Cluster
+### Cluster (microservices tier)
 
-**Hash Ring** (`internal/cluster/ring.go`): SHA256-based consistent hash ring
-with configurable virtual nodes for even distribution.
+**Hash Ring** (`internal/cluster/ring.go`): a 64-bit SHA-256 consistent hash ring
+with configurable virtual nodes and a deterministic nodeID tie-break, so a key's
+replica set is a function of membership rather than of node-join order. `GetNodes`
+returns the first N distinct replicas walking the ring, skipping nodes in the Dead or
+Leaving state; `SetState`/`LiveNodes` are the hooks the health monitor drives.
 
-**Coordinator** (`internal/cluster/coordinator.go`): Routes writes and reads
-based on ring ownership with configurable replication factor.
+**Replicated storage client** (`internal/service/client.go`): the live routing
+source. It seeds a ring from the configured storage addresses and applies the
+quorum model (ADR-022):
+
+- **Write** — for each series, `replicas = ring.GetNodes(key, N)`; the series is sent
+  to all live replicas (batched per node) and the write succeeds only at ≥W acks.
+  Too few live replicas or acks is a quorum error, not a partial write.
+- **Read** — a label-matcher query scatters to all live nodes (a superset of any
+  matched series' replicas), merges and dedupes by (series, timestamp), enforces read
+  quorum R globally and per series, and asynchronously **read-repairs** any responding
+  replica missing points relative to the merged truth.
+- **Health** — a background `/health` monitor (`StartHealthMonitor`) sets ring node
+  state Active/Dead, so routing excludes dead nodes and re-includes recovered ones; a
+  revived node is caught up by read-repair.
+
+The ingestor and querier each build this client from `REPLICATION_FACTOR`/
+`WRITE_QUORUM`/`READ_QUORUM` and run the health monitor. The `Coordinator`
+(`internal/cluster/coordinator.go`) wraps the same ring with `RouteWrite`/`RouteRead`
+helpers. Hinted handoff and rebalancing are future work; the monolith `serve` path is
+single-node and does not use the ring.
 
 ### Retention & Downsampling
 

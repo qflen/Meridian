@@ -44,7 +44,7 @@ export interface WSStatsMessage {
   memoryBytes: number;
   compressedBytes: number;
   rawBytes: number;
-  walSegments: number;
+  walBytes: number;
   blockCount: number;
   uptimeSeconds: number;
   // Write-path backpressure (ADR-023): bounded ingest queue depth/capacity and the

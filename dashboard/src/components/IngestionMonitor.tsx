@@ -70,8 +70,8 @@ export function IngestionMonitor() {
           <div className="stat-label">memory</div>
         </div>
         <div>
-          <div className="stat-value">{stats ? stats.walSegments : '--'}</div>
-          <div className="stat-label">WAL segments</div>
+          <div className="stat-value">{stats ? formatBytes(stats.walBytes) : '--'}</div>
+          <div className="stat-label">WAL size</div>
         </div>
       </div>
 

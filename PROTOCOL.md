@@ -117,7 +117,7 @@ Server sends JSON messages of type:
   "memoryBytes": 52428800,
   "compressedBytes": 1048576,
   "rawBytes": 31457280,
-  "walSegments": 1,
+  "walBytes": 262144,
   "blockCount": 4,
   "uptimeSeconds": 3600
 }

@@ -8,6 +8,11 @@ monitoring dashboard. It ships as a single binary with minimal dependencies.
 
 ![Meridian dashboard](docs/dashboard.png)
 
+The query result is a strip-chart instrument: a cursor crosshair sweeps a live,
+tabular-mono readout of every series' value across a fine graticule.
+
+![Meridian instrument chart — crosshair readout](docs/demo.gif)
+
 ## Quick Start
 
 ```bash

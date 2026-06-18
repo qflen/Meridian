@@ -97,7 +97,27 @@ type ingestorServer struct {
 func (s *ingestorServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/internal/ingest", s.handleHTTPIngest)
+	mux.HandleFunc("/api/internal/ingest_stats", s.handleIngestStats)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+}
+
+// handleIngestStats reports the bounded ingest queue snapshot as JSON so the
+// gateway can aggregate ingest-queue load across ingestors for the dashboard.
+func (s *ingestorServer) handleIngestStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.pool == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{})
+		return
+	}
+	st := s.pool.Stats()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"depth":               st.Depth,
+		"capacity":            st.Capacity,
+		"high_watermark":      st.HighWatermark,
+		"dropped_samples":     st.DroppedSamples,
+		"shed_events":         st.ShedEvents,
+		"backpressure_events": st.BackpressureEvents,
+	})
 }
 
 func (s *ingestorServer) handleMetrics(w http.ResponseWriter, r *http.Request) {

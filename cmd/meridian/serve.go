@@ -157,6 +157,7 @@ func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingSer
 
 	for range ticker.C {
 		stats := db.Stats()
+		q := ingServer.BatchWriter().QueueStats()
 
 		metrics := map[string]interface{}{
 			"type":            "stats",
@@ -168,6 +169,13 @@ func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingSer
 			"walSegments":     stats.WALSize,
 			"blockCount":      stats.BlockCount,
 			"uptimeSeconds":   int(time.Since(db.StartTime()).Seconds()),
+			// Write-path backpressure (ADR-023): bounded queue depth/capacity and the
+			// cumulative drop counter. The dashboard derives a drop rate from successive
+			// samples, like the ingestion rate/total split.
+			"ingestQueueDepth":         q.Depth,
+			"ingestQueueCapacity":      q.Capacity,
+			"ingestQueueHighWatermark": q.HighWatermark,
+			"droppedSamples":           q.DroppedSamples,
 		}
 
 		hub.BroadcastMetrics(metrics)

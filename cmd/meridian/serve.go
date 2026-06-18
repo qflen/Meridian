@@ -88,8 +88,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("open TSDB: %w", err)
 	}
 
-	// Start ingestion server
-	ingServer := ingestion.NewServer(db, cfg.Ingestion.BatchSize, cfg.Ingestion.FlushInterval.Std())
+	// Start ingestion server with a bounded, sheddable queue sized from config.
+	ingServer := ingestion.NewServerWithQueue(db, cfg.Ingestion.BatchSize, cfg.Ingestion.FlushInterval.Std(), ingestion.QueueOptions{
+		Capacity:      cfg.Ingestion.QueueCapacity,
+		HighWatermark: cfg.Ingestion.QueueHighWatermark,
+		BlockDeadline: cfg.Ingestion.BlockDeadline.Std(),
+	})
 	if err := ingServer.Start(cfg.Server.GRPCAddr); err != nil {
 		return fmt.Errorf("start ingestion server: %w", err)
 	}
@@ -118,6 +122,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	httpServer := server.NewHTTPServer(db, nodeID, peerHTTPAddrs)
 	httpServer.SetQueryTimeout(cfg.Server.QueryTimeout.Std())
 	httpServer.SetAllowedOrigins(cfg.Server.AllowedOrigins)
+	// Surface the ingest queue depth / capacity / drops on /metrics and /api/v1/stats.
+	httpServer.SetIngestStatsSource(ingServer.BatchWriter().QueueStats)
 	if err := httpServer.Start(cfg.Server.HTTPAddr); err != nil {
 		return fmt.Errorf("start HTTP server: %w", err)
 	}

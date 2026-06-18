@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/backpressure"
 	"github.com/meridiandb/meridian/internal/query"
 	"github.com/meridiandb/meridian/internal/storage"
 )
@@ -42,6 +43,10 @@ type HTTPServer struct {
 	latency        *latencyTracker
 	queryTimeout   time.Duration
 	allowedOrigins []string // CORS allow-list; empty = localhost only
+	// ingestStats, when set, supplies the bounded ingest queue snapshot for the
+	// /metrics and /api/v1/stats handlers. The ingestion server owns the queue, so
+	// the serve command wires this after constructing both.
+	ingestStats func() backpressure.Stats
 }
 
 // latencyTracker records query execution latency into histogram buckets.
@@ -105,6 +110,12 @@ func (s *HTTPServer) SetQueryTimeout(d time.Duration) {
 // localhost origins; a single "*" entry permits all. See CORSMiddleware.
 func (s *HTTPServer) SetAllowedOrigins(origins []string) {
 	s.allowedOrigins = origins
+}
+
+// SetIngestStatsSource wires the bounded ingest queue snapshot into the /metrics
+// and /api/v1/stats handlers so the monolith exposes write-path flow control.
+func (s *HTTPServer) SetIngestStatsSource(fn func() backpressure.Stats) {
+	s.ingestStats = fn
 }
 
 // handler composes the full middleware chain in front of the mux: CORS, then a
@@ -361,7 +372,7 @@ func (s *HTTPServer) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := s.db.Stats()
 	ratio := s.db.CompressionRatio()
-	writeJSON(w, map[string]interface{}{
+	out := map[string]interface{}{
 		"total_samples":            stats.TotalSamples,
 		"total_series":             stats.TotalSeries,
 		"blocks":                   stats.BlockCount,
@@ -374,7 +385,18 @@ func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		"wal_size":                 stats.WALSize,
 		"ingestion_rate":           s.db.IngestionRate(),
 		"uptime":                   time.Since(s.startTime).String(),
-	})
+	}
+	// Write-path backpressure: the queue depth/capacity gauges and the cumulative
+	// drop counter (the dashboard derives a drop rate from successive samples, like
+	// the rate/total split for ingestion). See ADR-023.
+	if s.ingestStats != nil {
+		q := s.ingestStats()
+		out["ingest_queue_depth"] = q.Depth
+		out["ingest_queue_capacity"] = q.Capacity
+		out["ingest_queue_high_watermark"] = q.HighWatermark
+		out["dropped_samples"] = q.DroppedSamples
+	}
+	writeJSON(w, out)
 }
 
 func (s *HTTPServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
@@ -418,6 +440,11 @@ func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// Storage-engine metrics, shared verbatim with the storage microservice.
 	WriteStorageMetrics(w, s.db, node)
+
+	// Write-path flow-control metrics from the bounded ingest queue, when wired.
+	if s.ingestStats != nil {
+		WriteQueueMetrics(w, node, "monolith", s.ingestStats())
+	}
 
 	fmt.Fprintf(w, "# HELP meridian_query_latency_seconds Query executor latency histogram.\n")
 	fmt.Fprintf(w, "# TYPE meridian_query_latency_seconds histogram\n")

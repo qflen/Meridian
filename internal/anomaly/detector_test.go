@@ -230,13 +230,15 @@ func TestThresholdGovernsSensitivity(t *testing.T) {
 		cfg.Warmup = 20
 		d := New(cfg)
 		rng := rand.New(rand.NewSource(7))
+		// Dispersion ~10, far above the relative scale floor (3% of 50 = 1.5), so the
+		// test exercises the threshold against the tracked dispersion, not the floor.
 		base := make([]float64, 80)
 		for i := range base {
-			base[i] = 50 + rng.NormFloat64() // unit dispersion
+			base[i] = 50 + 10*rng.NormFloat64()
 		}
 		feed(d, 0, base)
 		// ~4 standard deviations out.
-		return feed(d, 80_000, []float64{54, 54, 54})
+		return feed(d, 80_000, []float64{90, 90, 90})
 	}
 	if countState(mk(3.0), StateFiring) == 0 {
 		t.Fatalf("a ~4σ deviation should fire under threshold 3.0")

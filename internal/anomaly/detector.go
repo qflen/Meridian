@@ -106,15 +106,26 @@ type Config struct {
 
 // Default tuning constants. These back DefaultConfig and (Config).withDefaults.
 const (
-	defaultThreshold   = 3.5
-	defaultAlpha       = 0.1
-	defaultWarmup      = 20
-	defaultDebounceK   = 3
+	defaultThreshold = 3.5
+	defaultAlpha     = 0.1
+	defaultWarmup    = 20
+	// defaultDebounceK requires two consecutive out-of-band samples to raise. Two
+	// independent samples both exceeding the threshold by chance is vanishingly
+	// likely (~1e-7), so this still rejects single-sample noise, while a transient
+	// spike — which, once a slow stream is deduplicated to its genuine samples, may
+	// only span a few points before it decays — is still caught. Three was too
+	// strict for short spikes.
+	defaultDebounceK   = 2
 	defaultClearFactor = 0.5
 	defaultCritFactor  = 2.0
-	defaultFloorFrac   = 0.01
-	defaultFloorAbs    = 1e-9
-	defaultBufferSize  = 128
+	// defaultFloorFrac floors the dispersion at 4% of |level|. Beyond preventing a
+	// flat series from collapsing the scale toward zero, this encodes a sane domain
+	// default for noisy infrastructure gauges: a sub-~4% departure from the local
+	// baseline is treated as in-band (so a memory GC drop or counter step is not an
+	// anomaly), while a spike — many times the baseline — is far past it.
+	defaultFloorFrac  = 0.04
+	defaultFloorAbs   = 1e-9
+	defaultBufferSize = 128
 )
 
 // DefaultConfig returns the recommended tuning. Enabled is false: callers opt in.

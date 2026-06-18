@@ -327,7 +327,7 @@ func DefaultConfig() *Config {
 			Threshold: 3.5,
 			Alpha:     0.1,
 			Warmup:    20,
-			DebounceK: 3,
+			DebounceK: 2,
 		},
 		Log: LogConfig{
 			Level:  "info",

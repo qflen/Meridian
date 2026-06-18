@@ -146,7 +146,7 @@ func TestDefaultConfigAnomalyValid(t *testing.T) {
 	}
 	// The mapping onto the detector config preserves the YAML-exposed tunables.
 	d := DefaultConfig().Anomaly.Detector()
-	if !d.Enabled || d.Threshold != 3.5 || d.Alpha != 0.1 || d.Warmup != 20 || d.DebounceK != 3 {
+	if !d.Enabled || d.Threshold != 3.5 || d.Alpha != 0.1 || d.Warmup != 20 || d.DebounceK != 2 {
 		t.Fatalf("detector mapping lost tunables: %+v", d)
 	}
 }

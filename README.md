@@ -260,7 +260,7 @@ anomaly:                  # streaming anomaly detection (ADR-024)
   threshold:  3.5         # local z-score above which a sample is out-of-band
   alpha:      0.1         # EWMA smoothing in (0,1]; smaller = steadier baseline
   warmup:     20          # samples used to seed a baseline before any alert
-  debounce_k: 3           # consecutive out-of-band samples required to raise
+  debounce_k: 2           # consecutive out-of-band samples required to raise
 ```
 
 The microservice binaries read the same knobs from the environment: replication

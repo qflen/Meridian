@@ -306,7 +306,7 @@ func (s *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	startExec := time.Now()
-	results, err := s.engine.Execute(ctx, q, start, end, step)
+	results, meta, err := s.engine.ExecuteWithMeta(ctx, q, start, end, step)
 	execTime := time.Since(startExec)
 	s.latency.record(execTime)
 
@@ -338,6 +338,11 @@ func (s *HTTPServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"status":    "success",
 		"exec_time": execTime.String(),
+		// Resolution selection is transparent, but reported so callers can see a wide
+		// span was served from a coarse rollup tier (resolution_ms>0) reading far fewer
+		// points. resolution_ms is 0 when the query read raw. See ADR-011.
+		"resolution_ms": meta.ResolutionMs,
+		"points_read":   meta.PointsRead,
 		"data": map[string]interface{}{
 			"resultType": "matrix",
 			"result":     data,

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -168,6 +169,94 @@ func (db *TSDB) DeleteRollupBlock(resolution int64, ulid string) error {
 		}
 	}
 	return fmt.Errorf("rollup block %s (res=%d) not found", ulid, resolution)
+}
+
+// QueryResolution serves [start, end] from the given rollup resolution, using the avg
+// aggregate as each series' value. A resolution of 0 falls back to the raw Query. For
+// a coarse resolution it returns the persisted rollup windows that overlap the range
+// and, for the most recent span the rollup tier has not closed yet, rolls up raw data
+// (head + sealed blocks) on the fly so the coarse series stays complete to now. The
+// seam between the two is the tier's covered-through bound, which is window-aligned, so
+// the two regions never overlap. Selection is transparent to the caller — the returned
+// shape is identical to Query.
+func (db *TSDB) QueryResolution(ctx context.Context, matchers []LabelMatcher, start, end, resolution int64) (SeriesSet, error) {
+	if resolution <= 0 {
+		return db.Query(ctx, matchers, start, end)
+	}
+
+	type acc struct {
+		name   string
+		labels map[string]string
+		pts    []Point
+	}
+	merged := make(map[string]*acc)
+	add := func(name string, labels map[string]string, pts []Point) {
+		if len(pts) == 0 {
+			return
+		}
+		noName := make(map[string]string, len(labels))
+		for k, v := range labels {
+			if k != "__name__" {
+				noName[k] = v
+			}
+		}
+		key := seriesKey(name, noName)
+		a := merged[key]
+		if a == nil {
+			a = &acc{name: name, labels: labels}
+			merged[key] = a
+		}
+		a.pts = append(a.pts, pts...)
+	}
+
+	// Persisted rollup windows (avg column) overlapping the range.
+	frontier := db.RollupCoveredThrough(resolution)
+	for _, b := range db.RollupBlocks(resolution) {
+		for _, qr := range b.Query(matchers, start, end, rollupColAvg) {
+			add(qr.Name, qr.Labels, qr.Points)
+		}
+	}
+
+	// On-the-fly tail: roll up raw data from the (window-aligned) frontier to end, so
+	// the freshest, not-yet-rolled window is still served. Keep only window centres at
+	// or beyond the frontier to avoid overlapping the persisted region.
+	tailStart := frontier
+	if tailStart < start {
+		tailStart = start
+	}
+	if tailStart <= end {
+		rawSS, err := db.Query(ctx, matchers, tailStart, end)
+		if err != nil {
+			return nil, err
+		}
+		for _, rs := range rawSS {
+			var pts []Point
+			for _, s := range RollupPoints(rs.Points, resolution) {
+				if s.Timestamp < frontier || s.Timestamp < start || s.Timestamp > end {
+					continue
+				}
+				pts = append(pts, Point{Timestamp: s.Timestamp, Value: s.Avg})
+			}
+			add(rs.Name, rs.Labels, pts)
+		}
+	}
+
+	out := make(SeriesSet, 0, len(merged))
+	for _, a := range merged {
+		sort.Slice(a.pts, func(i, j int) bool { return a.pts[i].Timestamp < a.pts[j].Timestamp })
+		// Drop any duplicate timestamps at the seam, preferring the first (persisted).
+		deduped := make([]Point, 0, len(a.pts))
+		var last int64 = -1 << 62
+		for _, p := range a.pts {
+			if p.Timestamp == last {
+				continue
+			}
+			deduped = append(deduped, p)
+			last = p.Timestamp
+		}
+		out = append(out, ResultSeries{Name: a.name, Labels: a.labels, Points: deduped})
+	}
+	return out, nil
 }
 
 // RawBlockFrontier returns the largest MaxTime across immutable raw blocks, or

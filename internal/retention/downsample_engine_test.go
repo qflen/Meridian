@@ -1,6 +1,7 @@
 package retention
 
 import (
+	"context"
 	"math"
 	"testing"
 	"time"
@@ -141,6 +142,49 @@ func assertSampleEqual(t *testing.T, host string, want, got storage.RollupSample
 	}
 	if math.Abs(want.Sum-got.Sum) > 1e-6 || math.Abs(want.Avg-got.Avg) > 1e-9 {
 		t.Fatalf("host %s sum/avg: got %v/%v want %v/%v", host, got.Sum, got.Avg, want.Sum, want.Avg)
+	}
+}
+
+// TestQueryResolutionValues proves the coarse query path returns the exact window
+// averages, including the freshest window served by the on-the-fly tail (which lies
+// beyond the persisted tier's covered-through bound).
+func TestQueryResolutionValues(t *testing.T) {
+	dir := t.TempDir()
+	db := openManualDB(t, dir)
+	defer db.Close()
+	raw := ingestSynthetic(t, db)
+	NewDownsampler(db, cascadeRules(), time.Hour).Downsample()
+
+	// The 1s tier is persisted only through 29000; QueryResolution must still return
+	// the [29000,30000) window from the head/raw tail.
+	matchers := []storage.LabelMatcher{
+		{Name: "__name__", Value: "cpu", Type: storage.MatchEqual},
+		{Name: "host", Value: "a", Type: storage.MatchEqual},
+	}
+	ss, err := db.QueryResolution(context.Background(), matchers, 0, 30000, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ss) != 1 {
+		t.Fatalf("expected 1 series, got %d", len(ss))
+	}
+
+	want := storage.RollupPoints(raw["a"], 1000) // direct 1s rollup of all raw host-a points
+	got := ss[0].Points
+	if len(got) != len(want) {
+		t.Fatalf("coarse points: got %d, want %d windows", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].Timestamp != want[i].Timestamp {
+			t.Fatalf("window %d centre: got %d want %d", i, got[i].Timestamp, want[i].Timestamp)
+		}
+		if math.Abs(got[i].Value-want[i].Avg) > 1e-9 {
+			t.Fatalf("window %d avg: got %v want %v", i, got[i].Value, want[i].Avg)
+		}
+	}
+	// The last window (29500) is the on-the-fly tail beyond the persisted frontier.
+	if got[len(got)-1].Timestamp != 29500 {
+		t.Fatalf("tail window centre: %d, want 29500", got[len(got)-1].Timestamp)
 	}
 }
 

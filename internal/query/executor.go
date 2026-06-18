@@ -16,6 +16,29 @@ type DataSource interface {
 	Query(ctx context.Context, matchers []storage.LabelMatcher, start, end int64) (storage.SeriesSet, error)
 }
 
+// ResolutionDataSource is an optional capability: a DataSource that can serve a query
+// from a chosen rollup resolution and report which resolutions currently have data.
+// When the backing store implements it, the engine selects a resolution from the query
+// span/step and reads coarse rollup points for wide spans; otherwise every query reads
+// raw. *storage.TSDB implements this; the remote StorageClient does not (so the cluster
+// path reads raw — see ADR-011).
+type ResolutionDataSource interface {
+	DataSource
+	// QueryResolution serves [start,end] from the given rollup resolution (ms); a
+	// resolution of 0 is equivalent to Query (raw).
+	QueryResolution(ctx context.Context, matchers []storage.LabelMatcher, start, end, resolution int64) (storage.SeriesSet, error)
+	// RollupResolutions returns the resolutions (ms) that currently have rollup data.
+	RollupResolutions() []int64
+}
+
+// QueryMeta reports how a query was served: the resolution chosen (0 = raw) and the
+// number of points fetched from storage across all selectors. The transparent
+// resolution selection is observable here without changing the result shape.
+type QueryMeta struct {
+	ResolutionMs int64
+	PointsRead   int
+}
+
 // Engine executes parsed queries against a DataSource.
 type Engine struct {
 	ds DataSource
@@ -65,12 +88,21 @@ const (
 // When start == end a single instant is evaluated. When step <= 0 a step is
 // derived so the range yields roughly defaultStepPoints points (floored at 1s).
 func (e *Engine) Execute(ctx context.Context, query string, start, end int64, step time.Duration) ([]ResultSeries, error) {
+	res, _, err := e.ExecuteWithMeta(ctx, query, start, end, step)
+	return res, err
+}
+
+// ExecuteWithMeta is Execute plus QueryMeta describing how the query was served (the
+// resolution selected and the points fetched from storage). Callers that want to
+// surface the resolution selection (the HTTP API, the smoke harness) use this; the
+// result series are identical to Execute.
+func (e *Engine) ExecuteWithMeta(ctx context.Context, query string, start, end int64, step time.Duration) ([]ResultSeries, QueryMeta, error) {
 	expr, err := Parse(query)
 	if err != nil {
-		return nil, fmt.Errorf("parse: %w", err)
+		return nil, QueryMeta{}, fmt.Errorf("parse: %w", err)
 	}
 	if start > end {
-		return nil, fmt.Errorf("invalid range: start %d is after end %d", start, end)
+		return nil, QueryMeta{}, fmt.Errorf("invalid range: start %d is after end %d", start, end)
 	}
 
 	stepMs := step.Milliseconds()
@@ -82,12 +114,12 @@ func (e *Engine) Execute(ctx context.Context, query string, start, end int64, st
 	// exactly one step (a single instant evaluation).
 	nSteps := int((end-start)/stepMs) + 1
 	if nSteps > maxStepCount {
-		return nil, fmt.Errorf("query would evaluate %d steps, exceeding the maximum of %d; widen the step or narrow the range", nSteps, maxStepCount)
+		return nil, QueryMeta{}, fmt.Errorf("query would evaluate %d steps, exceeding the maximum of %d; widen the step or narrow the range", nSteps, maxStepCount)
 	}
 
 	ec, err := e.newEvalContext(ctx, expr, start, end, stepMs)
 	if err != nil {
-		return nil, err
+		return nil, QueryMeta{}, err
 	}
 
 	asm := newMatrixAssembler()
@@ -95,11 +127,11 @@ func (e *Engine) Execute(ctx context.Context, query string, start, end int64, st
 		t := start + int64(i)*stepMs
 		vec, err := e.evalInstant(ec, expr, t)
 		if err != nil {
-			return nil, err
+			return nil, QueryMeta{}, err
 		}
 		asm.add(vec)
 	}
-	return asm.matrix(), nil
+	return asm.matrix(), QueryMeta{ResolutionMs: ec.resolution, PointsRead: ec.pointsRead}, nil
 }
 
 // defaultStepMs sizes an auto step so [start,end] yields ~defaultStepPoints points,
@@ -122,9 +154,11 @@ func defaultStepMs(start, end int64) int64 {
 // in memory rather than re-querying storage, so a range query is one fetch per
 // selector, not one per step.
 type evalContext struct {
-	ctx      context.Context
-	lookback int64                                 // staleness window, ms
-	fetched  map[*VectorSelector]storage.SeriesSet // full-window data per leaf selector
+	ctx        context.Context
+	lookback   int64                                 // staleness window, ms
+	fetched    map[*VectorSelector]storage.SeriesSet // full-window data per leaf selector
+	resolution int64                                 // rollup resolution served, 0 = raw
+	pointsRead int                                   // points fetched from storage
 }
 
 // newEvalContext fetches every leaf selector's full needed window exactly once.
@@ -135,21 +169,44 @@ type evalContext struct {
 // no storage round-trip per step (avoids an N+1 over steps). Matchers are pushed
 // down per selector so each leaf prunes on its own predicates.
 func (e *Engine) newEvalContext(ctx context.Context, expr Expr, start, end, stepMs int64) (*evalContext, error) {
+	// Resolution selection is transparent: if the store can serve rollups, plan the
+	// resolution from the span/step against the resolutions that have data.
+	rds, hasResolution := e.ds.(ResolutionDataSource)
+	var available []int64
+	if hasResolution {
+		available = rds.RollupResolutions()
+	}
+	plan := Plan(expr, start, end, time.Duration(stepMs)*time.Millisecond, available)
+
+	// At a coarse resolution, rollup points are one window apart, so the staleness
+	// window must be at least one window wide or most steps would fall in a gap.
 	lookback := defaultLookbackDelta.Milliseconds()
-	ec := &evalContext{
-		ctx:      ctx,
-		lookback: lookback,
-		fetched:  make(map[*VectorSelector]storage.SeriesSet),
+	if plan.Resolution > lookback {
+		lookback = plan.Resolution
 	}
 
-	plan := Plan(expr, start, end, time.Duration(stepMs)*time.Millisecond)
+	ec := &evalContext{
+		ctx:        ctx,
+		lookback:   lookback,
+		fetched:    make(map[*VectorSelector]storage.SeriesSet),
+		resolution: plan.Resolution,
+	}
+
 	fetchStart := plan.TimeRange[0] - lookback
 	fetchEnd := plan.TimeRange[1]
 	for _, vs := range collectSelectors(expr) {
 		if _, ok := ec.fetched[vs]; ok {
 			continue // same selector node referenced twice — fetch once
 		}
-		ss, err := e.ds.Query(ctx, convertMatchers(vs.Name, vs.Matchers), fetchStart, fetchEnd)
+		var (
+			ss  storage.SeriesSet
+			err error
+		)
+		if plan.Resolution > 0 && hasResolution {
+			ss, err = rds.QueryResolution(ctx, convertMatchers(vs.Name, vs.Matchers), fetchStart, fetchEnd, plan.Resolution)
+		} else {
+			ss, err = e.ds.Query(ctx, convertMatchers(vs.Name, vs.Matchers), fetchStart, fetchEnd)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -160,6 +217,7 @@ func (e *Engine) newEvalContext(ctx context.Context, expr Expr, start, end, step
 			if !sort.SliceIsSorted(pts, func(a, b int) bool { return pts[a].Timestamp < pts[b].Timestamp }) {
 				sort.Slice(pts, func(a, b int) bool { return pts[a].Timestamp < pts[b].Timestamp })
 			}
+			ec.pointsRead += len(pts)
 		}
 		ec.fetched[vs] = ss
 	}

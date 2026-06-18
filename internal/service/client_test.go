@@ -18,8 +18,12 @@ func addrOf(s *httptest.Server) string {
 func sampleWrite() service.WriteRequest {
 	return service.WriteRequest{
 		TimeSeries: []service.TimeSeries{{
-			Name:    "cpu",
-			Samples: []service.Sample{{TimestampMs: 1, Value: 1}},
+			Name: "cpu",
+			Samples: []service.Sample{
+				{TimestampMs: 1, Value: 1},
+				{TimestampMs: 2, Value: 2},
+				{TimestampMs: 3, Value: 3},
+			},
 		}},
 	}
 }
@@ -40,10 +44,13 @@ func TestWriteErrorsOnNon200(t *testing.T) {
 
 func TestWriteSucceedsOn200(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(service.WriteResponse{SamplesIngested: 3})
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
+	// SamplesIngested is the count of logical samples that met write quorum, computed
+	// client-side — not the (replication-multiplied) sum of per-node responses. The
+	// single-node client writes the one series' 3 samples at quorum.
 	c := service.NewStorageClient([]string{addrOf(srv)})
 	resp, err := c.Write(context.Background(), sampleWrite())
 	if err != nil {

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/config"
 	"github.com/meridiandb/meridian/internal/query"
 	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
@@ -24,8 +25,13 @@ func main() {
 	storageAddrs := strings.Split(envOrDefault("STORAGE_ADDRS", "localhost:8081"), ",")
 	nodeID := envOrDefault("QUERIER_NODE_ID", "querier-1")
 
-	sc := service.NewStorageClient(storageAddrs)
+	sc := newStorageClient(storageAddrs)
 	engine := query.NewEngine(sc) // StorageClient implements query.DataSource
+
+	// Drive ring node-state from /health so quorum reads route around dead nodes.
+	monitorCtx, stopMonitor := context.WithCancel(context.Background())
+	defer stopMonitor()
+	sc.StartHealthMonitor(monitorCtx, 2*time.Second)
 
 	srv := &querierServer{
 		nodeID:    nodeID,
@@ -216,6 +222,40 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		log.Printf("invalid %s=%q, using default %d", key, v, def)
+	}
+	return def
+}
+
+// newStorageClient builds the replicated storage client from REPLICATION_FACTOR,
+// WRITE_QUORUM, READ_QUORUM and VIRTUAL_NODES (defaults 3/2/2/256), validating the
+// quorum relationship (W+R>N) before constructing it. The ring must match the
+// ingestor's so reads and writes agree on replica placement.
+func newStorageClient(storageAddrs []string) *service.StorageClient {
+	cc := config.ClusterConfig{
+		ReplicationFactor: envInt("REPLICATION_FACTOR", 3),
+		WriteQuorum:       envInt("WRITE_QUORUM", 2),
+		ReadQuorum:        envInt("READ_QUORUM", 2),
+		VirtualNodes:      envInt("VIRTUAL_NODES", 256),
+	}
+	if err := cc.Validate(); err != nil {
+		log.Fatalf("invalid replication config: %v", err)
+	}
+	log.Printf("replication: N=%d W=%d R=%d across %d storage node(s)",
+		cc.ReplicationFactor, cc.WriteQuorum, cc.ReadQuorum, len(storageAddrs))
+	return service.NewReplicatedStorageClient(storageAddrs, service.ReplicationOptions{
+		ReplicationFactor: cc.ReplicationFactor,
+		WriteQuorum:       cc.WriteQuorum,
+		ReadQuorum:        cc.ReadQuorum,
+		VirtualNodes:      cc.VirtualNodes,
+	})
 }
 
 func init() {

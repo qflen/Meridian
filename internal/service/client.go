@@ -5,28 +5,155 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"net/http"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/cluster"
 	"github.com/meridiandb/meridian/internal/storage"
 )
 
-// StorageClient communicates with storage service nodes over HTTP.
+// StorageClient communicates with storage service nodes over HTTP. It routes writes
+// and reads through a consistent-hash ring built from the configured storage nodes:
+// a series is written to its N ring replicas and succeeds at W acks; reads take R
+// responses, merge, and asynchronously read-repair stale replicas. See ADR-022.
 type StorageClient struct {
 	addrs  []string
 	client *http.Client
+
+	ring *cluster.Ring
+	rf   int // N — replication factor
+	w    int // W — write quorum
+	r    int // R — read quorum
 }
 
-// NewStorageClient creates a client for the given storage node addresses.
+// ReplicationOptions configures the replication behaviour of a StorageClient.
+type ReplicationOptions struct {
+	ReplicationFactor int // N
+	WriteQuorum       int // W
+	ReadQuorum        int // R
+	VirtualNodes      int // ring virtual nodes per physical node
+}
+
+// NewStorageClient creates a client for the given storage node addresses with default
+// replication: N = min(3, #nodes) and a majority quorum for both reads and writes. It
+// is used by services that only fan out aggregate reads (gateway, compactor); the
+// ingestor and querier pass explicit options via NewReplicatedStorageClient.
 func NewStorageClient(addrs []string) *StorageClient {
-	return &StorageClient{
-		addrs: addrs,
-		client: &http.Client{Timeout: 30 * time.Second},
+	n := len(addrs)
+	if n > 3 {
+		n = 3
 	}
+	if n < 1 {
+		n = 1
+	}
+	return NewReplicatedStorageClient(addrs, ReplicationOptions{
+		ReplicationFactor: n,
+		WriteQuorum:       n/2 + 1,
+		ReadQuorum:        n/2 + 1,
+		VirtualNodes:      256,
+	})
+}
+
+// NewReplicatedStorageClient builds a client whose ring is seeded with the given
+// storage addresses (each its own physical node, keyed by address). The effective
+// replication factor is capped at the number of nodes, and the quorums are clamped
+// into [1, N] so a cluster smaller than the configured N degrades gracefully rather
+// than rejecting every write — validation of the configured W+R>N happens at config
+// load time (ClusterConfig.Validate).
+func NewReplicatedStorageClient(addrs []string, opts ReplicationOptions) *StorageClient {
+	ring := cluster.NewRing(opts.VirtualNodes)
+	for _, addr := range addrs {
+		ring.AddNode(cluster.Node{ID: addr, Addr: addr, State: cluster.NodeActive})
+	}
+
+	n := opts.ReplicationFactor
+	if n > len(addrs) {
+		n = len(addrs)
+	}
+	if n < 1 {
+		n = 1
+	}
+	return &StorageClient{
+		addrs:  addrs,
+		client: &http.Client{Timeout: 30 * time.Second},
+		ring:   ring,
+		rf:     n,
+		w:      clampInt(opts.WriteQuorum, 1, n),
+		r:      clampInt(opts.ReadQuorum, 1, n),
+	}
+}
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// ReplicationFactor reports the effective replication factor (N).
+func (c *StorageClient) ReplicationFactor() int { return c.rf }
+
+// WriteQuorum reports the effective write quorum (W).
+func (c *StorageClient) WriteQuorum() int { return c.w }
+
+// ReadQuorum reports the effective read quorum (R).
+func (c *StorageClient) ReadQuorum() int { return c.r }
+
+// Replicas returns the addresses of the live replicas that own the given series key,
+// in ring order. It backs cluster-topology introspection and tests.
+func (c *StorageClient) Replicas(name string, labels map[string]string) []string {
+	nodes := c.ring.GetNodes(ringKey(name, labels), c.rf)
+	addrs := make([]string, len(nodes))
+	for i, n := range nodes {
+		addrs[i] = n.Addr
+	}
+	return addrs
+}
+
+// RefreshHealth probes every storage node's /health once and updates its ring state
+// to Active or Dead, so routing immediately excludes nodes that have gone away and
+// re-includes ones that have returned. Probes run concurrently.
+func (c *StorageClient) RefreshHealth() {
+	var wg sync.WaitGroup
+	for _, addr := range c.addrs {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			if _, ok := HealthCheck(addr); ok {
+				c.ring.SetState(addr, cluster.NodeActive)
+			} else {
+				c.ring.SetState(addr, cluster.NodeDead)
+			}
+		}(addr)
+	}
+	wg.Wait()
+}
+
+// StartHealthMonitor runs RefreshHealth immediately and then every interval until ctx
+// is cancelled, keeping ring node-state in sync with reachability.
+func (c *StorageClient) StartHealthMonitor(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	go func() {
+		c.RefreshHealth()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				c.RefreshHealth()
+			}
+		}
+	}()
 }
 
 // Addrs returns the configured storage node addresses.
@@ -45,123 +172,202 @@ func statusError(resp *http.Response, action string) error {
 	return nil
 }
 
-// Write sends a write request to the appropriate storage node based on metric name hash.
+// Write replicates each series to its N ring replicas and succeeds only when every
+// series reaches its write quorum W. For a series key it computes the live replica set
+// via the ring, batches the series destined for each node into one request, fans the
+// batches out concurrently, and then verifies each series collected at least W acks.
+// Fewer than W live replicas (or W acks) is a quorum failure surfaced as an error, not
+// a silent partial write — a replica that was down stays stale until read-repair. The
+// returned SamplesIngested counts logical samples that met quorum (once, not per
+// replica). The request is all-or-nothing: if any series cannot reach quorum the whole
+// call errors and nothing is sent.
 func (c *StorageClient) Write(ctx context.Context, req WriteRequest) (*WriteResponse, error) {
-	// Group time series by target node (hash-based sharding by metric name)
-	shards := make(map[int][]TimeSeries)
-	for _, ts := range req.TimeSeries {
-		idx := c.shardFor(ts.Name)
-		shards[idx] = append(shards[idx], ts)
+	if len(req.TimeSeries) == 0 {
+		return &WriteResponse{}, nil
 	}
 
-	var totalIngested int64
-	for idx, series := range shards {
-		shardReq := WriteRequest{TimeSeries: series}
-		body, err := json.Marshal(shardReq)
-		if err != nil {
-			return nil, fmt.Errorf("marshal write request: %w", err)
-		}
-
-		url := fmt.Sprintf("http://%s/api/internal/write", c.addrs[idx])
-		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-		if err != nil {
-			return nil, err
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-
-		resp, err := c.client.Do(httpReq)
-		if err != nil {
-			return nil, fmt.Errorf("write to storage %s: %w", c.addrs[idx], err)
-		}
-		if err := statusError(resp, "write to storage "+c.addrs[idx]); err != nil {
-			resp.Body.Close()
-			return nil, err
-		}
-		var wr WriteResponse
-		decErr := json.NewDecoder(resp.Body).Decode(&wr)
-		resp.Body.Close()
-		if decErr != nil {
-			return nil, fmt.Errorf("decode write response from %s: %w", c.addrs[idx], decErr)
-		}
-		totalIngested += wr.SamplesIngested
+	type seriesPlan struct {
+		key      string
+		samples  int
+		replicas []string // live replica addresses for this series
 	}
 
-	return &WriteResponse{SamplesIngested: totalIngested}, nil
+	// Plan placement for every series first; bail before sending if any series lacks
+	// a quorum of live replicas, so a quorum failure never leaves a partial write.
+	plans := make([]seriesPlan, len(req.TimeSeries))
+	perNode := make(map[string][]TimeSeries)
+	for i, ts := range req.TimeSeries {
+		key := ringKey(ts.Name, labelSliceToMap(ts.Labels))
+		nodes := c.ring.GetNodes(key, c.rf)
+		if len(nodes) < c.w {
+			return nil, fmt.Errorf("write quorum unavailable for series %q: %d live replica(s) < W=%d", key, len(nodes), c.w)
+		}
+		addrs := make([]string, len(nodes))
+		for j, n := range nodes {
+			addrs[j] = n.Addr
+			perNode[n.Addr] = append(perNode[n.Addr], ts)
+		}
+		plans[i] = seriesPlan{key: key, samples: len(ts.Samples), replicas: addrs}
+	}
+
+	// Fan out one batched write per target node, concurrently.
+	type nodeResult struct {
+		addr string
+		ok   bool
+	}
+	results := make(chan nodeResult, len(perNode))
+	for addr, series := range perNode {
+		go func(addr string, series []TimeSeries) {
+			results <- nodeResult{addr: addr, ok: c.writeToNode(ctx, addr, series)}
+		}(addr, series)
+	}
+	okNodes := make(map[string]bool, len(perNode))
+	for range perNode {
+		nr := <-results
+		if nr.ok {
+			okNodes[nr.addr] = true
+		}
+	}
+
+	// Require W acks per series.
+	var ingested int64
+	for _, p := range plans {
+		acks := 0
+		for _, addr := range p.replicas {
+			if okNodes[addr] {
+				acks++
+			}
+		}
+		if acks < c.w {
+			return nil, fmt.Errorf("write quorum not met for series %q: %d/%d replica acks < W=%d", p.key, acks, len(p.replicas), c.w)
+		}
+		ingested += int64(p.samples)
+	}
+
+	return &WriteResponse{SamplesIngested: ingested}, nil
 }
 
-// Query fans out a query to all storage nodes and merges results.
+// writeToNode POSTs a batch of series to one storage node, returning whether the node
+// acknowledged it (HTTP 200). The body is drained so the connection can be reused.
+func (c *StorageClient) writeToNode(ctx context.Context, addr string, series []TimeSeries) bool {
+	body, err := json.Marshal(WriteRequest{TimeSeries: series})
+	if err != nil {
+		return false
+	}
+	url := fmt.Sprintf("http://%s/api/internal/write", addr)
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
+// Query serves a read from a quorum of replicas. Because a label-matcher query spans
+// many series (each with its own ring replica set), it scatters to all live nodes —
+// a superset of any matched series' replicas — and merges the responses, deduping by
+// (series, timestamp). It then enforces a read quorum of R: globally (at least R live
+// nodes must respond) and per returned series (at least R of that series' replicas
+// must have responded); too few is a quorum failure surfaced as an error rather than
+// silent partial data. Finally it asynchronously read-repairs: any responding replica
+// missing points relative to the merged truth is sent those points. With W+R>N the
+// read set overlaps every write set, giving read-your-writes.
 func (c *StorageClient) Query(ctx context.Context, matchers []storage.LabelMatcher, start, end int64) (storage.SeriesSet, error) {
-	// Build request
+	live := c.ring.LiveNodes()
+	if len(live) < c.r {
+		return nil, fmt.Errorf("read quorum unavailable: %d live storage node(s) < R=%d", len(live), c.r)
+	}
+
 	matcherJSON := make([]MatcherJSON, len(matchers))
 	for i, m := range matchers {
 		matcherJSON[i] = StorageToMatcher(m)
 	}
-	qr := QueryRequest{Matchers: matcherJSON, Start: start, End: end}
-	body, err := json.Marshal(qr)
+	body, err := json.Marshal(QueryRequest{Matchers: matcherJSON, Start: start, End: end})
 	if err != nil {
 		return nil, err
 	}
 
-	type result struct {
+	type nodeResp struct {
+		addr string
 		data []SeriesResult
-		err  error
+		ok   bool
 	}
-
-	// Fan out to all storage nodes in parallel
-	results := make(chan result, len(c.addrs))
-	for _, addr := range c.addrs {
+	ch := make(chan nodeResp, len(live))
+	for _, n := range live {
 		go func(addr string) {
-			url := fmt.Sprintf("http://%s/api/internal/query", addr)
-			req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
-			if err != nil {
-				results <- result{err: err}
-				return
-			}
-			req.Header.Set("Content-Type", "application/json")
-
-			resp, err := c.client.Do(req)
-			if err != nil {
-				results <- result{err: fmt.Errorf("query storage %s: %w", addr, err)}
-				return
-			}
-			defer resp.Body.Close()
-			if err := statusError(resp, "query storage "+addr); err != nil {
-				results <- result{err: err}
-				return
-			}
-
-			var qr QueryResponse
-			if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
-				results <- result{err: fmt.Errorf("decode response from %s: %w", addr, err)}
-				return
-			}
-			results <- result{data: qr.Data}
-		}(addr)
+			data, ok := c.queryNode(ctx, addr, body)
+			ch <- nodeResp{addr: addr, data: data, ok: ok}
+		}(n.Addr)
 	}
 
-	// Merge results from all nodes
+	// Merge responses into the canonical truth, and remember each node's per-series
+	// points so we can diff them for read-repair.
+	responded := make(map[string]bool, len(live))
 	merged := make(map[string]*storage.ResultSeries)
-	for range c.addrs {
-		r := <-results
-		if r.err != nil {
-			continue // Skip failed nodes, return partial results
+	perNode := make(map[string]map[string][]storage.Point, len(live))
+	for range live {
+		nr := <-ch
+		if !nr.ok {
+			continue
 		}
-		for _, sr := range r.data {
+		responded[nr.addr] = true
+		nodePoints := make(map[string][]storage.Point, len(nr.data))
+		for _, sr := range nr.data {
 			key := seriesKey(sr.Name, sr.Labels)
 			points := make([]storage.Point, len(sr.Points))
 			for i, p := range sr.Points {
 				points[i] = storage.Point{Timestamp: p.Timestamp, Value: p.Value}
 			}
+			nodePoints[key] = points
 			if existing, ok := merged[key]; ok {
 				existing.Points = mergePoints(existing.Points, points)
 			} else {
 				merged[key] = &storage.ResultSeries{
 					Name:   sr.Name,
 					Labels: sr.Labels,
-					Points: points,
+					Points: append([]storage.Point(nil), points...),
 				}
 			}
 		}
+		perNode[nr.addr] = nodePoints
+	}
+
+	if len(responded) < c.r {
+		return nil, fmt.Errorf("read quorum not met: %d/%d live storage node(s) responded (R=%d)", len(responded), len(live), c.r)
+	}
+
+	// Per-series read quorum + read-repair planning. Repairs are batched per target so
+	// a node receives one write regardless of how many series it must catch up on.
+	repairs := make(map[string][]TimeSeries)
+	for key, rs := range merged {
+		replicas := c.ring.GetNodes(ringKey(rs.Name, rs.Labels), c.rf)
+		respondedReplicas := 0
+		for _, n := range replicas {
+			if responded[n.Addr] {
+				respondedReplicas++
+			}
+		}
+		if respondedReplicas < c.r {
+			return nil, fmt.Errorf("read quorum not met for series %q: %d responding replica(s) < R=%d", key, respondedReplicas, c.r)
+		}
+		for _, n := range replicas {
+			nodePoints, ok := perNode[n.Addr]
+			if !ok {
+				continue // replica didn't respond; nothing read from it to diff against
+			}
+			if missing := pointsMissing(rs.Points, nodePoints[key]); len(missing) > 0 {
+				repairs[n.Addr] = append(repairs[n.Addr], seriesToWrite(rs.Name, rs.Labels, missing))
+			}
+		}
+	}
+	if len(repairs) > 0 {
+		go c.readRepair(repairs)
 	}
 
 	ss := make(storage.SeriesSet, 0, len(merged))
@@ -172,6 +378,51 @@ func (c *StorageClient) Query(ctx context.Context, matchers []storage.LabelMatch
 		ss = append(ss, *rs)
 	}
 	return ss, nil
+}
+
+// queryNode runs the query against one storage node, returning its series and whether
+// the node responded successfully (HTTP 200, decodable body).
+func (c *StorageClient) queryNode(ctx context.Context, addr string, body []byte) ([]SeriesResult, bool) {
+	url := fmt.Sprintf("http://%s/api/internal/query", addr)
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return nil, false
+	}
+	var qr QueryResponse
+	if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
+		return nil, false
+	}
+	return qr.Data, true
+}
+
+// readRepair writes the missing points back to stale replicas in the background, under
+// its own timeout so it outlives the originating request. Repairs are best-effort:
+// failures are dropped and corrected on a later read. Because storage rejects
+// out-of-order samples, a replica converges for points newer than its last — the usual
+// case of a replica that missed a contiguous window while down. (Filling an interior
+// gap needs hinted handoff; see ADR-022.)
+func (c *StorageClient) readRepair(byAddr map[string][]TimeSeries) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	for addr, series := range byAddr {
+		wg.Add(1)
+		go func(addr string, series []TimeSeries) {
+			defer wg.Done()
+			c.writeToNode(ctx, addr, series)
+		}(addr, series)
+	}
+	wg.Wait()
 }
 
 // FetchBlocks retrieves block metadata from all storage nodes.
@@ -481,10 +732,69 @@ func (c *StorageClient) DeleteBlock(ctx context.Context, addr, ulid string) erro
 	return nil
 }
 
-func (c *StorageClient) shardFor(metricName string) int {
-	h := fnv.New32a()
-	h.Write([]byte(metricName))
-	return int(h.Sum32()) % len(c.addrs)
+// ringKey is the consistent-hash key for a series. It excludes the synthetic
+// "__name__" label (the name is carried separately, and storage reads echo it back in
+// the label set) so the key a write computes from []Label and the key a read computes
+// from the returned label map are identical for the same logical series.
+func ringKey(name string, labels map[string]string) string {
+	if _, ok := labels["__name__"]; ok {
+		stripped := make(map[string]string, len(labels))
+		for k, v := range labels {
+			if k != "__name__" {
+				stripped[k] = v
+			}
+		}
+		labels = stripped
+	}
+	return cluster.MetricKey(name, labels)
+}
+
+// labelSliceToMap converts wire labels to a map, dropping any "__name__" entry so the
+// result matches what ringKey strips on the read side.
+func labelSliceToMap(labels []Label) map[string]string {
+	m := make(map[string]string, len(labels))
+	for _, l := range labels {
+		if l.Name == "__name__" {
+			continue
+		}
+		m[l.Name] = l.Value
+	}
+	return m
+}
+
+// pointsMissing returns the points in truth whose timestamp is absent from have. Both
+// slices must be sorted ascending by timestamp (storage returns sorted points and
+// mergePoints preserves order).
+func pointsMissing(truth, have []storage.Point) []storage.Point {
+	var missing []storage.Point
+	i := 0
+	for _, p := range truth {
+		for i < len(have) && have[i].Timestamp < p.Timestamp {
+			i++
+		}
+		if i < len(have) && have[i].Timestamp == p.Timestamp {
+			continue
+		}
+		missing = append(missing, p)
+	}
+	return missing
+}
+
+// seriesToWrite packages a series' points into a wire TimeSeries for read-repair,
+// dropping "__name__" from the labels (storage re-derives it from the name).
+func seriesToWrite(name string, labels map[string]string, points []storage.Point) TimeSeries {
+	lbls := make([]Label, 0, len(labels))
+	for k, v := range labels {
+		if k == "__name__" {
+			continue
+		}
+		lbls = append(lbls, Label{Name: k, Value: v})
+	}
+	samples := make([]Sample, len(points))
+	for i, p := range points {
+		samples[i] = Sample{TimestampMs: p.Timestamp, Value: p.Value}
+	}
+	return TimeSeries{Name: name, Labels: lbls, Samples: samples}
 }
 
 func seriesKey(name string, labels map[string]string) string {

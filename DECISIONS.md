@@ -461,3 +461,73 @@ light, and at a 390px width by driving the live dashboard in a headless browser:
 the crosshair readout tracks the cursor, the empty/loading/error/reconnect states
 render in one voice, and there are no console errors. The boldness lives in exactly
 one place; everything else stays quiet, which is what makes it land.
+
+## ADR-022: Replication — Quorum Writes, Quorum Reads, and Read-Repair
+
+**Status**: Accepted
+**Context**: The project claimed "consistent-hash clustering with configurable
+replication," but `internal/cluster` (the ring and coordinator) was dead code with
+zero non-test importers: the live write path sharded each series to a single node
+with `fnv(name) % len(nodes)` — replication factor 1 — and `replication_factor: 3`
+in config was inert. A single storage node's loss therefore lost data, and reads
+returned silent partial results. The ring also truncated its hash to 32 bits and
+ignored node state, so it could route to dead nodes. The goal: make replication real
+over the existing docker-compose tier (ingestor → storage ← querier) while leaving
+the single-binary monolith single-node.
+**Decision**: Adopt a Dynamo-style quorum model with N, W, R configured in
+`cluster` (defaults N=3, W=2, R=2; `Validate` enforces 1≤W,R≤N and W+R>N for
+read-your-writes). The consistent-hash ring (`internal/cluster`, now widened to a
+64-bit hash with a deterministic nodeID tie-break and Dead/Leaving filtering) is the
+single routing source, built by `service.StorageClient` from the configured storage
+addresses so the ingestor and querier agree on placement.
+
+- **Replica selection**: a series' key is `MetricKey(name, labels)` (the synthetic
+  `__name__` label excluded so write-side `[]Label` and read-side label maps hash
+  identically); `replicas = ring.GetNodes(key, N)`, skipping nodes whose health
+  state is Dead/Leaving.
+- **Write — write-to-all, require W**: send each series to all of its live replicas
+  (batched per node), succeed only when ≥W acknowledge. Fewer than W live replicas,
+  or fewer than W acks, is a quorum failure returned as an error — never a silent
+  partial write. The request is all-or-nothing. A replica that was down simply
+  misses the write and is reconciled later by read-repair.
+- **Read — scatter, quorum, merge, repair**: a PromQL query carries label matchers,
+  not a single series key, so it can match many series each with its own replica
+  set. The client therefore scatters to all live nodes (a superset of any matched
+  series' replicas) and merges responses, deduping by (series, timestamp) via the
+  existing point-merge. Read quorum R is enforced globally (≥R live nodes must
+  respond) and per returned series (≥R of that series' replicas must have
+  responded); too few is a quorum error, not partial data. It then asynchronously
+  read-repairs: any responding replica missing points relative to the merged truth
+  is sent exactly those points in the background.
+- **Health**: a background monitor probes each node's `/health` and sets ring state
+  Active/Dead, so routing excludes dead nodes and a node returning Dead→Active
+  resumes receiving writes and is repaired on the next read.
+- **Degraded mode**: with one node down, N=3/W=2/R=2 still satisfies both quorums,
+  so writes and reads keep succeeding; the surviving replicas hold a complete copy.
+
+Why quorum over async primary/replica: W+R>N gives read-your-writes without a leader
+or failover election, and read-repair makes the system self-healing on the read path
+— a better fit for a single-process-per-node tier than primary hand-off.
+
+**Consequences**: A storage node can be lost without losing data or failing reads,
+and a recovered node converges via read-repair — proven by in-process integration
+tests (exactly-N placement, write-at-quorum-with-one-down, complete-read-with-one-
+down, read-repair convergence, read-your-writes across a membership shift, and
+quorum-failure errors). `internal/cluster` is now on the live path. The model is
+eventually consistent: a read during a failure may briefly observe a replica that
+has not yet been repaired, but the merge always returns the union, so no acknowledged
+write is lost. Effective N/W/R are clamped to the live node count, so a cluster
+smaller than the configured N degrades gracefully rather than rejecting every write.
+
+**Deferred (honest scope)**:
+- **Hinted handoff**: writes are not buffered for a dead replica; it stays stale
+  until a read repairs it. Read-repair only converges points *newer* than a
+  replica's last sample (storage rejects out-of-order — ADR-015), which covers the
+  usual contiguous down-window; filling an interior gap needs hinted handoff.
+- **Rebalancing on membership change**: the ring re-derives placement when state
+  changes, but data already written is not migrated, and over-replication left by a
+  degraded-mode write to a non-owner is not garbage-collected.
+- **Cross-node anti-entropy** (e.g. Merkle repair) beyond read-triggered repair.
+- **Topology/ownership in the UI**: `/api/v1/cluster` still reports per-service
+  health, not per-series replica ownership; surfacing the ring there and in the
+  dashboard is left as-is.

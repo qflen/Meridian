@@ -175,11 +175,52 @@ type DownsamplingRule struct {
 	Retention      Duration `yaml:"retention"`
 }
 
-// IngestionConfig holds batch writer parameters.
+// IngestionConfig holds batch writer and write-path flow-control parameters.
+//
+// The ingest path is a bounded queue between accept and the drain-to-storage
+// worker (ADR-023). QueueCapacity bounds the samples that may sit in the queue,
+// so it caps resident memory under overload. When the queue is full a producer
+// blocks up to BlockDeadline (the backpressure); past it, the batch is shed —
+// dropped, counted, and the producer NACKed (HTTP 429 / TCP NACK) — rather than
+// buffered without bound. QueueHighWatermark is the depth at which producers are
+// flagged to throttle before shedding begins.
 type IngestionConfig struct {
-	BatchSize           int      `yaml:"batch_size"`
-	FlushInterval       Duration `yaml:"flush_interval"`
-	MaxConcurrentWrites int      `yaml:"max_concurrent_writes"`
+	BatchSize     int      `yaml:"batch_size"`
+	FlushInterval Duration `yaml:"flush_interval"`
+	// MaxConcurrentWrites bounds the worker pool that drains the service ingest
+	// queue to storage (ingestor) or the local TSDB (storage node).
+	MaxConcurrentWrites int `yaml:"max_concurrent_writes"`
+	// QueueCapacity is the bounded ingest queue size in samples (the hard memory
+	// cap). It must be at least BatchSize so a single batch can be enqueued.
+	QueueCapacity int `yaml:"queue_capacity"`
+	// QueueHighWatermark is the queue depth in samples at or above which producers
+	// are flagged to throttle (early backpressure). It must be in [1, QueueCapacity].
+	QueueHighWatermark int `yaml:"queue_high_watermark"`
+	// BlockDeadline is how long an enqueue blocks against a full queue before the
+	// batch is shed. Zero makes enqueue non-blocking (shed immediately when full).
+	BlockDeadline Duration `yaml:"block_deadline"`
+}
+
+// Validate checks the ingestion flow-control parameters are internally consistent
+// so a misconfiguration is caught at load time rather than producing a queue that
+// can never accept a batch or a watermark above the cap.
+func (c IngestionConfig) Validate() error {
+	if c.BatchSize < 1 {
+		return fmt.Errorf("ingestion.batch_size must be >= 1, got %d", c.BatchSize)
+	}
+	if c.MaxConcurrentWrites < 1 {
+		return fmt.Errorf("ingestion.max_concurrent_writes must be >= 1, got %d", c.MaxConcurrentWrites)
+	}
+	if c.QueueCapacity < c.BatchSize {
+		return fmt.Errorf("ingestion.queue_capacity (%d) must be >= batch_size (%d) so a batch can enqueue", c.QueueCapacity, c.BatchSize)
+	}
+	if c.QueueHighWatermark < 1 || c.QueueHighWatermark > c.QueueCapacity {
+		return fmt.Errorf("ingestion.queue_high_watermark must be in [1,%d], got %d", c.QueueCapacity, c.QueueHighWatermark)
+	}
+	if c.BlockDeadline < 0 {
+		return fmt.Errorf("ingestion.block_deadline must be >= 0, got %s", time.Duration(c.BlockDeadline))
+	}
+	return nil
 }
 
 // LogConfig holds logging parameters.
@@ -221,6 +262,9 @@ func DefaultConfig() *Config {
 			BatchSize:           1000,
 			FlushInterval:       Duration(100 * time.Millisecond),
 			MaxConcurrentWrites: 64,
+			QueueCapacity:       50000,
+			QueueHighWatermark:  40000,
+			BlockDeadline:       Duration(250 * time.Millisecond),
 		},
 		Log: LogConfig{
 			Level:  "info",
@@ -243,6 +287,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := cfg.Cluster.Validate(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Ingestion.Validate(); err != nil {
 		return nil, err
 	}
 

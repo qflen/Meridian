@@ -32,6 +32,14 @@ ingestion:
   batch_size: 1000
   flush_interval: "100ms"
   max_concurrent_writes: 64
+  # Write-path backpressure (ADR-023). The ingest queue holds at most
+  # queue_capacity samples — the hard memory cap. A full queue blocks the
+  # producer up to block_deadline (backpressure); past it, the batch is shed
+  # (dropped + counted, producer NACKed) instead of buffered without bound.
+  # queue_high_watermark is the depth at which producers are flagged to throttle.
+  queue_capacity: 50000
+  queue_high_watermark: 40000
+  block_deadline: "250ms"
 
 log:
   level: "info"

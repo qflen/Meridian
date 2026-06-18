@@ -242,7 +242,7 @@ function Dashboard() {
       {/* Footer */}
       <footer className="border-t mt-8">
         <div className="max-w-[1600px] mx-auto px-4 py-3 text-xs text-muted">
-          Meridian v0.1.0 — distributed time-series database
+          Meridian v0.2.0 — distributed time-series database
         </div>
       </footer>
     </div>

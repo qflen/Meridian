@@ -170,6 +170,86 @@ func (db *TSDB) DeleteRollupBlock(resolution int64, ulid string) error {
 	return fmt.Errorf("rollup block %s (res=%d) not found", ulid, resolution)
 }
 
+// RawBlockFrontier returns the largest MaxTime across immutable raw blocks, or
+// math.MinInt64 if there are none. The downsampler treats this as the global
+// ingestion frontier: a rollup window is only closed once a raw block exists whose
+// data extends past the window's end.
+func (db *TSDB) RawBlockFrontier() int64 {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	frontier := int64(-1 << 62)
+	for _, b := range db.blocks {
+		if b.meta.MaxTime > frontier {
+			frontier = b.meta.MaxTime
+		}
+	}
+	return frontier
+}
+
+// RawBlockSeries returns, per series, the raw points held in immutable raw blocks with
+// timestamps in [start, end] (inclusive). It deliberately excludes the head: the
+// downsampler derives rollups only from durably-flushed, immutable data, so a rollup
+// is deterministic and regenerable. Points for a series are merged across blocks and
+// time-ordered.
+func (db *TSDB) RawBlockSeries(start, end int64) []ResultSeries {
+	db.mu.RLock()
+	blocks := make([]*Block, len(db.blocks))
+	copy(blocks, db.blocks)
+	db.mu.RUnlock()
+
+	resultMap := make(map[string]*ResultSeries)
+	for _, block := range blocks {
+		for _, br := range block.Query(nil, start, end) {
+			labelsNoName := make(map[string]string, len(br.Labels))
+			for k, v := range br.Labels {
+				if k != "__name__" {
+					labelsNoName[k] = v
+				}
+			}
+			key := seriesKey(br.Name, labelsNoName)
+			if existing, ok := resultMap[key]; ok {
+				existing.Points = mergePoints(existing.Points, br.Points)
+			} else {
+				// Labels exclude __name__ (carried in Name), matching the rollup-series
+				// convention so the rollup block index isn't double-populated.
+				rs := ResultSeries{Name: br.Name, Labels: labelsNoName, Points: br.Points}
+				resultMap[key] = &rs
+			}
+		}
+	}
+	out := make([]ResultSeries, 0, len(resultMap))
+	for _, rs := range resultMap {
+		sort.Slice(rs.Points, func(i, j int) bool { return rs.Points[i].Timestamp < rs.Points[j].Timestamp })
+		out = append(out, *rs)
+	}
+	return out
+}
+
+// RollupTierSeries returns, per series, the rollup windows of the given resolution
+// whose centre falls in [start, end] (inclusive), merged across that tier's blocks.
+// The downsampler consumes this to chain a finer tier into a coarser one.
+func (db *TSDB) RollupTierSeries(resolution, start, end int64) []RollupSeriesData {
+	blocks := db.RollupBlocks(resolution)
+	merged := make(map[string]*RollupSeriesData)
+	for _, b := range blocks {
+		for _, sd := range b.SeriesInRange(start, end) {
+			key := seriesKey(sd.Name, sd.Labels)
+			if existing, ok := merged[key]; ok {
+				existing.Windows = append(existing.Windows, sd.Windows...)
+			} else {
+				cp := sd
+				merged[key] = &cp
+			}
+		}
+	}
+	out := make([]RollupSeriesData, 0, len(merged))
+	for _, sd := range merged {
+		sort.Slice(sd.Windows, func(i, j int) bool { return sd.Windows[i].Timestamp < sd.Windows[j].Timestamp })
+		out = append(out, *sd)
+	}
+	return out
+}
+
 // RollupStats reports the per-resolution on-disk footprint, ascending by resolution.
 func (db *TSDB) RollupStats() []RollupResolutionStats {
 	db.rollupMu.RLock()

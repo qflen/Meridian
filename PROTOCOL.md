@@ -62,6 +62,13 @@ GET /api/query?q=<promql>&start=<ms>&end=<ms>&format=<json|csv|table>
 }
 ```
 
+**Resolution selection** (ADR-011): the planner transparently serves wide spans from
+a coarse rollup tier instead of raw, picking the resolution from the query span and
+step. The response carries `resolution_ms` (the rollup window served, in ms; `0` =
+raw) and `points_read` (points fetched from storage) so a caller can see that a wide
+query read far fewer points from a coarse tier. `rate()` and range selectors always
+read raw.
+
 ### Labels
 
 ```

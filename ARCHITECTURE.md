@@ -201,12 +201,22 @@ single-node and does not use the ring.
 
 ### Retention & Downsampling
 
-**Enforcer** (`internal/retention/enforcer.go`): Periodic TTL-based cleanup
-that deletes blocks older than the configured retention period.
+**Downsampler** (`internal/retention/downsampler.go`): Runs the live raw → 1m → 1h
+cascade (ADR-011). Each background pass advances a tier as far as its source is
+durably closed, rolling sealed raw blocks into resolution-tagged **rollup blocks**
+(`storage.RollupBlock`) that store five Gorilla-compressed aggregate columns
+(min/max/sum/count/avg) per series under `<dataDir>/rollups/<resolution>/`. The 1h
+tier is *chained* from the 1m tier with a count-weighted average, so it equals a 1h
+rollup built directly from raw. A per-resolution `covered_through` watermark makes
+passes idempotent and crash-recoverable (rollups are regenerable). At query time the
+planner (`internal/query`) selects a resolution from the span and step and the
+executor reads the chosen tier's avg column (`TSDB.QueryResolution`), rolling up the
+freshest not-yet-closed tail on the fly so the coarse series stays current.
 
-**Downsampler** (`internal/retention/downsampler.go`): Computes rollup
-aggregates (min, max, avg, sum, count) per time window, enabling the
-5s → 1m → 1h downsampling cascade.
+**Enforcer** (`internal/retention/enforcer.go`): Per-resolution TTL cleanup. Raw
+blocks expire first (and only once the finest rollup tier has captured them); each
+rollup tier is kept longer, so a long-range query is still answerable from the 1h
+tier after the raw behind it is gone.
 
 ## Data Flow
 
@@ -217,10 +227,13 @@ aggregates (min, max, avg, sum, count) per time window, enabling the
    (ADR-023).
 2. **Flush**: Head swap + WAL rotate (cut) → Gorilla-compressed block written via
    temp-dir + fsync + atomic rename → covered WAL segments reclaimed.
-3. **Query**: Parser → Planner → merge(HeadBlock, Blocks) → Executor → Result
+3. **Query**: Parser → Planner (also selects a rollup resolution from the span/step)
+   → merge(HeadBlock, Blocks) or read the chosen rollup tier → Executor → Result
 4. **Stream**: WebSocket hub broadcasts metrics + stats to dashboard at 60fps. The
    same per-tick per-series stream feeds the anomaly detector, whose raise/clear
    transitions broadcast as `anomaly` frames (ADR-024).
-5. **Retain**: Enforcer deletes expired blocks; downsampler creates rollups
+5. **Downsample & retain**: the downsampler rolls sealed raw blocks into the 1m/1h
+   tiers (1h chained count-weighted from 1m); the enforcer expires each tier on its
+   own TTL, raw first (only once it has been rolled up)
 6. **Recover**: On open, load blocks, then replay only the WAL beyond the blocks'
    max low-water-mark → exactly-once reconstruction of the head.

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/meridiandb/meridian/internal/config"
+	"github.com/meridiandb/meridian/internal/retention"
 	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
 	"github.com/meridiandb/meridian/internal/storage"
@@ -50,6 +51,17 @@ func main() {
 		Workers:       envInt("STORAGE_MAX_CONCURRENT_WRITES", 8),
 	})
 	defer pool.Close()
+
+	// Run the downsampling cascade locally: rollups are generated where the raw data
+	// lives (ADR-011). Cluster-wide per-resolution retention is enforced by the
+	// compactor, which now sees rollup blocks tagged by resolution.
+	if envBool("STORAGE_DOWNSAMPLING_ENABLED", true) {
+		dc := config.DefaultConfig().Downsampling
+		ds := retention.NewDownsampler(db, dc.DownsampleRules(), envDuration("STORAGE_DOWNSAMPLE_INTERVAL", dc.Interval.Std()))
+		ds.Start()
+		defer ds.Stop()
+		log.Printf("Storage service %s: downsampling cascade enabled", nodeID)
+	}
 
 	mux := http.NewServeMux()
 	s := &storageServer{db: db, nodeID: nodeID, pool: pool, startTime: time.Now()}
@@ -124,6 +136,7 @@ func (s *storageServer) registerRoutes(mux *http.ServeMux) {
 func (s *storageServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	server.WriteStorageMetrics(w, s.db, s.nodeID)
+	server.WriteRollupMetrics(w, s.db, s.nodeID)
 	server.WriteServiceMetrics(w, s.nodeID, "storage", time.Since(s.startTime))
 	if s.pool != nil {
 		server.WriteQueueMetrics(w, s.nodeID, "storage", s.pool.Stats())
@@ -249,11 +262,11 @@ func (s *storageServer) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *storageServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
-	// Handle DELETE /api/internal/blocks/{ulid}
+	// Handle DELETE /api/internal/blocks/{ulid} across the raw and rollup tiers.
 	path := strings.TrimPrefix(r.URL.Path, "/api/internal/blocks")
 	if r.Method == "DELETE" && len(path) > 1 {
 		ulid := strings.TrimPrefix(path, "/")
-		if err := s.db.DeleteBlock(ulid); err != nil {
+		if err := s.db.DeleteAnyBlock(ulid); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
@@ -261,12 +274,12 @@ func (s *storageServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// GET: list all blocks
-	blocks := s.db.Blocks()
-	infos := make([]service.BlockInfo, len(blocks))
-	for i, b := range blocks {
+	// GET: list raw blocks plus every rollup tier, tagged with its resolution so the
+	// compactor can apply a per-resolution retention TTL.
+	var infos []service.BlockInfo
+	for _, b := range s.db.Blocks() {
 		meta := b.Meta()
-		infos[i] = service.BlockInfo{
+		infos = append(infos, service.BlockInfo{
 			ULID:       meta.ULID,
 			NodeID:     s.nodeID,
 			MinTime:    meta.MinTime,
@@ -274,6 +287,21 @@ func (s *storageServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
 			NumSamples: meta.Stats.NumSamples,
 			NumSeries:  meta.Stats.NumSeries,
 			Level:      meta.Compaction.Level,
+			Resolution: 0,
+		})
+	}
+	for _, res := range s.db.RollupResolutions() {
+		for _, b := range s.db.RollupBlocks(res) {
+			meta := b.Meta()
+			infos = append(infos, service.BlockInfo{
+				ULID:       meta.ULID,
+				NodeID:     s.nodeID,
+				MinTime:    meta.MinTime,
+				MaxTime:    meta.MaxTime,
+				NumSamples: meta.Stats.NumWindows,
+				NumSeries:  meta.Stats.NumSeries,
+				Resolution: meta.Resolution,
+			})
 		}
 	}
 	writeJSON(w, infos)
@@ -316,6 +344,19 @@ func envInt(key string, def int) int {
 			return n
 		}
 		log.Printf("invalid %s=%q, using default %d", key, v, def)
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+		log.Printf("invalid %s=%q, using default %v", key, v, def)
 	}
 	return def
 }

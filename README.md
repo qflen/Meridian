@@ -167,8 +167,17 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   exactly the one real node rather than fabricating zero-stat peers.
 
 ### Operations
-- **Retention enforcement**: TTL-based block deletion
-- **Downsampling**: 5s → 1m → 1h cascade (min/max/avg/sum/count)
+- **Downsampling cascade**: a live raw → 1m → 1h rollup cascade (ADR-011). On each
+  background pass, sealed raw blocks are rolled up to resolution-tagged 1m blocks and
+  the 1m tier is chained — count-weighted, so a 1h average equals one built directly
+  from raw — into 1h blocks. Every window stores min/max/sum/count/avg. The query
+  planner picks a resolution from the query span and step, so a wide view reads coarse
+  rollup points instead of millions of raw samples (a verified 8h span read 36 points
+  from the 1h tier versus 3844 raw), transparently to the caller. `rate()` and range
+  selectors force raw.
+- **Per-resolution retention**: each tier has its own TTL — raw expires first while
+  the longer-lived 1m/1h tiers keep answering long-range queries (default raw 15d →
+  1m 30d → 1h 365d). Raw is never dropped before the finest rollup tier has captured it.
 - **Simulator**: diurnal patterns, spike injection, memory drift across 8 hosts
 
 ## Architecture

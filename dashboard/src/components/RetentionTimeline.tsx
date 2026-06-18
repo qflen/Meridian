@@ -38,30 +38,30 @@ export function RetentionTimeline() {
     };
   }, []);
 
-  // Build display blocks: real blocks + head block
+  // Build display blocks: real blocks + head block, laned by downsampling tier
+  // (raw, then each rollup resolution) so the cascade reads top-to-bottom.
   const now = Date.now();
   const displayBlocks = (() => {
-    const result: { id: string; node: string; minTime: number; maxTime: number; samples: number }[] = [];
+    const result: { id: string; tier: number; tierLabel: string; minTime: number; maxTime: number; samples: number }[] = [];
 
-    if (blocks.length > 0) {
-      for (const b of blocks) {
-        result.push({
-          id: b.ulid.substring(0, 8),
-          node: b.node_id,
-          minTime: b.min_time,
-          maxTime: b.max_time,
-          samples: b.num_samples,
-        });
-      }
+    for (const b of blocks) {
+      result.push({
+        id: b.ulid.substring(0, 8),
+        tier: b.resolution_ms ?? 0,
+        tierLabel: b.resolution ?? 'raw',
+        minTime: b.min_time,
+        maxTime: b.max_time,
+        samples: b.num_samples,
+      });
     }
 
-    // Always show a head block for current time
-    const headStart = result.length > 0
-      ? Math.max(...result.map((b) => b.maxTime))
-      : now - 3600000;
+    // Always show a head block (the still-open raw tier) up to current time.
+    const rawMax = result.filter((b) => b.tier === 0).map((b) => b.maxTime);
+    const headStart = rawMax.length > 0 ? Math.max(...rawMax) : now - 3600000;
     result.push({
       id: 'head',
-      node: 'all',
+      tier: 0,
+      tierLabel: 'raw',
       minTime: headStart,
       maxTime: now,
       samples: state.stats?.activeSeries ?? 0,
@@ -95,27 +95,27 @@ export function RetentionTimeline() {
     const maxT = Math.max(...displayBlocks.map((b) => b.maxTime));
     const tRange = maxT - minT || 1;
 
-    // Group blocks by storage node for multi-lane display
-    const nodeIds = [...new Set(displayBlocks.map((b) => b.node))];
-    const laneCount = Math.max(nodeIds.length, 1);
+    // One lane per downsampling tier, raw first then coarser rollups.
+    const tiers = [...new Set(displayBlocks.map((b) => b.tier))].sort((a, b) => a - b);
+    const laneCount = Math.max(tiers.length, 1);
     const laneH = plotH / laneCount;
 
     const laneColors = [colors.accent, ...CATEGORICAL];
 
-    nodeIds.forEach((nodeId, lane) => {
+    tiers.forEach((tier, lane) => {
       const y = pad.top + lane * laneH;
       const color = laneColors[lane % laneColors.length];
 
-      // Lane label
+      // Lane label = the tier's resolution ("raw", "1m", "1h").
       ctx.fillStyle = colors.textMuted;
       ctx.font = canvasFont(9, { family: 'sans' });
       ctx.textAlign = 'right';
-      const label = nodeId === 'all' ? 'head' : nodeId.replace('storage-', 'S');
+      const label = displayBlocks.find((b) => b.tier === tier)?.tierLabel ?? 'raw';
       ctx.fillText(label, pad.left - 8, y + laneH / 2 + 3);
 
       // Blocks in this lane
       displayBlocks
-        .filter((b) => b.node === nodeId)
+        .filter((b) => b.tier === tier)
         .forEach((b) => {
           const x1 = pad.left + ((b.minTime - minT) / tRange) * plotW;
           const x2 = pad.left + ((b.maxTime - minT) / tRange) * plotW;

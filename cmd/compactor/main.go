@@ -13,15 +13,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/config"
 	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
+	"github.com/meridiandb/meridian/internal/storage"
 )
 
 func main() {
 	httpAddr := envOrDefault("COMPACTOR_HTTP_ADDR", ":8080")
 	storageAddrs := strings.Split(envOrDefault("STORAGE_ADDRS", "localhost:8081"), ",")
 	nodeID := envOrDefault("COMPACTOR_NODE_ID", "compactor-1")
-	retentionStr := envOrDefault("RETENTION", "360h") // 15 days default
+	retentionStr := envOrDefault("RETENTION", "360h") // 15 days default (raw tier)
 	retention, err := time.ParseDuration(retentionStr)
 	if err != nil {
 		retention = 15 * 24 * time.Hour
@@ -29,11 +31,16 @@ func main() {
 
 	sc := service.NewStorageClient(storageAddrs)
 
+	// Per-resolution rollup retention (raw shortest, coarser tiers longer). Defaults
+	// come from the standard cascade; raw is the RETENTION env above.
+	rollupRetention := config.DefaultConfig().Downsampling.RollupRetentions()
+
 	comp := &compactorServer{
-		nodeID:    nodeID,
-		storage:   sc,
-		retention: retention,
-		startTime: time.Now(),
+		nodeID:          nodeID,
+		storage:         sc,
+		retention:       retention,
+		rollupRetention: rollupRetention,
+		startTime:       time.Now(),
 	}
 
 	// Start health HTTP server
@@ -66,8 +73,11 @@ func main() {
 type compactorServer struct {
 	nodeID    string
 	storage   *service.StorageClient
-	retention time.Duration
-	startTime time.Time
+	retention time.Duration // raw tier TTL
+	// rollupRetention maps a rollup resolution (ms) to its TTL. A rollup block whose
+	// resolution is absent here is left untouched.
+	rollupRetention map[int64]time.Duration
+	startTime       time.Time
 }
 
 func (c *compactorServer) registerRoutes(mux *http.ServeMux) {
@@ -113,24 +123,35 @@ func (c *compactorServer) enforceRetention() {
 		return
 	}
 
-	cutoff := time.Now().UnixMilli() - c.retention.Milliseconds()
+	now := time.Now().UnixMilli()
 	deleted := 0
 
 	for _, block := range blocks {
-		if block.MaxTime < cutoff {
-			// Find the storage node address for this block
-			addr := c.findNodeAddr(block.NodeID)
-			if addr == "" {
+		// Each tier expires on its own TTL: raw at the raw retention, each rollup
+		// resolution at its configured TTL. A rollup tier with no configured TTL is
+		// kept (skipped) rather than deleted by the raw rule.
+		ttl := c.retention
+		if block.Resolution != 0 {
+			rt, ok := c.rollupRetention[block.Resolution]
+			if !ok {
 				continue
 			}
-			log.Printf("Compactor: deleting block %s from %s (max_time=%d < cutoff=%d)",
-				block.ULID, block.NodeID, block.MaxTime, cutoff)
-			if err := c.storage.DeleteBlock(ctx, addr, block.ULID); err != nil {
-				log.Printf("Compactor: error deleting block %s: %v", block.ULID, err)
-				continue
-			}
-			deleted++
+			ttl = rt
 		}
+		if block.MaxTime >= now-ttl.Milliseconds() {
+			continue
+		}
+		addr := c.findNodeAddr(block.NodeID)
+		if addr == "" {
+			continue
+		}
+		log.Printf("Compactor: deleting %s block %s from %s (max_time=%d, ttl=%s)",
+			storage.ResolutionLabel(block.Resolution), block.ULID, block.NodeID, block.MaxTime, ttl)
+		if err := c.storage.DeleteBlock(ctx, addr, block.ULID); err != nil {
+			log.Printf("Compactor: error deleting block %s: %v", block.ULID, err)
+			continue
+		}
+		deleted++
 	}
 
 	if deleted > 0 {

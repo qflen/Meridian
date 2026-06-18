@@ -289,7 +289,9 @@ The microservice binaries read the same knobs from the environment: replication
 the live node count so a cluster smaller than N still works — backpressure
 (`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
 `MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents) — and the
-gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`).
+gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`). The storage node also reads its
+local TSDB timings from `STORAGE_BLOCK_DURATION`, `STORAGE_FLUSH_INTERVAL`, and
+`STORAGE_RETENTION` (and `STORAGE_DOWNSAMPLE_INTERVAL` for the rollup cascade pass).
 
 ## Docker
 

@@ -31,9 +31,9 @@ func main() {
 	opts := storage.TSDBOptions{
 		WALDir:          dataDir + "/wal",
 		BlockDir:        dataDir + "/blocks",
-		BlockDuration:   2 * time.Hour,
-		RetentionPeriod: 15 * 24 * time.Hour,
-		FlushInterval:   1 * time.Minute,
+		BlockDuration:   envDuration("STORAGE_BLOCK_DURATION", 2*time.Hour),
+		RetentionPeriod: envDuration("STORAGE_RETENTION", 15*24*time.Hour),
+		FlushInterval:   envDuration("STORAGE_FLUSH_INTERVAL", 1*time.Minute),
 	}
 
 	db, err := storage.Open(dataDir, opts)

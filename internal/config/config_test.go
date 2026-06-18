@@ -47,6 +47,59 @@ func TestParseDurationErrors(t *testing.T) {
 	}
 }
 
+func TestClusterConfigValidate(t *testing.T) {
+	valid := []ClusterConfig{
+		{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 256}, // default
+		{ReplicationFactor: 1, WriteQuorum: 1, ReadQuorum: 1, VirtualNodes: 64},   // single node
+		{ReplicationFactor: 3, WriteQuorum: 3, ReadQuorum: 1, VirtualNodes: 8},    // write-all/read-one
+		{ReplicationFactor: 5, WriteQuorum: 3, ReadQuorum: 3, VirtualNodes: 256},
+	}
+	for _, c := range valid {
+		if err := c.Validate(); err != nil {
+			t.Errorf("expected %+v to be valid, got %v", c, err)
+		}
+	}
+
+	invalid := []ClusterConfig{
+		{ReplicationFactor: 0, WriteQuorum: 1, ReadQuorum: 1, VirtualNodes: 1},  // N<1
+		{ReplicationFactor: 3, WriteQuorum: 0, ReadQuorum: 2, VirtualNodes: 1},  // W<1
+		{ReplicationFactor: 3, WriteQuorum: 4, ReadQuorum: 2, VirtualNodes: 1},  // W>N
+		{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 4, VirtualNodes: 1},  // R>N
+		{ReplicationFactor: 3, WriteQuorum: 1, ReadQuorum: 2, VirtualNodes: 1},  // W+R == N (no read-your-writes)
+		{ReplicationFactor: 4, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 1},  // W+R == N
+		{ReplicationFactor: 3, WriteQuorum: 2, ReadQuorum: 2, VirtualNodes: 0},  // virtual nodes < 1
+	}
+	for _, c := range invalid {
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected %+v to be invalid", c)
+		}
+	}
+}
+
+func TestDefaultConfigClusterValid(t *testing.T) {
+	if err := DefaultConfig().Cluster.Validate(); err != nil {
+		t.Fatalf("default cluster config must validate: %v", err)
+	}
+}
+
+func TestLoadRejectsBadQuorum(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "meridian.yaml")
+	yaml := `
+cluster:
+  replication_factor: 3
+  write_quorum: 1
+  read_quorum: 1
+  virtual_nodes: 256
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load should reject W+R <= N (1+1 <= 3)")
+	}
+}
+
 func TestLoadYAMLWithDayWeekSuffix(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "meridian.yaml")

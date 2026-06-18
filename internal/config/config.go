@@ -122,13 +122,45 @@ type StorageConfig struct {
 }
 
 // ClusterConfig holds cluster membership and replication settings.
+//
+// Replication follows a quorum model: a series is written to the N
+// (ReplicationFactor) ring replicas and succeeds once WriteQuorum acks; reads take
+// ReadQuorum responses and merge. Choosing WriteQuorum+ReadQuorum > ReplicationFactor
+// guarantees read-your-writes (the write and read sets always overlap). See ADR-022.
 type ClusterConfig struct {
 	Enabled           bool     `yaml:"enabled"`
 	NodeID            string   `yaml:"node_id"`
 	BindAddr          string   `yaml:"bind_addr"`
 	Join              []string `yaml:"join"`
 	ReplicationFactor int      `yaml:"replication_factor"`
-	VirtualNodes      int      `yaml:"virtual_nodes"`
+	// WriteQuorum (W) is the number of replica acks required for a write to succeed.
+	WriteQuorum int `yaml:"write_quorum"`
+	// ReadQuorum (R) is the number of replicas a read must hear from.
+	ReadQuorum   int `yaml:"read_quorum"`
+	VirtualNodes int `yaml:"virtual_nodes"`
+}
+
+// Validate checks the replication parameters are internally consistent. It enforces
+// 1 <= W,R <= N and the read-your-writes condition W+R > N, so a misconfiguration is
+// caught at load time rather than silently weakening consistency at runtime.
+func (c ClusterConfig) Validate() error {
+	n, w, r := c.ReplicationFactor, c.WriteQuorum, c.ReadQuorum
+	if n < 1 {
+		return fmt.Errorf("cluster.replication_factor must be >= 1, got %d", n)
+	}
+	if w < 1 || w > n {
+		return fmt.Errorf("cluster.write_quorum must be in [1,%d], got %d", n, w)
+	}
+	if r < 1 || r > n {
+		return fmt.Errorf("cluster.read_quorum must be in [1,%d], got %d", n, r)
+	}
+	if w+r <= n {
+		return fmt.Errorf("cluster.write_quorum + cluster.read_quorum must exceed replication_factor for read-your-writes (W=%d + R=%d <= N=%d)", w, r, n)
+	}
+	if c.VirtualNodes < 1 {
+		return fmt.Errorf("cluster.virtual_nodes must be >= 1, got %d", c.VirtualNodes)
+	}
+	return nil
 }
 
 // DownsamplingConfig holds automatic rollup rules.
@@ -175,6 +207,8 @@ func DefaultConfig() *Config {
 			Enabled:           false,
 			BindAddr:          "0.0.0.0:7946",
 			ReplicationFactor: 3,
+			WriteQuorum:       2,
+			ReadQuorum:        2,
 			VirtualNodes:      256,
 		},
 		Downsampling: DownsamplingConfig{
@@ -205,6 +239,10 @@ func Load(path string) (*Config, error) {
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, err
+	}
+
+	if err := cfg.Cluster.Validate(); err != nil {
 		return nil, err
 	}
 

@@ -49,6 +49,43 @@ func WriteStorageMetrics(w io.Writer, db *storage.TSDB, node string) {
 	fmt.Fprintf(w, "meridian_compression_ratio{node=%q} %.3f\n", node, ratio)
 }
 
+// WriteRollupMetrics writes the downsampling metrics for db: per-resolution rollup
+// block count, stored windows, compressed bytes, and raw samples summarised, plus the
+// downsampling-savings figure (raw samples represented per stored rollup window — ~12x
+// for 1m and ~720x for 1h over 5s data). Shared by the monolith and the storage
+// microservice so every node that holds rollups reports them. See ADR-011.
+func WriteRollupMetrics(w io.Writer, db *storage.TSDB, node string) {
+	stats := db.RollupStats()
+
+	fmt.Fprintf(w, "# HELP meridian_rollup_blocks Rollup blocks on disk, by resolution.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rollup_blocks gauge\n")
+	for _, s := range stats {
+		fmt.Fprintf(w, "meridian_rollup_blocks{node=%q,resolution=%q} %d\n", node, storage.ResolutionLabel(s.Resolution), s.BlockCount)
+	}
+
+	fmt.Fprintf(w, "# HELP meridian_rollup_windows Stored rollup windows (points), by resolution.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rollup_windows gauge\n")
+	for _, s := range stats {
+		fmt.Fprintf(w, "meridian_rollup_windows{node=%q,resolution=%q} %d\n", node, storage.ResolutionLabel(s.Resolution), s.NumWindows)
+	}
+
+	fmt.Fprintf(w, "# HELP meridian_rollup_bytes Compressed rollup column bytes on disk, by resolution.\n")
+	fmt.Fprintf(w, "# TYPE meridian_rollup_bytes gauge\n")
+	for _, s := range stats {
+		fmt.Fprintf(w, "meridian_rollup_bytes{node=%q,resolution=%q} %d\n", node, storage.ResolutionLabel(s.Resolution), s.ChunkBytes)
+	}
+
+	fmt.Fprintf(w, "# HELP meridian_downsampling_point_reduction Raw samples represented per stored rollup window (the downsampling savings).\n")
+	fmt.Fprintf(w, "# TYPE meridian_downsampling_point_reduction gauge\n")
+	for _, s := range stats {
+		var reduction float64
+		if s.NumWindows > 0 {
+			reduction = float64(s.RawSamples) / float64(s.NumWindows)
+		}
+		fmt.Fprintf(w, "meridian_downsampling_point_reduction{node=%q,resolution=%q} %.2f\n", node, storage.ResolutionLabel(s.Resolution), reduction)
+	}
+}
+
 // WriteQueueMetrics writes the write-path flow-control metrics for one node/role
 // from a bounded-queue snapshot (ADR-023): the cumulative drop/shed/backpressure
 // counters and the depth/capacity/high-water gauges. It is shared by the monolith

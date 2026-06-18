@@ -419,6 +419,37 @@ func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		out["anomalies_total"] = s.anomalyDet.Total()
 		out["active_anomalies"] = s.anomalyDet.Active()
 	}
+	// Downsampling cascade (ADR-011): per-resolution rollup footprint and the savings
+	// figure (raw samples represented per stored rollup window).
+	if rollups := s.db.RollupStats(); len(rollups) > 0 {
+		tiers := make([]map[string]interface{}, 0, len(rollups))
+		for _, st := range rollups {
+			var reduction float64
+			if st.NumWindows > 0 {
+				reduction = float64(st.RawSamples) / float64(st.NumWindows)
+			}
+			tiers = append(tiers, map[string]interface{}{
+				"resolution_ms":   st.Resolution,
+				"resolution":      storage.ResolutionLabel(st.Resolution),
+				"blocks":          st.BlockCount,
+				"windows":         st.NumWindows,
+				"bytes":           st.ChunkBytes,
+				"raw_samples":     st.RawSamples,
+				"point_reduction": reduction,
+			})
+		}
+		// Headline savings: the coarsest tier's point reduction (RollupStats is
+		// ascending by resolution).
+		coarsest := rollups[len(rollups)-1]
+		var headline float64
+		if coarsest.NumWindows > 0 {
+			headline = float64(coarsest.RawSamples) / float64(coarsest.NumWindows)
+		}
+		out["downsampling"] = map[string]interface{}{
+			"resolutions":     tiers,
+			"point_reduction": headline,
+		}
+	}
 	writeJSON(w, out)
 }
 
@@ -486,6 +517,9 @@ func (s *HTTPServer) handlePromMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// Storage-engine metrics, shared verbatim with the storage microservice.
 	WriteStorageMetrics(w, s.db, node)
+
+	// Downsampling cascade: per-resolution rollup footprint and savings (ADR-011).
+	WriteRollupMetrics(w, s.db, node)
 
 	// Write-path flow-control metrics from the bounded ingest queue, when wired.
 	if s.ingestStats != nil {

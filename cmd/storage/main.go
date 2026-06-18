@@ -136,6 +136,7 @@ func (s *storageServer) registerRoutes(mux *http.ServeMux) {
 func (s *storageServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	server.WriteStorageMetrics(w, s.db, s.nodeID)
+	server.WriteRollupMetrics(w, s.db, s.nodeID)
 	server.WriteServiceMetrics(w, s.nodeID, "storage", time.Since(s.startTime))
 	if s.pool != nil {
 		server.WriteQueueMetrics(w, s.nodeID, "storage", s.pool.Stats())

@@ -1,103 +1,36 @@
 package retention
 
 import (
-	"math"
 	"time"
 
 	"github.com/meridiandb/meridian/internal/storage"
 )
 
-// DownsampleRule defines a rollup rule for downsampling.
+// DownsampleRule defines a rollup rule for downsampling: raw (or the previous tier)
+// at SourceInterval is rolled up to TargetInterval and kept for Retention.
 type DownsampleRule struct {
 	SourceInterval time.Duration
 	TargetInterval time.Duration
 	Retention      time.Duration
 }
 
-// Downsampler performs automatic rollup of time-series data at progressively
-// coarser intervals to reduce storage while preserving long-term trends.
-type Downsampler struct {
-	db    *storage.TSDB
-	rules []DownsampleRule
-}
+// RollupResult holds the aggregated values for a single rollup window. It is the
+// canonical storage.RollupSample (min/max/sum/avg/count) — aliased here so the
+// downsampling API reads naturally while a single type flows through storage, the
+// rollup blocks, and the query path.
+type RollupResult = storage.RollupSample
 
-// RollupResult holds the aggregated values for a single rollup window.
-type RollupResult struct {
-	Timestamp int64
-	Min       float64
-	Max       float64
-	Avg       float64
-	Sum       float64
-	Count     int
-}
-
-// NewDownsampler creates a downsampler with the given rules.
-func NewDownsampler(db *storage.TSDB, rules []DownsampleRule) *Downsampler {
-	return &Downsampler{
-		db:    db,
-		rules: rules,
-	}
-}
-
-// Rollup computes aggregated values for points within fixed windows.
+// Rollup computes per-window aggregates (min, max, sum, count, and the count-weighted
+// avg) for raw points using fixed, globally-aligned windows of windowMs. It is the
+// raw→coarse step of the cascade; see storage.RollupPoints.
 func Rollup(points []storage.Point, windowMs int64) []RollupResult {
-	if len(points) == 0 || windowMs <= 0 {
-		return nil
-	}
+	return storage.RollupPoints(points, windowMs)
+}
 
-	var results []RollupResult
-	windowStart := (points[0].Timestamp / windowMs) * windowMs
-
-	var (
-		minVal = math.Inf(1)
-		maxVal = math.Inf(-1)
-		sum    float64
-		count  int
-	)
-
-	for _, p := range points {
-		windowEnd := windowStart + windowMs
-		if p.Timestamp >= windowEnd {
-			// Emit current window
-			if count > 0 {
-				results = append(results, RollupResult{
-					Timestamp: windowStart + windowMs/2,
-					Min:       minVal,
-					Max:       maxVal,
-					Avg:       sum / float64(count),
-					Sum:       sum,
-					Count:     count,
-				})
-			}
-			// Advance to the window containing this point
-			windowStart = (p.Timestamp / windowMs) * windowMs
-			minVal = math.Inf(1)
-			maxVal = math.Inf(-1)
-			sum = 0
-			count = 0
-		}
-
-		if p.Value < minVal {
-			minVal = p.Value
-		}
-		if p.Value > maxVal {
-			maxVal = p.Value
-		}
-		sum += p.Value
-		count++
-	}
-
-	// Emit last window
-	if count > 0 {
-		results = append(results, RollupResult{
-			Timestamp: windowStart + windowMs/2,
-			Min:       minVal,
-			Max:       maxVal,
-			Avg:       sum / float64(count),
-			Sum:       sum,
-			Count:     count,
-		})
-	}
-
-	return results
+// ChainRollups derives a coarser tier from an already-rolled finer tier, weighting
+// the average by Count so a 1h window built from 1m rollups equals the 1h window
+// built directly from raw. The coarse interval must be a multiple of the finer one
+// (the cascade guarantees it). See storage.ChainRollups.
+func ChainRollups(samples []RollupResult, windowMs int64) []RollupResult {
+	return storage.ChainRollups(samples, windowMs)
 }

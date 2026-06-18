@@ -106,13 +106,84 @@ are predictable and debuggable. Adequate for the component count.
 
 ## ADR-011: Three-Tier Downsampling Cascade
 
-**Status**: Accepted  
-**Context**: Long-term storage of 5-second resolution data is prohibitively
-expensive. Users querying older data don't need high resolution.  
-**Decision**: Automatic downsampling: 5s → 1m (after 24h) → 1h (after 7d).
-Each rollup stores min, max, avg, sum, count per window.  
-**Consequences**: Storage savings of ~12x for 1m and ~720x for 1h rollups.
-Query engine transparently selects appropriate resolution.
+**Status**: Accepted (implemented)
+**Context**: High-resolution data is expensive to store and slow to scan over long
+ranges: a 30-day view at 5-second resolution is ~518k points per series, far more
+than a screen can show or a user needs. The rollup math (`Rollup`) existed but was
+dead code — never scheduled, never persisted, never queried — so the advertised
+"5s→1m→1h cascade with transparent resolution selection" was a claim with no code
+path behind it. Making it real means three things that must agree: generating
+resolution-tagged rollups, selecting a resolution at query time, and expiring each
+tier on its own schedule.
+
+**Decision**: A live cascade — raw → 1m → 1h — with rollups stored in their own
+resolution-tagged blocks, a planner that picks the resolution from the query span,
+and per-resolution retention.
+
+- **Rollup blocks** (`storage.RollupBlock`). Rollups are stored separately from raw
+  blocks, one directory per resolution (`<dataDir>/rollups/<label>/<ulid>`). Each
+  series carries **five aggregate columns** — min, max, sum, count, and the
+  count-weighted avg — each a Gorilla-compressed stream over the shared window-centre
+  timestamps (the Gorilla codec is reused unchanged). Writing reuses the raw block's
+  crash-safe path (temp dir → fsync files+dir → atomic rename → fsync parent). A
+  rollup is **derived data**, so it carries no WAL low-water-mark; a block instead
+  records its `resolution` and a `covered_through` watermark (the window-aligned,
+  exclusive source-time bound the tier is complete to).
+
+- **Generation** (`retention.Downsampler`). A background pass advances each tier as
+  far as its source is *closed*: `covered_through = ⌊source_frontier / window⌋ ×
+  window`, where the source frontier is the max time of the immutable raw blocks (for
+  1m) or the finer tier's `covered_through` (for 1h). It rolls only windows whose end
+  has passed that frontier, reading from **sealed raw blocks** (merged across block
+  boundaries) so a rollup is deterministic and regenerable; the still-open head tail
+  is left to the query path. Idempotency is the on-disk watermark — a tier resumes
+  from `max(covered_through)`, so passes never duplicate or re-roll a window and a
+  crash mid-pass is recovered by regeneration.
+
+- **Weighted chaining** (the A16 correctness point). 1h is built by chaining the 1m
+  tier, **not** by re-reading raw. For this to equal a direct raw→1h rollup the
+  average must be count-weighted: `sum = Σ sub.sum`, `count = Σ sub.count`, `min/max =
+  min/max of sub.min/max`, and `avg = sum / count`. A plain mean of the sixty 1m
+  averages is wrong whenever the minutes hold unequal sample counts. Because every
+  raw point falls in exactly one 1m window and every 1m window in exactly one 1h
+  window (global alignment), the chained result is *identical*, for all five
+  aggregates, to the direct one — proven by a test on deliberately uneven counts.
+
+- **Query-time selection** (`query.Plan`/`executor`). The planner chooses the
+  coarsest resolution that (a) is no coarser than the step (no upsampling) and (b)
+  yields enough windows over the span, considering only resolutions that actually
+  have data. The executor reads the chosen tier's **avg** column as the series value
+  (min/max/sum/count are kept for future function-aware selection), widening the
+  staleness window to one rollup interval so coarse points are not dropped as gaps.
+  `TSDB.QueryResolution` serves persisted rollups for the range and rolls up the
+  freshest, not-yet-closed tail on the fly (seamed at the window-aligned
+  `covered_through`), so the coarse series stays complete to *now*. Selection is
+  transparent — the result shape is unchanged; the HTTP API reports the chosen
+  `resolution_ms` and `points_read` for observability.
+
+- **Per-resolution retention** (`retention.Enforcer`). Raw expires first; each rollup
+  tier is kept longer (defaults: raw 15d → 1m 30d → 1h 365d). A raw block is only
+  eligible for deletion once the finest rollup tier has captured it (its max time is
+  below that tier's `covered_through`), so shortening the raw TTL trades resolution
+  for space without losing history. In the cluster the compactor enforces the same
+  per-resolution TTLs, keyed by the resolution now carried on each block's metadata.
+
+**Forced raw / future work**: range selectors and `rate()` force raw, because a rate
+over a downsampled counter is not generally correct. Two follow-ups are deliberately
+out of scope here and documented as future work: **function-aware aggregate
+selection** (e.g. serving `max_over_time` from the stored max column rather than avg)
+and **rate-on-rollup**. In the **cluster**, rollups are generated on each storage
+node but the querier still reads raw (the remote client does not yet push a
+resolution to storage); cluster query-time selection is the remaining piece, so
+cluster raw retention should stay ≥ the longest query span until it lands.
+
+**Consequences**: Verified on a 4-series, 8-hour backfill: a wide query (8h span, 1h
+step) was served from the 1h tier reading **36 points**, versus **3844** for the same
+span at raw resolution — a ~107× reduction — while a narrow query (5m span) read raw.
+The 1h tier reported a 105× point-reduction (raw samples represented per stored
+window); over 5s raw data the figures are ~12× (1m) and ~720× (1h). The cost is five
+stored aggregates per window and a background pass; rollups are regenerable, so the
+extra on-disk state is never authoritative.
 
 ## ADR-012: Single-Binary Architecture
 

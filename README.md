@@ -111,9 +111,29 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   shed/backpressure-event counters on `/metrics`; queue depth + a derived drop rate on
   `/api/v1/stats` and the dashboard load view, which the simulator's spikes drive.
 
+### Streaming anomaly detection
+- **Per-series online detector**: single-pass and O(1) state per series, run inline
+  in the broadcast loop. Each series tracks an **EWMA baseline + dispersion**; a point
+  is flagged when its *local* z-score `|value − baseline| / dispersion` exceeds a
+  threshold (~3–4). The moving baseline tracks the simulator's **diurnal swing and
+  memory drift without alerting**, while an injected **spike** departs sharply from it
+  and **does** alert — where a naive global mean/z-score would flag the whole diurnal
+  peak. (ADR-024.)
+- **Robust by construction**: a Welford warmup seeds the baseline before any alert; a
+  Huber clamp bounds a spike's pull on the baseline/dispersion (so it can't blind the
+  detector); a relative scale floor stops a momentarily-flat series from looking
+  anomalous; debounce + hysteresis and timestamp dedup prevent alert storms; stale
+  series are evicted so memory follows live cardinality.
+- **On the wire and the screen**: raise/clear transitions stream as a distinct
+  `anomaly` WebSocket frame and into a bounded recent-buffer (`/api/v1/anomalies`) for
+  late-joining clients; the dashboard's **Anomalies** strip lists them most-recent-first
+  and clears each as it recovers. `meridian_anomalies_total` and
+  `meridian_active_anomalies` are on `/metrics` and `/api/v1/stats`. Runs uniformly in
+  the monolith and the cluster gateway.
+
 ### Dashboard
 - **Canvas-rendered**: charts drawn directly on the Canvas 2D API, no chart library
-- **10 components**: query editor, time-series chart, metric explorer, cluster topology, ingestion monitor, compression gauge, latency histogram, retention timeline, live stream, theme toggle
+- **11 components**: query editor, time-series chart, metric explorer, cluster topology, ingestion monitor, compression gauge, latency histogram, retention timeline, live stream, anomalies strip, theme toggle
 - **Real-time**: WebSocket streaming batched through `requestAnimationFrame`
 - **Themes**: dark and light, sharing one semantic token system
 - **Design**: a calm "precision instrument" visual language — three panel tiers, one accent, tabular-mono figures, self-hosted Inter Tight / Inter / IBM Plex Mono (ADR-020, ADR-021)
@@ -129,15 +149,20 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   query-latency histogram); the gateway also reports connected WebSocket clients;
   every ingest-bounding node exposes the flow-control families
   (`meridian_dropped_samples_total`, ingest queue depth/capacity/high-water,
-  shed/backpressure-event counters — ADR-023); and every service exposes
-  `meridian_up` and uptime. (ADR-019.)
+  shed/backpressure-event counters — ADR-023); the monolith and gateway, where the
+  anomaly detector runs, also expose `meridian_anomalies_total` and
+  `meridian_active_anomalies` (ADR-024); and every service exposes `meridian_up` and
+  uptime. (ADR-019.)
 - **`/health`**: liveness probe for orchestrators
 - **`/api/v1/stats`**: JSON snapshot of storage, WAL, ingestion, compression, and
   ingest-queue load. The `ingestion_rate` field is a live **samples/sec rate**
   averaged over a short rolling window (it tracks load and falls back to ~0 when
   idle); the monotonic cumulative count lives in the `meridian_samples_ingested_total`
   counter (ADR-017). `ingest_queue_depth`/`_capacity` and the cumulative
-  `dropped_samples` expose write-path backpressure (ADR-023).
+  `dropped_samples` expose write-path backpressure (ADR-023); `anomalies_total` and
+  `active_anomalies` expose the detector (ADR-024).
+- **`/api/v1/anomalies`**: the bounded recent-anomalies buffer, most-recent-first,
+  so a late-joining dashboard seeds its alerts strip before live frames arrive (ADR-024).
 - **Single-node honesty**: in default single-node `serve`, `/api/v1/cluster` reports
   exactly the one real node rather than fabricating zero-stat peers.
 
@@ -182,10 +207,13 @@ curl "http://localhost:8080/api/v1/stats"
 curl "http://localhost:8080/api/v1/cluster"
 curl "http://localhost:8080/api/v1/blocks"
 
+# Recent anomalies (most-recent-first, with total/active counters)
+curl "http://localhost:8080/api/v1/anomalies"
+
 # Prometheus-scrapeable self-metrics
 curl "http://localhost:8080/metrics"
 
-# Live WebSocket stream
+# Live WebSocket stream — stats, per-series metric, and `anomaly` frames
 websocat "ws://localhost:8080/ws/metrics"
 ```
 
@@ -227,13 +255,20 @@ ingestion:                # write-path backpressure (ADR-023)
   queue_high_watermark: 40000   # depth at which producers are flagged to throttle
   block_deadline:       "250ms" # how long a full queue blocks before shedding
   max_concurrent_writes: 64     # drain worker-pool size (ingestor/storage)
+anomaly:                  # streaming anomaly detection (ADR-024)
+  enabled:    true        # toggle the detector on the live path
+  threshold:  3.5         # local z-score above which a sample is out-of-band
+  alpha:      0.1         # EWMA smoothing in (0,1]; smaller = steadier baseline
+  warmup:     20          # samples used to seed a baseline before any alert
+  debounce_k: 3           # consecutive out-of-band samples required to raise
 ```
 
 The microservice binaries read the same knobs from the environment: replication
 (`REPLICATION_FACTOR`, `WRITE_QUORUM`, `READ_QUORUM`, `VIRTUAL_NODES`) — clamped to
-the live node count so a cluster smaller than N still works — and backpressure
+the live node count so a cluster smaller than N still works — backpressure
 (`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
-`MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents).
+`MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents) — and the
+gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`).
 
 ## Docker
 
@@ -257,6 +292,7 @@ internal/
   query/            Lexer, parser, planner, executor
   ingestion/        TCP server, batch writer
   backpressure/     Bounded block-then-shed ingest queue (flow control)
+  anomaly/          Streaming per-series EWMA anomaly detector
   server/           HTTP API, WebSocket hub, /metrics exporter
   cluster/          Hash ring, coordinator, node lifecycle
   retention/        TTL enforcer, downsampler
@@ -274,7 +310,8 @@ ingestion, rAF batching for WebSocket, the out-of-order sample policy, the
 crash-consistent flush model, the windowed ingestion-rate vs cumulative counter, the
 CORS policy, cluster-wide `/metrics`, the replication consistency model (quorum
 writes/reads + read-repair), the write-path backpressure model (bounded queues with
-block-then-shed load shedding), and more.
+block-then-shed load shedding), the streaming anomaly detector (EWMA baseline +
+dispersion, robust to a moving diurnal baseline), and more.
 
 ## Development
 

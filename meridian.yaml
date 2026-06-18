@@ -41,6 +41,19 @@ ingestion:
   queue_high_watermark: 40000
   block_deadline: "250ms"
 
+anomaly:
+  # Streaming per-series anomaly detection over the live telemetry path (ADR-024).
+  # Each series tracks an EWMA baseline + dispersion; a point is flagged when its
+  # local z-score |value-baseline|/dispersion exceeds threshold. The moving
+  # baseline tracks slow diurnal swings and drift (no alert) while a spike departs
+  # sharply from it (alert). Robustness knobs (Huber clamp, scale floor,
+  # hysteresis) take internal defaults.
+  enabled: true
+  threshold: 3.5    # local z-score above which a sample is out-of-band (~3–4)
+  alpha: 0.1        # EWMA smoothing in (0,1]; smaller = steadier baseline
+  warmup: 20        # samples used to seed a baseline before any alert may fire
+  debounce_k: 3     # consecutive out-of-band samples required to raise an alert
+
 log:
   level: "info"
   format: "text"

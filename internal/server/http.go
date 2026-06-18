@@ -454,20 +454,21 @@ func (s *HTTPServer) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
-	blocks := s.db.Blocks()
 	type blockInfo struct {
-		ULID       string `json:"ulid"`
-		NodeID     string `json:"node_id"`
-		MinTime    int64  `json:"min_time"`
-		MaxTime    int64  `json:"max_time"`
-		NumSamples int64  `json:"num_samples"`
-		NumSeries  int    `json:"num_series"`
-		Level      int    `json:"level"`
+		ULID         string `json:"ulid"`
+		NodeID       string `json:"node_id"`
+		MinTime      int64  `json:"min_time"`
+		MaxTime      int64  `json:"max_time"`
+		NumSamples   int64  `json:"num_samples"`
+		NumSeries    int    `json:"num_series"`
+		Level        int    `json:"level"`
+		ResolutionMs int64  `json:"resolution_ms"` // 0 for raw, rollup window otherwise
+		Resolution   string `json:"resolution"`    // "raw", "1m", "1h", …
 	}
-	infos := make([]blockInfo, len(blocks))
-	for i, b := range blocks {
+	var infos []blockInfo
+	for _, b := range s.db.Blocks() {
 		meta := b.Meta()
-		infos[i] = blockInfo{
+		infos = append(infos, blockInfo{
 			ULID:       meta.ULID,
 			NodeID:     s.nodeID,
 			MinTime:    meta.MinTime,
@@ -475,6 +476,23 @@ func (s *HTTPServer) handleBlocks(w http.ResponseWriter, r *http.Request) {
 			NumSamples: meta.Stats.NumSamples,
 			NumSeries:  meta.Stats.NumSeries,
 			Level:      meta.Compaction.Level,
+			Resolution: storage.ResolutionLabel(0),
+		})
+	}
+	// Rollup blocks, tagged by resolution, so the timeline can show the cascade tiers.
+	for _, res := range s.db.RollupResolutions() {
+		for _, b := range s.db.RollupBlocks(res) {
+			meta := b.Meta()
+			infos = append(infos, blockInfo{
+				ULID:         meta.ULID,
+				NodeID:       s.nodeID,
+				MinTime:      meta.MinTime,
+				MaxTime:      meta.MaxTime,
+				NumSamples:   meta.Stats.NumWindows,
+				NumSeries:    meta.Stats.NumSeries,
+				ResolutionMs: meta.Resolution,
+				Resolution:   storage.ResolutionLabel(meta.Resolution),
+			})
 		}
 	}
 	writeJSON(w, map[string]interface{}{"blocks": infos})

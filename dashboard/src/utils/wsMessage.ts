@@ -1,4 +1,4 @@
-import { WSMessage, TimeSeries } from '../types';
+import { WSMessage, TimeSeries, Anomaly } from '../types';
 
 // Validation/normalisation for inbound WebSocket frames. A malformed or
 // partial payload must never reach the UI as a NaN (which renders as e.g.
@@ -11,6 +11,35 @@ function isFiniteNum(v: unknown): v is number {
 
 function num(v: unknown, fallback = 0): number {
   return isFiniteNum(v) ? v : fallback;
+}
+
+function str(v: unknown, fallback = ''): string {
+  return typeof v === 'string' ? v : fallback;
+}
+
+/**
+ * Validate and normalise one anomaly record (from a WebSocket frame or the
+ * /api/v1/anomalies seed). Requires a series id and finite value/timestamp; the
+ * severity/state enums and numeric fields are coerced to safe defaults. Returns
+ * `null` for shapes that are not anomalies.
+ */
+export function coerceAnomaly(raw: unknown): Anomaly | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+  if (typeof o.series !== 'string') return null;
+  if (!isFiniteNum(o.timestamp) || !isFiniteNum(o.value)) return null;
+  return {
+    seq: num(o.seq),
+    series: o.series,
+    metric: str(o.metric),
+    labels: o.labels && typeof o.labels === 'object' ? (o.labels as Record<string, string>) : {},
+    value: o.value,
+    baseline: num(o.baseline),
+    score: num(o.score),
+    severity: o.severity === 'crit' ? 'crit' : 'warn',
+    state: o.state === 'resolved' ? 'resolved' : 'firing',
+    timestamp: o.timestamp,
+  };
 }
 
 /**
@@ -58,6 +87,11 @@ export function parseWSMessage(raw: unknown): WSMessage | null {
     case 'live':
       if (!Array.isArray(obj.series)) return null;
       return { type: 'live', series: obj.series as TimeSeries[] };
+
+    case 'anomaly': {
+      const a = coerceAnomaly(obj);
+      return a ? { type: 'anomaly', ...a } : null;
+    }
 
     default:
       return null;

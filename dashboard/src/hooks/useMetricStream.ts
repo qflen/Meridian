@@ -19,6 +19,10 @@ export function useMetricStream() {
         case 'stats':
           dispatch({ type: 'SET_STATS', stats: msg });
           break;
+        case 'anomaly':
+          // WSAnomalyMessage carries every Anomaly field (plus the frame `type`).
+          dispatch({ type: 'ADD_ANOMALY', anomaly: msg });
+          break;
       }
     },
     [dispatch],

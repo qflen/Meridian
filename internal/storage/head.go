@@ -358,6 +358,10 @@ type SeriesInfo struct {
 	Labels      map[string]string
 	SampleCount int
 	LastValue   float64
+	// LastTS is the timestamp (Unix ms) of the most recent sample, or 0 if the
+	// series has none. It lets a 1 Hz consumer (e.g. the broadcast/anomaly path)
+	// tell a fresh sample from a re-read of the same point.
+	LastTS int64
 }
 
 // SeriesInfos returns metadata for all series.
@@ -369,8 +373,12 @@ func (h *HeadBlock) SeriesInfos() []SeriesInfo {
 	for _, s := range h.series {
 		s.mu.Lock()
 		var lastVal float64
+		var lastTS int64
 		if len(s.Values) > 0 {
 			lastVal = s.Values[len(s.Values)-1]
+		}
+		if len(s.Timestamps) > 0 {
+			lastTS = s.Timestamps[len(s.Timestamps)-1]
 		}
 		infos = append(infos, SeriesInfo{
 			ID:          s.ID,
@@ -378,6 +386,7 @@ func (h *HeadBlock) SeriesInfos() []SeriesInfo {
 			Labels:      s.Labels,
 			SampleCount: len(s.Timestamps),
 			LastValue:   lastVal,
+			LastTS:      lastTS,
 		})
 		s.mu.Unlock()
 	}

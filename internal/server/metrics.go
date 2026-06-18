@@ -81,6 +81,20 @@ func WriteQueueMetrics(w io.Writer, node, role string, st backpressure.Stats) {
 	fmt.Fprintf(w, "meridian_ingest_queue_high_watermark{node=%q,role=%q} %d\n", node, role, st.HighWatermark)
 }
 
+// WriteAnomalyMetrics writes the streaming-anomaly-detector metrics for one
+// node/role: the cumulative count of alerts raised (a counter) and the number of
+// series currently firing (a gauge). Shared by the monolith and the gateway so
+// both expose identical anomaly metrics. See ADR-024.
+func WriteAnomalyMetrics(w io.Writer, node, role string, total uint64, active int) {
+	fmt.Fprintf(w, "# HELP meridian_anomalies_total Anomaly alerts raised since startup.\n")
+	fmt.Fprintf(w, "# TYPE meridian_anomalies_total counter\n")
+	fmt.Fprintf(w, "meridian_anomalies_total{node=%q,role=%q} %d\n", node, role, total)
+
+	fmt.Fprintf(w, "# HELP meridian_active_anomalies Series currently in an out-of-band (firing) state.\n")
+	fmt.Fprintf(w, "# TYPE meridian_active_anomalies gauge\n")
+	fmt.Fprintf(w, "meridian_active_anomalies{node=%q,role=%q} %d\n", node, role, active)
+}
+
 // WriteServiceMetrics writes process-level metrics common to every Meridian service
 // so that gateway/querier/ingestor/compactor all expose a valid scrape endpoint.
 func WriteServiceMetrics(w io.Writer, node, role string, uptime time.Duration) {

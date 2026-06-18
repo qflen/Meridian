@@ -124,3 +124,27 @@ Per-series samples are also pushed on the same channel:
   "value": 42.5
 }
 ```
+
+**Anomaly alert** (ADR-024): a raise/clear transition from the streaming detector.
+`state` is `firing` or `resolved`; `severity` is `warn` or `crit`; `baseline` is the
+tracked EWMA level and `score` is `|value - baseline| / dispersion`; `seq` is a
+monotonic id for de-duplication.
+```json
+{
+  "type": "anomaly",
+  "seq": 12,
+  "series": "cpu_usage_percent{host=\"web-01\",role=\"web\"}",
+  "metric": "cpu_usage_percent",
+  "labels": {"host": "web-01", "role": "web"},
+  "value": 95.2,
+  "baseline": 41.3,
+  "score": 8.4,
+  "severity": "crit",
+  "state": "firing",
+  "timestamp": 1700000000000
+}
+```
+
+The recent transitions are also retained server-side; `GET /api/v1/anomalies`
+returns them most-recent-first as `{"anomalies": [...], "total": N, "active": M}`
+so a late-joining client can seed its view.

@@ -625,3 +625,108 @@ wiring.
 - **Storage parallelism**: the storage pool's workers serialize on the TSDB write
   lock, so its worker count is an admission bound rather than true write
   parallelism; group-commit (ADR-016) would raise the service rate it bounds.
+
+## ADR-024: Streaming Anomaly Detection — EWMA Baseline + Dispersion, Robust to a Moving Baseline
+
+**Status**: Accepted
+**Context**: The telemetry on the live path is not stationary. The simulator (and
+real infrastructure) produces a slow **diurnal swing** (a 24-hour load cycle) and
+slow **drift** (a leaking memory gauge that climbs for minutes then resets), with
+**spikes** injected on top (CPU jumping 2–3× for tens of seconds). We want to flag
+the spikes in real time and surface them on the dashboard — *without* flagging the
+diurnal swing or the drift, which are normal. The naive approach — score each point
+against a global mean and standard deviation (a fixed-baseline z-score) — is exactly
+wrong here: the baseline it compares against moves, so it would flag the entire
+afternoon peak of a diurnal series and the whole tail of a drifting one (a point
+many σ above the *seed* mean even though nothing is wrong). A streaming detector
+also has to be cheap: single-pass, O(1) state per series, no history buffer, run
+inline in the per-second broadcast over hundreds of series.
+
+**Decision**: A per-series **exponentially-weighted moving baseline + dispersion**
+in a new pure package `internal/anomaly`, fed from the broadcast loop and emitting
+alerts over the existing WebSocket hub.
+
+- **Local z-score, not global.** Each series tracks an EWMA **level** (the
+  baseline) and an EWMA **variance** of the residual (the dispersion). The score is
+  `|value − level| / dispersion` — a z-score against the *recently tracked*
+  baseline. Because both terms decay old data geometrically, the level follows the
+  slow diurnal/drift movement (so its residual stays small → no alert) while a spike
+  is a fast departure from the value the series was just holding (residual ≫
+  dispersion → large score → alert). This is the whole point: the moving baseline is
+  what makes diurnal data safe, where a global mean/σ is not.
+- **Welford warmup.** The first `warmup` samples seed the level/variance with an
+  exact Welford mean and sample variance and raise nothing, so the detector never
+  alerts before a baseline exists.
+- **Robustness — Huber winsorization + a scale floor.** The classic EWMA-z-score
+  failure is self-blinding: once the spike arrives it is folded into the level (which
+  lurches toward it, so the next point looks normal) and the dispersion (which
+  inflates, so nothing looks anomalous for a while after). Before a residual updates
+  the level and variance it is **clamped to ±(clip · dispersion)** (a Huber step,
+  clip defaults to the threshold). A spike therefore moves the baseline only
+  slightly, so its score stays high for the whole spike and the alert holds until the
+  value genuinely recovers; a slow ramp's residual is well inside the clamp and
+  passes through unchanged, so the baseline still tracks it. The dispersion is also
+  **floored** at `floorFrac · |level| + floorAbs` (relative, so it adapts to each
+  series' magnitude) so a momentarily-flat series cannot collapse the scale toward
+  zero and make ordinary noise look anomalous — important because the 1 Hz broadcast
+  resamples a slower (5 s) stream, so a series often repeats a value.
+- **Debounce + hysteresis (no alert storms).** An alert is raised only after
+  `debounce_k` consecutive out-of-band samples and cleared only once the score falls
+  back through a lower hysteresis band (½·threshold), so single-sample noise and
+  boundary flapping do not flap the alert. To make "consecutive" mean genuine
+  samples rather than re-reads, the detector **dedups on the sample timestamp**
+  (`SeriesInfo.LastTS`, plumbed through storage and the service layer): a sample
+  whose timestamp does not advance the series is ignored. On the gateway this also
+  collapses the same series fetched from multiple replicas at one timestamp.
+- **Bounded memory.** State is O(1) per series (a handful of float64s). Series not
+  seen within a TTL are **evicted**, so memory follows live cardinality (series leave
+  the head on flush/retention) rather than every series ever observed.
+- **Where it runs — tick-based, uniform across modes.** The detector is fed from the
+  same per-series stream the broadcaster already emits each tick: `SeriesInfos()` in
+  the monolith (`cmd/meridian/serve.go`) and the aggregated `FetchSeries` in the
+  cluster gateway (`cmd/gateway`). One code path, identical in both deployment modes.
+  We chose the tick feed over hooking raw ingest because it is simpler, naturally
+  cross-mode (the gateway never sees raw samples), and the 1 Hz cadence is the right
+  resolution for alerting on a live dashboard; the timestamp dedup recovers
+  per-sample debounce semantics. The trade-off (honest): detection runs at the
+  broadcast resolution and observes each series' latest value per tick, not every
+  raw sample.
+- **Events, buffer, transport.** A raise/clear transition is an `Event` (series,
+  metric, labels, value, baseline, score, severity warn/crit by score vs
+  2·threshold, state firing/resolved, a monotonic seq, timestamp) broadcast as a
+  distinct **`anomaly`** WebSocket frame. A bounded server-side ring keeps the recent
+  events; `/api/v1/anomalies` returns them most-recent-first so a late-joining
+  dashboard seeds its strip before live frames arrive. The dashboard merges by series
+  on the seq (one row per series, firing → resolved updates the same row), seeded
+  once then kept live.
+- **Config & metrics.** `anomaly.{enabled,threshold,alpha,warmup,debounce_k}` are
+  configurable and validated at load; the robustness knobs take internal defaults.
+  `meridian_anomalies_total` (cumulative counter) and `meridian_active_anomalies`
+  (gauge) are on `/metrics` and `/api/v1/stats`. The detector runs only where the
+  broadcast loop runs — the monolith and the gateway — so only those expose the
+  anomaly metrics; the storage/querier/ingestor/compactor services do no detection.
+
+**Consequences**: The diurnal swing and the slow memory drift do **not** raise
+alerts (the moving baseline tracks them and, for memory, the relative scale floor
+treats a few-percent jump as in-band), while the injected CPU spikes raise an alert
+within `debounce_k` samples that clears on recovery — proven by unit tests on
+synthetic stationary / diurnal / drift / spike sequences (the drift test also checks
+that a naive frozen-baseline z-score *would* have fired, so the moving baseline is
+demonstrably doing the work), plus warmup, debounce, threshold, exact Welford+EWMA
+math, dedup, eviction, and the robustness check that a second identical spike still
+fires after the first. The cost on the hot path is one map lookup and a few float
+ops per series per tick, with bounded memory.
+
+**Deferred (honest scope)**:
+- **Tick resolution, not per-sample.** Detection observes the latest value per
+  series per broadcast tick; a spike shorter than a tick that never lands on a
+  broadcast read is not seen. Hooking raw ingest would give per-sample fidelity at
+  the cost of the cross-mode uniformity above.
+- **No seasonal model.** The EWMA tracks *any* slow movement, diurnal or not; it
+  does not learn the 24-hour period explicitly (e.g. Holt-Winters), so a step change
+  in the *rate* of the baseline is briefly out-of-band until the level catches up.
+- **Per-series tuning.** One global threshold/alpha applies to every series; there
+  is no per-metric override or learned per-series sensitivity.
+- **No alert persistence or routing.** Alerts live in a bounded in-memory ring and
+  on the WebSocket; they are not persisted, deduplicated across restarts, or routed
+  to an external alertmanager.

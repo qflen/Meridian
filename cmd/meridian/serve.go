@@ -10,12 +10,22 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/anomaly"
 	"github.com/meridiandb/meridian/internal/config"
 	"github.com/meridiandb/meridian/internal/ingestion"
 	"github.com/meridiandb/meridian/internal/retention"
 	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/storage"
 	"github.com/spf13/cobra"
+)
+
+// Cadence/retention for the streaming anomaly detector fed by the broadcast loop.
+// The detector is evicted every anomalyEvictEvery ticks of series not seen within
+// anomalyTTL, so its memory follows live cardinality (series leave the head on
+// flush/retention) rather than every series ever observed.
+const (
+	anomalyEvictEvery = 30
+	anomalyTTL        = 5 * time.Minute
 )
 
 var (
@@ -132,8 +142,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	enforcer := retention.NewEnforcer(db, cfg.Storage.Retention.Std())
 	enforcer.Start()
 
+	// Streaming anomaly detector over the live telemetry path (ADR-024). It is fed
+	// from the same per-series stream the broadcaster emits each tick and shares the
+	// dashboard WebSocket hub; the HTTP server surfaces its recent buffer/counters.
+	var det *anomaly.Detector
+	if cfg.Anomaly.Enabled {
+		det = anomaly.New(cfg.Anomaly.Detector())
+		httpServer.SetAnomalyDetector(det)
+	}
+
 	// Start internal metrics broadcaster
-	go broadcastInternalMetrics(httpServer.Hub(), db, ingServer)
+	go broadcastInternalMetrics(httpServer.Hub(), db, ingServer, det)
 
 	fmt.Printf("Meridian node started (HTTP %s, gRPC %s, node=%s)\n", cfg.Server.HTTPAddr, cfg.Server.GRPCAddr, nodeID)
 
@@ -151,15 +170,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingServer *ingestion.Server) {
+func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingServer *ingestion.Server, det *anomaly.Detector) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	var tick uint64
 	for range ticker.C {
+		tick++
 		stats := db.Stats()
 		q := ingServer.BatchWriter().QueueStats()
 
-		metrics := map[string]interface{}{
+		hub.BroadcastMetrics(map[string]interface{}{
 			"type":            "stats",
 			"ingestionRate":   db.IngestionRate(),
 			"activeSeries":    stats.TotalSeries,
@@ -176,45 +197,50 @@ func broadcastInternalMetrics(hub *server.WebSocketHub, db *storage.TSDB, ingSer
 			"ingestQueueCapacity":      q.Capacity,
 			"ingestQueueHighWatermark": q.HighWatermark,
 			"droppedSamples":           q.DroppedSamples,
+		})
+
+		// Per-series stream. The anomaly detector (ADR-024) is fed from *every* live
+		// series — the same stream the broadcaster emits — while only a capped slice
+		// is pushed to the live-stream display. The detector dedups on LastTS, so a
+		// 1 Hz re-read of a slower series is not counted twice.
+		seriesInfos := db.Head().SeriesInfos()
+		var samples []anomaly.Sample
+		if det != nil {
+			samples = make([]anomaly.Sample, 0, len(seriesInfos))
+		}
+		count := 0
+		for _, si := range seriesInfos {
+			if si.SampleCount == 0 {
+				continue
+			}
+			key := server.SeriesKey(si.Name, si.Labels)
+			if det != nil {
+				samples = append(samples, anomaly.Sample{
+					Series:      key,
+					Metric:      si.Name,
+					Labels:      si.Labels,
+					Value:       si.LastValue,
+					TimestampMs: si.LastTS,
+				})
+			}
+			if count < 20 {
+				hub.BroadcastMetrics(map[string]interface{}{
+					"type":      "metric",
+					"series":    key,
+					"labels":    si.Labels,
+					"timestamp": time.Now().UnixMilli(),
+					"value":     si.LastValue,
+				})
+				count++
+			} else if det == nil {
+				break // nothing left to do once the display cap is hit
+			}
 		}
 
-		hub.BroadcastMetrics(metrics)
-
-		// Also broadcast individual metric messages for live stream
-		head := db.Head()
-		seriesInfos := head.SeriesInfos()
-		if len(seriesInfos) > 0 {
-			count := 0
-			for _, si := range seriesInfos {
-				if si.SampleCount > 0 {
-					seriesKey := si.Name
-					if len(si.Labels) > 0 {
-						pairs := ""
-						for k, v := range si.Labels {
-							if k == "__name__" {
-								continue
-							}
-							if pairs != "" {
-								pairs += ","
-							}
-							pairs += k + `="` + v + `"`
-						}
-						if pairs != "" {
-							seriesKey = si.Name + "{" + pairs + "}"
-						}
-					}
-					hub.BroadcastMetrics(map[string]interface{}{
-						"type":      "metric",
-						"series":    seriesKey,
-						"labels":    si.Labels,
-						"timestamp": time.Now().UnixMilli(),
-						"value":     si.LastValue,
-					})
-					count++
-					if count >= 20 {
-						break
-					}
-				}
+		if det != nil {
+			server.BroadcastAnomalies(hub, det.ObserveBatch(samples))
+			if tick%anomalyEvictEvery == 0 {
+				det.Evict(time.Now().UnixMilli() - anomalyTTL.Milliseconds())
 			}
 		}
 	}

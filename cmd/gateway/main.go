@@ -16,8 +16,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/anomaly"
 	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
+)
+
+// Cadence/retention for the gateway's streaming anomaly detector, matching the
+// monolith: evict series not seen within anomalyTTL every anomalyEvictEvery ticks.
+const (
+	anomalyEvictEvery = 30
+	anomalyTTL        = 5 * time.Minute
 )
 
 func main() {
@@ -30,6 +38,16 @@ func main() {
 
 	sc := service.NewStorageClient(storageAddrs)
 
+	// Streaming anomaly detector over the cluster broadcast (ADR-024), enabled by
+	// default and toggled with GATEWAY_ANOMALY_ENABLED. Uses the detector's standard
+	// tunables; the monolith reads the same defaults from config.
+	var det *anomaly.Detector
+	if envBool("GATEWAY_ANOMALY_ENABLED", true) {
+		acfg := anomaly.DefaultConfig()
+		acfg.Enabled = true
+		det = anomaly.New(acfg)
+	}
+
 	gw := &gatewayServer{
 		nodeID:        nodeID,
 		querierAddr:   querierAddr,
@@ -40,6 +58,7 @@ func main() {
 		latency:       service.NewLatencyTracker(),
 		startTime:     time.Now(),
 		httpClient:    &http.Client{Timeout: 30 * time.Second},
+		anomalyDet:    det,
 	}
 
 	go gw.wsHub.Run()
@@ -81,6 +100,7 @@ type gatewayServer struct {
 	latency       *service.LatencyTracker
 	startTime     time.Time
 	httpClient    *http.Client
+	anomalyDet    *anomaly.Detector // nil when anomaly detection is disabled
 }
 
 func (gw *gatewayServer) registerRoutes(mux *http.ServeMux) {
@@ -92,6 +112,7 @@ func (gw *gatewayServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/stats", gw.handleStats)
 	mux.HandleFunc("/api/v1/cluster", gw.handleCluster)
 	mux.HandleFunc("/api/v1/blocks", gw.handleBlocks)
+	mux.HandleFunc("/api/v1/anomalies", gw.handleAnomalies)
 	mux.HandleFunc("/api/v1/query_latency", gw.handleLatency)
 	mux.HandleFunc("/metrics", gw.handleMetrics)
 	mux.HandleFunc("/ws/metrics", gw.handleWSMetrics)
@@ -167,7 +188,7 @@ func (gw *gatewayServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		ratio = float64(agg.StorageBytesRaw) / float64(agg.StorageBytesDisk)
 	}
 	iq := gw.fetchIngestStats(r.Context())
-	writeJSON(w, map[string]interface{}{
+	out := map[string]interface{}{
 		"total_samples":            agg.TotalSamples,
 		"total_series":             agg.TotalSeries,
 		"blocks":                   agg.BlockCount,
@@ -182,7 +203,12 @@ func (gw *gatewayServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		"ingest_queue_capacity":    iq.Capacity,
 		"dropped_samples":          iq.DroppedSamples,
 		"uptime":                   time.Since(gw.startTime).String(),
-	})
+	}
+	if gw.anomalyDet != nil {
+		out["anomalies_total"] = gw.anomalyDet.Total()
+		out["active_anomalies"] = gw.anomalyDet.Active()
+	}
+	writeJSON(w, out)
 }
 
 // ingestQueueStats is the ingest-queue load aggregated across ingestors.
@@ -309,12 +335,21 @@ func (gw *gatewayServer) handleWSMetrics(w http.ResponseWriter, r *http.Request)
 	server.HandleWSUpgrade(gw.wsHub, w, r)
 }
 
+// handleAnomalies returns the gateway's bounded recent-anomalies buffer so a
+// late-joining dashboard can seed its alerts strip.
+func (gw *gatewayServer) handleAnomalies(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, server.RecentAnomaliesPayload(gw.anomalyDet))
+}
+
 func (gw *gatewayServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	server.WriteServiceMetrics(w, gw.nodeID, "gateway", time.Since(gw.startTime))
 	fmt.Fprintf(w, "# HELP meridian_ws_clients Connected dashboard WebSocket clients.\n")
 	fmt.Fprintf(w, "# TYPE meridian_ws_clients gauge\n")
 	fmt.Fprintf(w, "meridian_ws_clients{node=%q,role=\"gateway\"} %d\n", gw.nodeID, gw.wsHub.ClientCount())
+	if gw.anomalyDet != nil {
+		server.WriteAnomalyMetrics(w, gw.nodeID, "gateway", gw.anomalyDet.Total(), gw.anomalyDet.Active())
+	}
 }
 
 // broadcastLoop periodically polls storage nodes for stats and series data,
@@ -323,7 +358,9 @@ func (gw *gatewayServer) broadcastLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	var tick uint64
 	for range ticker.C {
+		tick++
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 
 		agg, err := gw.storageCli.FetchStats(ctx)
@@ -354,35 +391,48 @@ func (gw *gatewayServer) broadcastLoop() {
 			"droppedSamples":           iq.DroppedSamples,
 		})
 
-		// Broadcast live metric stream from storage nodes
+		// Broadcast live metric stream from storage nodes, and feed the anomaly
+		// detector (ADR-024) from every live series — the same uniform per-series
+		// stream the monolith uses. The detector dedups on LastTS, so the same series
+		// fetched from multiple replicas at one timestamp is observed once.
 		series, _ := gw.storageCli.FetchSeries(ctx)
+		var samples []anomaly.Sample
+		if gw.anomalyDet != nil {
+			samples = make([]anomaly.Sample, 0, len(series))
+		}
 		count := 0
 		for _, si := range series {
-			if si.SampleCount > 0 && count < 20 {
-				seriesKey := si.Name
-				if len(si.Labels) > 0 {
-					pairs := ""
-					for k, v := range si.Labels {
-						if k == "__name__" {
-							continue
-						}
-						if pairs != "" {
-							pairs += ","
-						}
-						pairs += k + `="` + v + `"`
-					}
-					if pairs != "" {
-						seriesKey = si.Name + "{" + pairs + "}"
-					}
-				}
+			if si.SampleCount == 0 {
+				continue
+			}
+			key := server.SeriesKey(si.Name, si.Labels)
+			if gw.anomalyDet != nil {
+				samples = append(samples, anomaly.Sample{
+					Series:      key,
+					Metric:      si.Name,
+					Labels:      si.Labels,
+					Value:       si.LastValue,
+					TimestampMs: si.LastTS,
+				})
+			}
+			if count < 20 {
 				gw.wsHub.BroadcastMetrics(map[string]interface{}{
 					"type":      "metric",
-					"series":    seriesKey,
+					"series":    key,
 					"labels":    si.Labels,
 					"timestamp": time.Now().UnixMilli(),
 					"value":     si.LastValue,
 				})
 				count++
+			} else if gw.anomalyDet == nil {
+				break
+			}
+		}
+
+		if gw.anomalyDet != nil {
+			server.BroadcastAnomalies(gw.wsHub, gw.anomalyDet.ObserveBatch(samples))
+			if tick%anomalyEvictEvery == 0 {
+				gw.anomalyDet.Evict(time.Now().UnixMilli() - anomalyTTL.Milliseconds())
 			}
 		}
 
@@ -438,6 +488,22 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool reads a boolean env var, returning def when unset or unparseable. Accepts
+// the usual 1/0, true/false, yes/no, on/off forms (case-insensitive).
+func envBool(key string, def bool) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	switch v {
+	case "":
+		return def
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
 
 // splitOrigins parses a comma-separated origin list, dropping blanks. An empty input

@@ -56,7 +56,34 @@ export interface WSStatsMessage {
   droppedSamples: number;
 }
 
-export type WSMessage = WSMetricMessage | WSLiveMessage | WSStatsMessage;
+// ── Anomaly detection (ADR-024) ─────────────────────────────────────────────
+
+export type AnomalySeverity = 'warn' | 'crit';
+export type AnomalyState = 'firing' | 'resolved';
+
+/**
+ * One anomaly transition from the streaming detector: a series went out-of-band
+ * (`firing`) or returned in-band (`resolved`). `seq` is a stable, monotonic id used
+ * to de-duplicate the live frame against the seeded recent buffer.
+ */
+export interface Anomaly {
+  seq: number;
+  series: string;
+  metric: string;
+  labels: Record<string, string>;
+  value: number;
+  baseline: number;
+  score: number;
+  severity: AnomalySeverity;
+  state: AnomalyState;
+  timestamp: number;
+}
+
+export interface WSAnomalyMessage extends Anomaly {
+  type: 'anomaly';
+}
+
+export type WSMessage = WSMetricMessage | WSLiveMessage | WSStatsMessage | WSAnomalyMessage;
 
 // ── Cluster types ───────────────────────────────────────────────────
 
@@ -101,6 +128,8 @@ export interface DashboardState {
   liveMetrics: Map<string, Sample[]>;
   clusterNodes: ClusterNode[];
   connectionStatus: ConnectionStatus;
+  // Recent anomalies, one row per series (latest transition wins), most-recent-first.
+  anomalies: Anomaly[];
 }
 
 export type DashboardAction =
@@ -112,4 +141,6 @@ export type DashboardAction =
   | { type: 'SET_STATS'; stats: WSStatsMessage }
   | { type: 'ADD_LIVE_METRIC'; key: string; sample: Sample }
   | { type: 'SET_CLUSTER_NODES'; nodes: ClusterNode[] }
-  | { type: 'SET_CONNECTION_STATUS'; status: ConnectionStatus };
+  | { type: 'SET_CONNECTION_STATUS'; status: ConnectionStatus }
+  | { type: 'ADD_ANOMALY'; anomaly: Anomaly }
+  | { type: 'SEED_ANOMALIES'; anomalies: Anomaly[] };

@@ -612,6 +612,9 @@ type SeriesInfo struct {
 	Labels      map[string]string `json:"labels"`
 	SampleCount int               `json:"samples_count"`
 	LastValue   float64           `json:"last_value"`
+	// LastTS is the most-recent sample timestamp (Unix ms), carried so the gateway
+	// broadcast/anomaly path can dedup re-reads of a slow series.
+	LastTS int64 `json:"last_ts"`
 }
 
 // FetchLabels retrieves label names from all storage nodes and deduplicates.

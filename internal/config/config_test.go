@@ -114,6 +114,43 @@ func TestDefaultConfigIngestionValid(t *testing.T) {
 	}
 }
 
+func TestAnomalyConfigValidate(t *testing.T) {
+	valid := []AnomalyConfig{
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 3},
+		{Enabled: true, Threshold: 0.5, Alpha: 1, Warmup: 2, DebounceK: 1}, // boundary values
+		{Enabled: false},                                                   // tunables irrelevant when disabled
+	}
+	for _, c := range valid {
+		if err := c.Validate(); err != nil {
+			t.Errorf("expected %+v to be valid, got %v", c, err)
+		}
+	}
+
+	invalid := []AnomalyConfig{
+		{Enabled: true, Threshold: 0, Alpha: 0.1, Warmup: 20, DebounceK: 3},   // threshold <= 0
+		{Enabled: true, Threshold: 3.5, Alpha: 0, Warmup: 20, DebounceK: 3},   // alpha <= 0
+		{Enabled: true, Threshold: 3.5, Alpha: 1.5, Warmup: 20, DebounceK: 3}, // alpha > 1
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 1, DebounceK: 3},  // warmup < 2
+		{Enabled: true, Threshold: 3.5, Alpha: 0.1, Warmup: 20, DebounceK: 0}, // debounce < 1
+	}
+	for _, c := range invalid {
+		if err := c.Validate(); err == nil {
+			t.Errorf("expected %+v to be invalid", c)
+		}
+	}
+}
+
+func TestDefaultConfigAnomalyValid(t *testing.T) {
+	if err := DefaultConfig().Anomaly.Validate(); err != nil {
+		t.Fatalf("default anomaly config must validate: %v", err)
+	}
+	// The mapping onto the detector config preserves the YAML-exposed tunables.
+	d := DefaultConfig().Anomaly.Detector()
+	if !d.Enabled || d.Threshold != 3.5 || d.Alpha != 0.1 || d.Warmup != 20 || d.DebounceK != 3 {
+		t.Fatalf("detector mapping lost tunables: %+v", d)
+	}
+}
+
 func TestLoadRejectsBadIngestion(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "meridian.yaml")

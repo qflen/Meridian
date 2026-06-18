@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/anomaly"
 	"gopkg.in/yaml.v3"
 )
 
@@ -97,6 +98,7 @@ type Config struct {
 	Cluster      ClusterConfig      `yaml:"cluster"`
 	Downsampling DownsamplingConfig `yaml:"downsampling"`
 	Ingestion    IngestionConfig    `yaml:"ingestion"`
+	Anomaly      AnomalyConfig      `yaml:"anomaly"`
 	Log          LogConfig          `yaml:"log"`
 }
 
@@ -223,6 +225,60 @@ func (c IngestionConfig) Validate() error {
 	return nil
 }
 
+// AnomalyConfig tunes the streaming anomaly detector that runs over the live
+// telemetry path (ADR-024). The detector tracks an EWMA baseline + dispersion per
+// series and flags points whose local z-score |value-baseline|/dispersion exceeds
+// Threshold; the remaining robustness knobs (Huber clamp, scale floor, hysteresis)
+// take internal defaults.
+type AnomalyConfig struct {
+	// Enabled turns the detector on. When false the broadcast loop feeds it nothing
+	// and no anomaly frames or metrics are produced.
+	Enabled bool `yaml:"enabled"`
+	// Threshold is the local z-score above which a sample is out-of-band (~3–4).
+	Threshold float64 `yaml:"threshold"`
+	// Alpha is the EWMA smoothing factor in (0,1] for the baseline and dispersion.
+	Alpha float64 `yaml:"alpha"`
+	// Warmup is the number of samples used to seed a per-series baseline before any
+	// alert may fire (>= 2).
+	Warmup int `yaml:"warmup"`
+	// DebounceK is the consecutive out-of-band samples required to raise an alert (>= 1).
+	DebounceK int `yaml:"debounce_k"`
+}
+
+// Validate checks the anomaly tunables when the detector is enabled, so a
+// misconfiguration is caught at load time rather than producing a detector that
+// never warms up or alerts on every point.
+func (c AnomalyConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.Threshold <= 0 {
+		return fmt.Errorf("anomaly.threshold must be > 0, got %g", c.Threshold)
+	}
+	if c.Alpha <= 0 || c.Alpha > 1 {
+		return fmt.Errorf("anomaly.alpha must be in (0,1], got %g", c.Alpha)
+	}
+	if c.Warmup < 2 {
+		return fmt.Errorf("anomaly.warmup must be >= 2, got %d", c.Warmup)
+	}
+	if c.DebounceK < 1 {
+		return fmt.Errorf("anomaly.debounce_k must be >= 1, got %d", c.DebounceK)
+	}
+	return nil
+}
+
+// Detector maps the YAML-exposed tunables onto an anomaly.Config, leaving the
+// detector's internal robustness defaults (clip/clear/crit/floor/buffer) in place.
+func (c AnomalyConfig) Detector() anomaly.Config {
+	base := anomaly.DefaultConfig()
+	base.Enabled = c.Enabled
+	base.Threshold = c.Threshold
+	base.Alpha = c.Alpha
+	base.Warmup = c.Warmup
+	base.DebounceK = c.DebounceK
+	return base
+}
+
 // LogConfig holds logging parameters.
 type LogConfig struct {
 	Level  string `yaml:"level"`
@@ -266,6 +322,13 @@ func DefaultConfig() *Config {
 			QueueHighWatermark:  40000,
 			BlockDeadline:       Duration(250 * time.Millisecond),
 		},
+		Anomaly: AnomalyConfig{
+			Enabled:   true,
+			Threshold: 3.5,
+			Alpha:     0.1,
+			Warmup:    20,
+			DebounceK: 3,
+		},
 		Log: LogConfig{
 			Level:  "info",
 			Format: "text",
@@ -290,6 +353,9 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	if err := cfg.Ingestion.Validate(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Anomaly.Validate(); err != nil {
 		return nil, err
 	}
 

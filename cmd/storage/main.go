@@ -211,6 +211,7 @@ func (s *storageServer) handleSeries(w http.ResponseWriter, r *http.Request) {
 			Labels:      si.Labels,
 			SampleCount: si.SampleCount,
 			LastValue:   si.LastValue,
+			LastTS:      si.LastTS,
 		}
 	}
 	writeJSON(w, map[string]interface{}{"data": data})

@@ -211,7 +211,11 @@ rollup built directly from raw. A per-resolution `covered_through` watermark mak
 passes idempotent and crash-recoverable (rollups are regenerable). At query time the
 planner (`internal/query`) selects a resolution from the span and step and the
 executor reads the chosen tier's avg column (`TSDB.QueryResolution`), rolling up the
-freshest not-yet-closed tail on the fly so the coarse series stays current.
+freshest not-yet-closed tail on the fly so the coarse series stays current. This
+query-time selection runs in the single-binary `serve`, whose TSDB implements the
+`ResolutionDataSource` capability; in the cluster the storage nodes still generate
+rollups, but the querier's `StorageClient` does not yet implement that capability and
+so reads raw (ADR-011, "Forced raw / future work").
 
 **Enforcer** (`internal/retention/enforcer.go`): Per-resolution TTL cleanup. Raw
 blocks expire first (and only once the finest rollup tier has captured them); each

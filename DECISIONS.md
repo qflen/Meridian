@@ -177,13 +177,15 @@ node but the querier still reads raw (the remote client does not yet push a
 resolution to storage); cluster query-time selection is the remaining piece, so
 cluster raw retention should stay ≥ the longest query span until it lands.
 
-**Consequences**: Verified on a 4-series, 8-hour backfill: a wide query (8h span, 1h
-step) was served from the 1h tier reading **36 points**, versus **3844** for the same
-span at raw resolution — a ~107× reduction — while a narrow query (5m span) read raw.
-The 1h tier reported a 105× point-reduction (raw samples represented per stored
-window); over 5s raw data the figures are ~12× (1m) and ~720× (1h). The cost is five
-stored aggregates per window and a background pass; rollups are regenerable, so the
-extra on-disk state is never authoritative.
+**Consequences**: Verified by `TestEngineResolutionWideVsNarrow` (internal/query) on a
+2-series, 8-hour backfill at 15s raw resolution: a wide query (8h span, 1h step) is
+served from the 1h tier reading **16 points**, versus **3840** raw samples over the
+same span — a 240× reduction — while a narrow query (5m span, 15s step) reads raw. The
+point-reduction per stored window is definitional — a 1m window represents one minute
+of raw samples and a 1h window sixty of those minutes — so over the 5s cadence the
+simulator emits the tiers reduce by ~12× (1m) and ~720× (1h), and over the test's 15s
+raw by ~4× and ~240×. The cost is five stored aggregates per window and a background
+pass; rollups are regenerable, so the extra on-disk state is never authoritative.
 
 ## ADR-012: Single-Binary Architecture
 

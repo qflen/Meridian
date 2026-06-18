@@ -157,6 +157,21 @@ func (db *TSDB) RollupFrontier(resolution int64) int64 {
 	return frontier
 }
 
+// DeleteAnyBlock removes a block identified only by ULID, from the raw tier or any
+// rollup tier. The cluster compactor deletes by ULID without tracking which tier a
+// block lives in; this resolves it.
+func (db *TSDB) DeleteAnyBlock(ulid string) error {
+	if err := db.DeleteBlock(ulid); err == nil {
+		return nil
+	}
+	for _, res := range db.RollupResolutions() {
+		if err := db.DeleteRollupBlock(res, ulid); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("block %s not found in any tier", ulid)
+}
+
 // DeleteRollupBlock unregisters and removes a rollup block from disk.
 func (db *TSDB) DeleteRollupBlock(resolution int64, ulid string) error {
 	db.rollupMu.Lock()

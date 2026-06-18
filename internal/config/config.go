@@ -4,11 +4,13 @@ package config
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/meridiandb/meridian/internal/anomaly"
+	"github.com/meridiandb/meridian/internal/retention"
 	"gopkg.in/yaml.v3"
 )
 
@@ -165,9 +167,18 @@ func (c ClusterConfig) Validate() error {
 	return nil
 }
 
-// DownsamplingConfig holds automatic rollup rules.
+// DownsamplingConfig holds the automatic rollup cascade: whether it runs, how often a
+// pass runs, and the per-tier rules (source→target interval and the tier's retention).
+// The first rule reads raw blocks; a later rule whose source matches an earlier rule's
+// target chains that finer rollup tier. Each tier keeps its own retention, longer for
+// coarser tiers, so a long-range query is still served after raw expires.
 type DownsamplingConfig struct {
-	Rules []DownsamplingRule `yaml:"rules"`
+	// Enabled turns the cascade on. When false no rollup blocks are generated and every
+	// query reads raw.
+	Enabled bool `yaml:"enabled"`
+	// Interval is how often a downsampling pass runs (default 1m when unset).
+	Interval Duration           `yaml:"interval"`
+	Rules    []DownsamplingRule `yaml:"rules"`
 }
 
 // DownsamplingRule defines a single rollup rule.
@@ -175,6 +186,71 @@ type DownsamplingRule struct {
 	SourceInterval Duration `yaml:"source_interval"`
 	TargetInterval Duration `yaml:"target_interval"`
 	Retention      Duration `yaml:"retention"`
+}
+
+// Validate checks the cascade is internally consistent when enabled: each target
+// exceeds and is an exact multiple of its source (required for weighted chaining), each
+// retention is positive, and coarser tiers are retained at least as long as finer ones
+// (so the cascade degrades resolution over age, never the reverse). The raw retention
+// (storage.retention) should be the shortest of all; it is enforced separately since it
+// lives in StorageConfig.
+func (c DownsamplingConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if len(c.Rules) == 0 {
+		return fmt.Errorf("downsampling.enabled is true but no rules are configured")
+	}
+	if c.Interval < 0 {
+		return fmt.Errorf("downsampling.interval must be >= 0, got %s", time.Duration(c.Interval))
+	}
+	rules := append([]DownsamplingRule(nil), c.Rules...)
+	sort.Slice(rules, func(i, j int) bool { return rules[i].TargetInterval < rules[j].TargetInterval })
+	var prevRet time.Duration
+	for i, r := range rules {
+		s, tg, ret := r.SourceInterval.Std(), r.TargetInterval.Std(), r.Retention.Std()
+		if s <= 0 {
+			return fmt.Errorf("downsampling rule %d: source_interval must be > 0", i)
+		}
+		if tg <= s {
+			return fmt.Errorf("downsampling rule %d: target_interval (%s) must exceed source_interval (%s)", i, tg, s)
+		}
+		if tg%s != 0 {
+			return fmt.Errorf("downsampling rule %d: target_interval (%s) must be a multiple of source_interval (%s) for weighted chaining", i, tg, s)
+		}
+		if ret <= 0 {
+			return fmt.Errorf("downsampling rule %d: retention must be > 0", i)
+		}
+		if i > 0 && ret < prevRet {
+			return fmt.Errorf("downsampling: coarser tier %s retention (%s) must be >= finer tier retention (%s)", tg, ret, prevRet)
+		}
+		prevRet = ret
+	}
+	return nil
+}
+
+// DownsampleRules converts the configured rules into retention.DownsampleRule values
+// for the live downsampler.
+func (c DownsamplingConfig) DownsampleRules() []retention.DownsampleRule {
+	out := make([]retention.DownsampleRule, 0, len(c.Rules))
+	for _, r := range c.Rules {
+		out = append(out, retention.DownsampleRule{
+			SourceInterval: r.SourceInterval.Std(),
+			TargetInterval: r.TargetInterval.Std(),
+			Retention:      r.Retention.Std(),
+		})
+	}
+	return out
+}
+
+// RollupRetentions maps each rollup resolution (ms) to its TTL, for the tiered
+// retention enforcer.
+func (c DownsamplingConfig) RollupRetentions() map[int64]time.Duration {
+	out := make(map[int64]time.Duration, len(c.Rules))
+	for _, r := range c.Rules {
+		out[r.TargetInterval.Std().Milliseconds()] = r.Retention.Std()
+	}
+	return out
 }
 
 // IngestionConfig holds batch writer and write-path flow-control parameters.
@@ -309,9 +385,13 @@ func DefaultConfig() *Config {
 			VirtualNodes:      256,
 		},
 		Downsampling: DownsamplingConfig{
+			Enabled:  true,
+			Interval: Duration(1 * time.Minute),
+			// Retentions are coarser-is-longer and exceed the raw retention (15d), so the
+			// cascade trades resolution for age: raw 15d → 1m 30d → 1h 365d.
 			Rules: []DownsamplingRule{
-				{SourceInterval: Duration(5 * time.Second), TargetInterval: Duration(1 * time.Minute), Retention: Duration(7 * 24 * time.Hour)},
-				{SourceInterval: Duration(1 * time.Minute), TargetInterval: Duration(1 * time.Hour), Retention: Duration(30 * 24 * time.Hour)},
+				{SourceInterval: Duration(5 * time.Second), TargetInterval: Duration(1 * time.Minute), Retention: Duration(30 * 24 * time.Hour)},
+				{SourceInterval: Duration(1 * time.Minute), TargetInterval: Duration(1 * time.Hour), Retention: Duration(365 * 24 * time.Hour)},
 			},
 		},
 		Ingestion: IngestionConfig{
@@ -356,6 +436,9 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	if err := cfg.Anomaly.Validate(); err != nil {
+		return nil, err
+	}
+	if err := cfg.Downsampling.Validate(); err != nil {
 		return nil, err
 	}
 

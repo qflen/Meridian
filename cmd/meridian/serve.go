@@ -138,8 +138,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("start HTTP server: %w", err)
 	}
 
-	// Start retention enforcer
-	enforcer := retention.NewEnforcer(db, cfg.Storage.Retention.Std())
+	// Start the downsampling cascade (ADR-011) and per-resolution retention. When
+	// downsampling is enabled, raw blocks are rolled up to 1m/1h tiers in the
+	// background and each tier expires on its own TTL (raw shortest); otherwise only
+	// raw retention runs.
+	var downsampler *retention.Downsampler
+	var enforcer *retention.Enforcer
+	if cfg.Downsampling.Enabled {
+		downsampler = retention.NewDownsampler(db, cfg.Downsampling.DownsampleRules(), cfg.Downsampling.Interval.Std())
+		downsampler.Start()
+		enforcer = retention.NewEnforcerWithTiers(db, cfg.Storage.Retention.Std(), cfg.Downsampling.RollupRetentions(), retention.DefaultEnforceInterval)
+	} else {
+		enforcer = retention.NewEnforcer(db, cfg.Storage.Retention.Std())
+	}
 	enforcer.Start()
 
 	// Streaming anomaly detector over the live telemetry path (ADR-024). It is fed
@@ -164,6 +175,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Println("\nShutting down...")
 	httpServer.Stop()
 	ingServer.Stop()
+	if downsampler != nil {
+		downsampler.Stop()
+	}
 	enforcer.Stop()
 	db.Close()
 	fmt.Println("Shutdown complete.")

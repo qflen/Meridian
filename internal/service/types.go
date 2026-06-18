@@ -65,7 +65,9 @@ type QueryResponse struct {
 	Data   []SeriesResult `json:"data"`
 }
 
-// BlockInfo describes a persistent block on a storage node.
+// BlockInfo describes a persistent block on a storage node. Resolution is 0 for a raw
+// block and the rollup window size in milliseconds for a rollup block, so the compactor
+// can apply a per-resolution retention TTL.
 type BlockInfo struct {
 	ULID       string `json:"ulid"`
 	NodeID     string `json:"node_id"`
@@ -74,6 +76,7 @@ type BlockInfo struct {
 	NumSamples int64  `json:"num_samples"`
 	NumSeries  int    `json:"num_series"`
 	Level      int    `json:"level"`
+	Resolution int64  `json:"resolution_ms"`
 }
 
 // NodeInfo describes a service in the cluster topology.

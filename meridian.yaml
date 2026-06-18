@@ -20,13 +20,21 @@ cluster:
   virtual_nodes: 256
 
 downsampling:
+  # Automatic rollup cascade (ADR-011). On each pass, raw blocks are rolled up to
+  # the 1m tier and the 1m tier is chained (count-weighted) into the 1h tier, each
+  # stored resolution-tagged. The query planner picks a resolution from the query
+  # span/step, so a wide view reads coarse rollup points instead of raw. Each tier
+  # has its own retention; coarser tiers are kept longer and all exceed the raw
+  # retention (15d) above, so a long-range query survives raw expiry.
+  enabled: true
+  interval: "1m"   # how often a downsampling pass runs
   rules:
     - source_interval: "5s"
       target_interval: "1m"
-      retention: "7d"
+      retention: "30d"
     - source_interval: "1m"
       target_interval: "1h"
-      retention: "30d"
+      retention: "365d"
 
 ingestion:
   batch_size: 1000

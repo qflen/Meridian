@@ -96,6 +96,21 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
 - **Scope**: this applies to the docker-compose tier (ingestor/storage/querier). The
   single-binary `serve` is genuinely single-node.
 
+### Write-path backpressure
+- **Bounded ingest queues**: every ingest path — the monolith batch writer, the
+  ingestor's submission pool, and the storage accept queue — sits behind a queue
+  bounded in samples, so resident memory is capped instead of growing under overload.
+  Queue depth ≈ arrival_rate × service_time (Little's Law), so bounding depth bounds
+  both memory and tail latency.
+- **Block-then-shed**: a full queue blocks the producer for up to a short deadline
+  (the backpressure); past it the batch is **shed** — dropped and counted — and the
+  producer is NACKed: **HTTP 429 + `Retry-After`**, or a clear NACK on the raw-TCP
+  path. A stalled replica (quorum write) or slow WAL fsync propagates backpressure
+  upstream rather than OOMing, and a counted drop beats a silent OOM. (ADR-023.)
+- **Observable**: `meridian_dropped_samples_total`, ingest queue depth/capacity, and
+  shed/backpressure-event counters on `/metrics`; queue depth + a derived drop rate on
+  `/api/v1/stats` and the dashboard load view, which the simulator's spikes drive.
+
 ### Dashboard
 - **Canvas-rendered**: charts drawn directly on the Canvas 2D API, no chart library
 - **10 components**: query editor, time-series chart, metric explorer, cluster topology, ingestion monitor, compression gauge, latency histogram, retention timeline, live stream, theme toggle
@@ -111,13 +126,18 @@ whole range and sliced per step, so cost scales with steps, not with re-queries.
   cluster is scrapeable end-to-end, not just the monolith. Storage nodes expose the
   full storage metrics (cumulative `meridian_samples_ingested_total`, out-of-order
   samples rejected, head/block stats, storage bytes by layer, compression ratio,
-  query-latency histogram); the gateway also reports connected WebSocket clients; and
-  every service exposes `meridian_up` and uptime. (ADR-019.)
+  query-latency histogram); the gateway also reports connected WebSocket clients;
+  every ingest-bounding node exposes the flow-control families
+  (`meridian_dropped_samples_total`, ingest queue depth/capacity/high-water,
+  shed/backpressure-event counters — ADR-023); and every service exposes
+  `meridian_up` and uptime. (ADR-019.)
 - **`/health`**: liveness probe for orchestrators
-- **`/api/v1/stats`**: JSON snapshot of storage, WAL, ingestion, compression. The
-  `ingestion_rate` field is a live **samples/sec rate** averaged over a short rolling
-  window (it tracks load and falls back to ~0 when idle); the monotonic cumulative
-  count lives in the `meridian_samples_ingested_total` counter. (ADR-017.)
+- **`/api/v1/stats`**: JSON snapshot of storage, WAL, ingestion, compression, and
+  ingest-queue load. The `ingestion_rate` field is a live **samples/sec rate**
+  averaged over a short rolling window (it tracks load and falls back to ~0 when
+  idle); the monotonic cumulative count lives in the `meridian_samples_ingested_total`
+  counter (ADR-017). `ingest_queue_depth`/`_capacity` and the cumulative
+  `dropped_samples` expose write-path backpressure (ADR-023).
 - **Single-node honesty**: in default single-node `serve`, `/api/v1/cluster` reports
   exactly the one real node rather than fabricating zero-stat peers.
 
@@ -202,11 +222,18 @@ cluster:                  # microservices tier only; W+R must exceed N
   write_quorum:       2   # W — acks required for a write
   read_quorum:        2   # R — replicas a read must hear from
   virtual_nodes:      256 # ring virtual nodes per physical node
+ingestion:                # write-path backpressure (ADR-023)
+  queue_capacity:       50000   # hard ingest-queue cap in samples (memory bound)
+  queue_high_watermark: 40000   # depth at which producers are flagged to throttle
+  block_deadline:       "250ms" # how long a full queue blocks before shedding
+  max_concurrent_writes: 64     # drain worker-pool size (ingestor/storage)
 ```
 
-The microservice binaries read the same knobs from the environment
-(`REPLICATION_FACTOR`, `WRITE_QUORUM`, `READ_QUORUM`, `VIRTUAL_NODES`); the effective
-values are clamped to the live node count so a cluster smaller than N still works.
+The microservice binaries read the same knobs from the environment: replication
+(`REPLICATION_FACTOR`, `WRITE_QUORUM`, `READ_QUORUM`, `VIRTUAL_NODES`) — clamped to
+the live node count so a cluster smaller than N still works — and backpressure
+(`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
+`MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents).
 
 ## Docker
 
@@ -229,6 +256,7 @@ internal/
   storage/          WAL, head block, persistent blocks, TSDB
   query/            Lexer, parser, planner, executor
   ingestion/        TCP server, batch writer
+  backpressure/     Bounded block-then-shed ingest queue (flow control)
   server/           HTTP API, WebSocket hub, /metrics exporter
   cluster/          Hash ring, coordinator, node lifecycle
   retention/        TTL enforcer, downsampler
@@ -245,7 +273,8 @@ Gorilla vs generic compression, sorted slices vs roaring bitmaps, JSON vs protob
 ingestion, rAF batching for WebSocket, the out-of-order sample policy, the
 crash-consistent flush model, the windowed ingestion-rate vs cumulative counter, the
 CORS policy, cluster-wide `/metrics`, the replication consistency model (quorum
-writes/reads + read-repair), and more.
+writes/reads + read-repair), the write-path backpressure model (bounded queues with
+block-then-shed load shedding), and more.
 
 ## Development
 

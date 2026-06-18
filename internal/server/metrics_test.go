@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/backpressure"
 	"github.com/meridiandb/meridian/internal/storage"
 )
 
@@ -49,6 +50,69 @@ func TestWriteServiceMetricsLabelsRole(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("service metrics missing %q\n%s", want, body)
+		}
+	}
+}
+
+func TestWriteQueueMetricsFamilies(t *testing.T) {
+	var buf bytes.Buffer
+	WriteQueueMetrics(&buf, "node-1", "monolith", backpressure.Stats{
+		Depth: 12, Capacity: 100, HighWatermark: 80, DroppedSamples: 7, ShedEvents: 2, BackpressureEvents: 5,
+	})
+	body := buf.String()
+	for _, want := range []string{
+		`meridian_dropped_samples_total{node="node-1",role="monolith"} 7`,
+		`meridian_ingest_shed_events_total{node="node-1",role="monolith"} 2`,
+		`meridian_ingest_backpressure_events_total{node="node-1",role="monolith"} 5`,
+		`meridian_ingest_queue_depth{node="node-1",role="monolith"} 12`,
+		`meridian_ingest_queue_capacity{node="node-1",role="monolith"} 100`,
+		`meridian_ingest_queue_high_watermark{node="node-1",role="monolith"} 80`,
+		"# TYPE meridian_dropped_samples_total counter",
+		"# TYPE meridian_ingest_queue_depth gauge",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("queue metrics missing %q\n%s", want, body)
+		}
+	}
+}
+
+// TestMonolithMetricsAndStatsIncludeQueue proves the wired ingest stats source
+// surfaces the bounded-queue families on /metrics and the fields on /api/v1/stats.
+func TestMonolithMetricsAndStatsIncludeQueue(t *testing.T) {
+	dir := t.TempDir()
+	db, err := storage.Open(dir, storage.TSDBOptions{
+		WALDir: dir + "/wal", BlockDir: dir + "/blocks", FlushInterval: time.Hour, RateSampleInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	s := NewHTTPServer(db, "mono-1", nil)
+	s.SetIngestStatsSource(func() backpressure.Stats {
+		return backpressure.Stats{Depth: 3, Capacity: 50, HighWatermark: 40, DroppedSamples: 9}
+	})
+
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	for _, want := range []string{
+		`meridian_dropped_samples_total{node="mono-1",role="monolith"} 9`,
+		`meridian_ingest_queue_depth{node="mono-1",role="monolith"} 3`,
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("monolith /metrics missing %q", want)
+		}
+	}
+
+	rec = httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/stats", nil))
+	for _, want := range []string{
+		`"ingest_queue_depth":3`,
+		`"ingest_queue_capacity":50`,
+		`"dropped_samples":9`,
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("/api/v1/stats missing %q\n%s", want, rec.Body.String())
 		}
 	}
 }

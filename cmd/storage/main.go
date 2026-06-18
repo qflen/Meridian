@@ -5,15 +5,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/config"
 	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
 	"github.com/meridiandb/meridian/internal/storage"
@@ -37,8 +40,19 @@ func main() {
 		log.Fatalf("open TSDB: %v", err)
 	}
 
+	// Bound the accept queue: a worker pool drains writes into the local TSDB, so a
+	// node whose WAL fsync is the bottleneck backpressures (then sheds → 429) and
+	// pushes flow control upstream to the ingestor/quorum layer. See ADR-023.
+	pool := service.NewWritePool(localIngest{db: db}, service.PoolOptions{
+		Capacity:      envInt("STORAGE_QUEUE_CAPACITY", 50000),
+		HighWatermark: envInt("STORAGE_QUEUE_HIGH_WATERMARK", 40000),
+		BlockDeadline: envDuration("STORAGE_BLOCK_DEADLINE", 250*time.Millisecond),
+		Workers:       envInt("STORAGE_MAX_CONCURRENT_WRITES", 8),
+	})
+	defer pool.Close()
+
 	mux := http.NewServeMux()
-	s := &storageServer{db: db, nodeID: nodeID, startTime: time.Now()}
+	s := &storageServer{db: db, nodeID: nodeID, pool: pool, startTime: time.Now()}
 	s.registerRoutes(mux)
 
 	httpServer := &http.Server{Addr: httpAddr, Handler: corsMiddleware(mux)}
@@ -64,7 +78,34 @@ func main() {
 type storageServer struct {
 	db        *storage.TSDB
 	nodeID    string
+	pool      *service.WritePool
 	startTime time.Time
+}
+
+// localIngest adapts the local TSDB to service.Writer so it can sit behind a
+// bounded WritePool. A stalled WAL fsync backpressures the pool and, past the
+// deadline, sheds — surfaced to the caller as 429 so the ingestor's quorum write
+// observes the overload and backpressure propagates upstream.
+type localIngest struct {
+	db *storage.TSDB
+}
+
+func (l localIngest) Write(_ context.Context, req service.WriteRequest) (*service.WriteResponse, error) {
+	var count int64
+	for _, ts := range req.TimeSeries {
+		labels := make(map[string]string, len(ts.Labels))
+		for _, lb := range ts.Labels {
+			labels[lb.Name] = lb.Value
+		}
+		for _, sample := range ts.Samples {
+			if err := l.db.Ingest(ts.Name, labels, sample.TimestampMs, sample.Value); err != nil {
+				log.Printf("Ingest error: %v", err)
+				continue
+			}
+			count++
+		}
+	}
+	return &service.WriteResponse{SamplesIngested: count}, nil
 }
 
 func (s *storageServer) registerRoutes(mux *http.ServeMux) {
@@ -84,6 +125,9 @@ func (s *storageServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	server.WriteStorageMetrics(w, s.db, s.nodeID)
 	server.WriteServiceMetrics(w, s.nodeID, "storage", time.Since(s.startTime))
+	if s.pool != nil {
+		server.WriteQueueMetrics(w, s.nodeID, "storage", s.pool.Stats())
+	}
 }
 
 func (s *storageServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -107,22 +151,20 @@ func (s *storageServer) handleWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var count int64
-	for _, ts := range req.TimeSeries {
-		labels := make(map[string]string, len(ts.Labels))
-		for _, l := range ts.Labels {
-			labels[l.Name] = l.Value
-		}
-		for _, sample := range ts.Samples {
-			if err := s.db.Ingest(ts.Name, labels, sample.TimestampMs, sample.Value); err != nil {
-				log.Printf("Ingest error: %v", err)
-				continue
-			}
-			count++
-		}
+	// Submit through the bounded accept queue: a stalled WAL fsync backpressures and,
+	// past the deadline, sheds with 429 so the caller's quorum write sees the overload.
+	resp, _, err := s.pool.Submit(r.Context(), req)
+	if errors.Is(err, service.ErrShed) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, "storage overloaded, retry after backing off")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 
-	writeJSON(w, service.WriteResponse{SamplesIngested: count})
+	writeJSON(w, resp)
 }
 
 func (s *storageServer) handleQuery(w http.ResponseWriter, r *http.Request) {
@@ -263,6 +305,26 @@ func corsMiddleware(next http.Handler) http.Handler {
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		log.Printf("invalid %s=%q, using default %d", key, v, def)
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := config.ParseDuration(v); err == nil {
+			return d
+		}
+		log.Printf("invalid %s=%q, using default %s", key, v, def)
 	}
 	return def
 }

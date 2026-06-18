@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/meridiandb/meridian/internal/backpressure"
 	"github.com/meridiandb/meridian/internal/storage"
 )
 
@@ -46,6 +47,38 @@ func WriteStorageMetrics(w io.Writer, db *storage.TSDB, node string) {
 	fmt.Fprintf(w, "# HELP meridian_compression_ratio Raw-to-compressed size ratio for Gorilla-encoded chunks.\n")
 	fmt.Fprintf(w, "# TYPE meridian_compression_ratio gauge\n")
 	fmt.Fprintf(w, "meridian_compression_ratio{node=%q} %.3f\n", node, ratio)
+}
+
+// WriteQueueMetrics writes the write-path flow-control metrics for one node/role
+// from a bounded-queue snapshot (ADR-023): the cumulative drop/shed/backpressure
+// counters and the depth/capacity/high-water gauges. It is shared by the monolith
+// and the ingestor/storage services so every node that bounds ingest reports the
+// same flow-control metrics. The counters are cumulative (Prometheus-correct); a
+// scraper derives a drop rate with rate().
+func WriteQueueMetrics(w io.Writer, node, role string, st backpressure.Stats) {
+	fmt.Fprintf(w, "# HELP meridian_dropped_samples_total Samples shed because the ingest queue was full past the block deadline.\n")
+	fmt.Fprintf(w, "# TYPE meridian_dropped_samples_total counter\n")
+	fmt.Fprintf(w, "meridian_dropped_samples_total{node=%q,role=%q} %d\n", node, role, st.DroppedSamples)
+
+	fmt.Fprintf(w, "# HELP meridian_ingest_shed_events_total Enqueue attempts that shed a batch under overload.\n")
+	fmt.Fprintf(w, "# TYPE meridian_ingest_shed_events_total counter\n")
+	fmt.Fprintf(w, "meridian_ingest_shed_events_total{node=%q,role=%q} %d\n", node, role, st.ShedEvents)
+
+	fmt.Fprintf(w, "# HELP meridian_ingest_backpressure_events_total Enqueue attempts that blocked because the queue was full.\n")
+	fmt.Fprintf(w, "# TYPE meridian_ingest_backpressure_events_total counter\n")
+	fmt.Fprintf(w, "meridian_ingest_backpressure_events_total{node=%q,role=%q} %d\n", node, role, st.BackpressureEvents)
+
+	fmt.Fprintf(w, "# HELP meridian_ingest_queue_depth Samples currently resident in the bounded ingest queue.\n")
+	fmt.Fprintf(w, "# TYPE meridian_ingest_queue_depth gauge\n")
+	fmt.Fprintf(w, "meridian_ingest_queue_depth{node=%q,role=%q} %d\n", node, role, st.Depth)
+
+	fmt.Fprintf(w, "# HELP meridian_ingest_queue_capacity Maximum samples the bounded ingest queue may hold.\n")
+	fmt.Fprintf(w, "# TYPE meridian_ingest_queue_capacity gauge\n")
+	fmt.Fprintf(w, "meridian_ingest_queue_capacity{node=%q,role=%q} %d\n", node, role, st.Capacity)
+
+	fmt.Fprintf(w, "# HELP meridian_ingest_queue_high_watermark Queue depth at which producers are flagged to throttle.\n")
+	fmt.Fprintf(w, "# TYPE meridian_ingest_queue_high_watermark gauge\n")
+	fmt.Fprintf(w, "meridian_ingest_queue_high_watermark{node=%q,role=%q} %d\n", node, role, st.HighWatermark)
 }
 
 // WriteServiceMetrics writes process-level metrics common to every Meridian service

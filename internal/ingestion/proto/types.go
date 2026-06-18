@@ -29,7 +29,15 @@ type Sample struct {
 	Value       float64
 }
 
-// WriteResponse reports the number of samples successfully ingested.
+// WriteResponse reports the number of samples accepted, plus backpressure signals.
 type WriteResponse struct {
 	SamplesIngested int64
+	// Shed is the number of samples the server dropped under overload (its bounded
+	// ingest queue was full past the block deadline). A non-zero Shed is the NACK:
+	// the producer should back off. meridian_dropped_samples_total is the
+	// authoritative cumulative count.
+	Shed int64 `json:",omitempty"`
+	// Throttled is set when the server's ingest queue is at or above its high-water
+	// mark — an early hint to ease off before shedding begins.
+	Throttled bool `json:",omitempty"`
 }

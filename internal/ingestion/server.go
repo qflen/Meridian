@@ -39,11 +39,21 @@ type Server struct {
 	connSem         chan struct{}
 }
 
-// NewServer creates a new ingestion server.
+// NewServer creates a new ingestion server with a default-sized bounded queue.
 func NewServer(db *storage.TSDB, batchSize int, flushInterval time.Duration) *Server {
+	return newServer(db, NewBatchWriter(db, batchSize, flushInterval))
+}
+
+// NewServerWithQueue creates an ingestion server whose bounded queue is sized from
+// opts (wired from ingestion config by the serve command).
+func NewServerWithQueue(db *storage.TSDB, batchSize int, flushInterval time.Duration, opts QueueOptions) *Server {
+	return newServer(db, NewBatchWriterWithQueue(db, batchSize, flushInterval, opts))
+}
+
+func newServer(db *storage.TSDB, batch *BatchWriter) *Server {
 	return &Server{
 		db:              db,
-		batch:           NewBatchWriter(db, batchSize, flushInterval),
+		batch:           batch,
 		done:            make(chan struct{}),
 		maxMessageBytes: defaultMaxMessageBytes,
 		readTimeout:     defaultReadTimeout,
@@ -79,9 +89,11 @@ func (s *Server) BatchWriter() *BatchWriter {
 }
 
 // Write handles a single write request (used for direct invocation). Series with an
-// invalid name or label (including oversized names/labels) are skipped.
+// invalid name or label (including oversized names/labels) are skipped. Valid
+// samples are offered to the bounded ingest queue; any shed under overload are
+// reported back so the producer is NACKed (SamplesIngested excludes them).
 func (s *Server) Write(_ context.Context, req *pb.WriteRequest) (*pb.WriteResponse, error) {
-	var count int64
+	var samples []storage.IngestSample
 	for _, ts := range req.TimeSeries {
 		if err := ValidateMetricName(ts.Name); err != nil {
 			continue
@@ -99,11 +111,25 @@ func (s *Server) Write(_ context.Context, req *pb.WriteRequest) (*pb.WriteRespon
 			continue
 		}
 		for _, sample := range ts.Samples {
-			s.batch.Add(ts.Name, labels, sample.TimestampMs, sample.Value)
-			count++
+			samples = append(samples, storage.IngestSample{
+				Name:      ts.Name,
+				Labels:    labels,
+				Timestamp: sample.TimestampMs,
+				Value:     sample.Value,
+			})
 		}
 	}
-	return &pb.WriteResponse{SamplesIngested: count}, nil
+
+	res := s.batch.AddBatch(samples)
+	accepted := int64(len(samples)) - res.Shed
+	if accepted < 0 {
+		accepted = 0
+	}
+	return &pb.WriteResponse{
+		SamplesIngested: accepted,
+		Shed:            res.Shed,
+		Throttled:       res.Throttled,
+	}, nil
 }
 
 func (s *Server) acceptLoop() {

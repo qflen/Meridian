@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,8 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	pb "github.com/meridiandb/meridian/internal/ingestion/proto"
 	"github.com/meridiandb/meridian/internal/config"
+	pb "github.com/meridiandb/meridian/internal/ingestion/proto"
 	"github.com/meridiandb/meridian/internal/server"
 	"github.com/meridiandb/meridian/internal/service"
 )
@@ -36,9 +37,21 @@ func main() {
 	defer stopMonitor()
 	sc.StartHealthMonitor(monitorCtx, 2*time.Second)
 
+	// Bound in-flight writes: a worker pool drains a bounded queue to the quorum
+	// Write, so a stalled replica backpressures (then sheds → 429) the producer
+	// instead of piling up unbounded concurrent writes. See ADR-023.
+	pool := service.NewWritePool(sc, service.PoolOptions{
+		Capacity:      envInt("INGEST_QUEUE_CAPACITY", 50000),
+		HighWatermark: envInt("INGEST_QUEUE_HIGH_WATERMARK", 40000),
+		BlockDeadline: envDuration("INGEST_BLOCK_DEADLINE", 250*time.Millisecond),
+		Workers:       envInt("MAX_CONCURRENT_WRITES", 64),
+	})
+	defer pool.Close()
+
 	srv := &ingestorServer{
 		nodeID:    nodeID,
 		storage:   sc,
+		pool:      pool,
 		startTime: time.Now(),
 	}
 
@@ -77,18 +90,42 @@ func main() {
 type ingestorServer struct {
 	nodeID    string
 	storage   *service.StorageClient
+	pool      *service.WritePool
 	startTime time.Time
 }
 
 func (s *ingestorServer) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/internal/ingest", s.handleHTTPIngest)
+	mux.HandleFunc("/api/internal/ingest_stats", s.handleIngestStats)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+}
+
+// handleIngestStats reports the bounded ingest queue snapshot as JSON so the
+// gateway can aggregate ingest-queue load across ingestors for the dashboard.
+func (s *ingestorServer) handleIngestStats(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.pool == nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{})
+		return
+	}
+	st := s.pool.Stats()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"depth":               st.Depth,
+		"capacity":            st.Capacity,
+		"high_watermark":      st.HighWatermark,
+		"dropped_samples":     st.DroppedSamples,
+		"shed_events":         st.ShedEvents,
+		"backpressure_events": st.BackpressureEvents,
+	})
 }
 
 func (s *ingestorServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	server.WriteServiceMetrics(w, s.nodeID, "ingestor", time.Since(s.startTime))
+	if s.pool != nil {
+		server.WriteQueueMetrics(w, s.nodeID, "ingestor", s.pool.Stats())
+	}
 }
 
 func (s *ingestorServer) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -114,7 +151,15 @@ func (s *ingestorServer) handleHTTPIngest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	resp, err := s.storage.Write(r.Context(), req)
+	resp, _, err := s.pool.Submit(r.Context(), req)
+	if errors.Is(err, service.ErrShed) {
+		// Overloaded: the bounded queue was full past the block deadline. Shed the
+		// request and tell the producer to back off — backpressure as a 429.
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(map[string]string{"error": "ingest overloaded, retry after backing off"})
+		return
+	}
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
@@ -153,7 +198,12 @@ func (s *ingestorServer) handleTCPConn(conn net.Conn) {
 		// Convert proto types to service types
 		svcReq := protoToServiceRequest(req)
 
-		resp, err := s.storage.Write(context.Background(), svcReq)
+		resp, _, err := s.pool.Submit(context.Background(), svcReq)
+		if errors.Is(err, service.ErrShed) {
+			// Overloaded: NACK the producer with the shed sample count so it eases off.
+			encoder.Encode(pb.WriteResponse{Shed: requestSamples(svcReq), Throttled: true})
+			continue
+		}
 		if err != nil {
 			log.Printf("Storage write error: %v", err)
 			encoder.Encode(pb.WriteResponse{SamplesIngested: 0})
@@ -162,6 +212,16 @@ func (s *ingestorServer) handleTCPConn(conn net.Conn) {
 
 		encoder.Encode(pb.WriteResponse{SamplesIngested: resp.SamplesIngested})
 	}
+}
+
+// requestSamples totals the samples in a request, used to report the shed count
+// when the producer is NACKed.
+func requestSamples(req service.WriteRequest) int64 {
+	var n int64
+	for _, ts := range req.TimeSeries {
+		n += int64(len(ts.Samples))
+	}
+	return n
 }
 
 func protoToServiceRequest(req pb.WriteRequest) service.WriteRequest {
@@ -212,6 +272,16 @@ func envInt(key string, def int) int {
 			return n
 		}
 		log.Printf("invalid %s=%q, using default %d", key, v, def)
+	}
+	return def
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := config.ParseDuration(v); err == nil {
+			return d
+		}
+		log.Printf("invalid %s=%q, using default %s", key, v, def)
 	}
 	return def
 }

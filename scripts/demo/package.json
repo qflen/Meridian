@@ -1,0 +1,13 @@
+{
+  "name": "meridian-demo-capture",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Local-only tooling to auto-capture the README demo assets. Not part of the Meridian runtime; install on demand with `npm install` here.",
+  "type": "module",
+  "scripts": {
+    "postinstall": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.1"
+  }
+}

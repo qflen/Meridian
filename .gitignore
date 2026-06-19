@@ -18,6 +18,10 @@ dashboard/dist/
 /querier
 /storage
 
+# Demo capture tooling — installed locally on demand, never committed.
+# The capture scripts and rendered assets (docs/assets/) ARE committed.
+scripts/demo/node_modules/
+
 # Local tooling and planning/scratch files (never committed)
 .claude/
 CLAUDE.md

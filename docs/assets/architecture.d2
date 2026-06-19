@@ -1,0 +1,61 @@
+# Meridian architecture.
+# Render:  d2 --theme 0 --layout dagre --pad 20 architecture.d2 architecture.svg
+direction: down
+
+clients: "Clients · simulator" {
+  shape: oval
+}
+
+ingest: "Ingest + routing" {
+  ingestor: "Ingestor\nbounded queue · backpressure"
+  ring: "Consistent-hash ring\nN=3 · virtual nodes" {
+    shape: hexagon
+    style.fill: "#3AA8A0"
+    style.font-color: "#ffffff"
+  }
+  ingestor -> ring: "shard + replicate"
+}
+
+storage: "Storage nodes · TSDB\nself-healing replicas: hinted handoff + Merkle anti-entropy" {
+  s1: "storage-1\nWAL · Gorilla blocks · rollups" {
+    shape: cylinder
+  }
+  s2: "storage-2" {
+    shape: cylinder
+  }
+  s3: "storage-3" {
+    shape: cylinder
+  }
+}
+
+serve: "Query + serve" {
+  querier: "Querier\nPromQL engine"
+  anomaly: "Anomaly detector\nEWMA / Holt-Winters"
+  gateway: "Gateway\nREST · WebSocket"
+  querier -> gateway
+  anomaly -> gateway
+}
+
+dashboard: "Dashboard\ncanvas strip-charts" {
+  shape: page
+}
+
+rollups: "Downsample cascade\nraw → 1m → 1h · retention" {
+  shape: document
+  style.fill: "#eef6f5"
+}
+
+clients -> ingest.ingestor: "TCP JSON / HTTP"
+ingest.ring -> storage.s1: "quorum write W=2"
+ingest.ring -> storage.s2
+ingest.ring -> storage.s3
+storage.s1 -> serve.querier: "scatter read R=2\nmerge + read-repair"
+storage.s2 -> serve.querier
+storage.s3 -> serve.querier
+serve.gateway -> dashboard: "live WebSocket stream" {
+  style.stroke: "#3AA8A0"
+  style.stroke-width: 3
+}
+storage.s3 -> rollups: "downsample + retain" {
+  style.stroke-dash: 4
+}

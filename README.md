@@ -1,440 +1,142 @@
+<div align="center">
+
 # Meridian
 
-A distributed time-series database written in Go with a real-time React dashboard.
+**Distributed time-series database in Go: Gorilla compression, a PromQL query engine, quorum-replicated hash-ring clustering, and a canvas-rendered live dashboard.**
 
-Meridian implements Facebook's Gorilla compression, a PromQL-subset query engine,
-consistent-hash clustering, automatic downsampling, and a canvas-rendered
-monitoring dashboard. It ships as a single binary with minimal dependencies.
+<!-- build / release -->
+[![Go](https://img.shields.io/badge/Go-1.25.6-00ADD8?style=flat-square&logo=go&logoColor=white)](go.mod)
+[![release](https://img.shields.io/badge/release-v0.2.0-3AA8A0?style=flat-square)](CHANGELOG.md)
+[![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+&nbsp;
+<!-- quality -->
+[![tests](https://img.shields.io/badge/tests-351_passing-3fb950?style=flat-square)](#development)
+[![race](https://img.shields.io/badge/race-clean-3fb950?style=flat-square)](#development)
+[![coverage](https://img.shields.io/badge/coverage-71.1%25-3fb950?style=flat-square)](#development)
+&nbsp;
+<!-- scale -->
+![code](https://img.shields.io/badge/code-~17.4k_LOC_Go-555?style=flat-square)
+![packages](https://img.shields.io/badge/internal_packages-12-555?style=flat-square)
+![binaries](https://img.shields.io/badge/binaries-6-555?style=flat-square)
+[![ADRs](https://img.shields.io/badge/ADRs-31-555?style=flat-square)](DECISIONS.md)
 
-![Meridian dashboard](docs/dashboard.png)
+<!-- architecture strip -->
+![query](https://img.shields.io/badge/query-PromQL_engine-3AA8A0?style=flat-square)
+![sharding](https://img.shields.io/badge/sharding-consistent_hash_ring-3AA8A0?style=flat-square)
+![replication](https://img.shields.io/badge/replication-quorum_N3%C2%B7W2%C2%B7R2-3AA8A0?style=flat-square)
+![consistency](https://img.shields.io/badge/consistency-read_repair-3AA8A0?style=flat-square)
+![recovery](https://img.shields.io/badge/recovery-hinted_handoff-3AA8A0?style=flat-square)
+![convergence](https://img.shields.io/badge/convergence-Merkle_anti_entropy-3AA8A0?style=flat-square)
+![compression](https://img.shields.io/badge/compression-Gorilla-3AA8A0?style=flat-square)
+![durability](https://img.shields.io/badge/durability-WAL_group_commit-3AA8A0?style=flat-square)
+![detection](https://img.shields.io/badge/detection-EWMA_+_Holt--Winters-3AA8A0?style=flat-square)
 
-The query result is a strip-chart instrument: a cursor crosshair sweeps a live,
-tabular-mono readout of every series' value across a fine graticule.
+</div>
 
-![Meridian instrument chart — crosshair readout](docs/demo.gif)
+![The Meridian dashboard: a live PromQL strip-chart with a cursor crosshair readout, streaming ingestion and cluster monitors, and the anomaly detector flagging out-of-band points in real time.](docs/assets/dashboard.gif)
 
-## Quick Start
+## What is Meridian?
 
-```bash
-# Build everything, start server + simulator, open the dashboard
-./run.sh demo
-```
-
-Step by step:
-
-```bash
-make build dashboard
-
-./bin/meridian serve &
-./bin/meridian simulate &          # 8 hosts × 43 metrics, diurnal patterns
-
-open http://localhost:8080
-
-./bin/meridian query "rate(http_requests_total[5m])"
-./bin/meridian query "avg by (host)(cpu_usage_percent)"
-```
-
-## Measured Performance
-
-Apple M5 (10-core), Go 1.25.6, single core, `./bin/meridian bench`
-(1 M samples, regular-interval, integer-like values):
-
-| Metric              | Value            |
-| ------------------- | ---------------- |
-| Compression ratio   | **28.3×**        |
-| Space savings       | 96.5%            |
-| Bits per sample     | 4.5              |
-| Encode throughput   | ~88 M points/s   |
-| Decode throughput   | ~132 M points/s  |
-| Encode latency      | ~11 ns/point     |
-| Decode latency      | ~8 ns/point      |
-
-Ratio, savings, and bits/sample are deterministic (the benchmark uses a fixed seed).
-Encode/decode throughput is a warm single-core figure that varies with thermal state —
-roughly 45–90 M points/s (encode) and 65–135 M points/s (decode) across runs. The
-28.3× ratio is best-case for regular, integer-like gauges; continuously varying float
-series compress closer to ~2× (see [PERFORMANCE.md](PERFORMANCE.md)). Live compression
-figures (blocks + in-memory head) are exposed on `/api/v1/stats`, `/metrics`, and the
-dashboard's compression gauge.
+A time-series database that ingests metrics, stores them compressed and crash-consistently, and answers PromQL queries. It runs either as a **single binary** or as a **quorum-replicated cluster** of small services. The storage engine, query engine, and distribution layer are built from scratch with no external storage or query dependencies, and documented across [31 ADRs](DECISIONS.md). A canvas-rendered React dashboard streams it all live over WebSockets.
 
 ## Features
 
-### Storage Engine
-- **Gorilla compression**: delta-of-delta timestamps + XOR float encoding
-- **Write-ahead log**: CRC32-framed, 128 MB segment rotation, fsync before
-  acknowledgment with optional group commit (concurrent frames coalesced behind one
-  fsync, ADR-026); corrupt frames resync to the next 8-byte boundary instead of
-  discarding the rest of the segment
-- **Crash-consistent flush**: an atomic head-swap + WAL-rotate cut, a block written
-  via temp-dir → fsync → atomic rename, and a per-block WAL low-water-mark so a crash
-  mid-flush neither loses concurrently-ingested samples nor double-counts on replay
-- **Out-of-order policy**: samples older than a series' last are rejected and counted
-  (`meridian_out_of_order_samples_total`); duplicates are deduplicated — so series
-  stay sorted and block/retention time bounds never invert
-- **Inverted index**: sorted-slice intersection, no external bitmap dependencies
-- **Block storage**: ULID-named immutable blocks with a binary index
+Each row links to the architecture decision records that specify it.
 
-### Query Engine
-- **PromQL subset**: recursive-descent parser with operator precedence and unary `+`/`-`
-- **Range/matrix evaluation**: a query is evaluated as an instant query at each `step` across `[start, end]` and returned as a matrix — one point per step per series, in time order. `rate(x[5m])` is a real multi-point series, not a single number.
-- **Selectors**: instant, range, and bare label-only (`{job="x"}`); matchers `=`, `!=`, `=~`, `!~`; compound/decimal durations (`1h30m`, `1.5h`)
-- **`rate()`**: per-second average over the selector range — counter-reset corrected and extrapolated to the window edges, Prometheus-style; a wide span is served from a coarse tier's stored counter-increase column (window-averaged), short spans read raw (ADR-025)
-- **Range aggregation**: `avg_over_time`, `min_over_time`, `max_over_time`, `sum_over_time`, `count_over_time`, `last_over_time` over a range vector `x[d]`; served from the matching rollup column at coarse resolution (`max_over_time`→max, …), exactly equal to the raw result for min/max/sum/count (ADR-025)
-- **`histogram_quantile()`**: linear interpolation within cumulative `le` buckets, grouped by the remaining labels
-- **Aggregations**: `sum`, `avg`, `min`, `max`, `count`, and `topk`/`bottomk`, with both `by` and `without` grouping
-- **Binary ops**: scalar↔vector and vector↔vector with label-set matching; `/` follows IEEE-754 (`x/0 → ±Inf`, `0/0 → NaN`)
+| Area | Highlights | ADRs |
+| --- | --- | --- |
+| **Query** | Stepped PromQL: range/matrix evaluation, `rate`, `histogram_quantile`, `*_over_time`, `topk`/`bottomk`, `by`/`without`, vector ops with label matching | [014](DECISIONS.md), [025](DECISIONS.md) |
+| **Storage** | Gorilla compression (~28x), CRC32 WAL with group commit, crash-consistent flush, inverted index | [002](DECISIONS.md), [003](DECISIONS.md), [016](DECISIONS.md), [026](DECISIONS.md) |
+| **Downsampling** | Live raw / 1m / 1h rollup cascade, query-time resolution selection, per-resolution retention | [011](DECISIONS.md), [025](DECISIONS.md) |
+| **Distribution** | Consistent-hash ring, quorum N=3/W=2/R=2 with read-repair, hinted handoff, Merkle anti-entropy, online rebalancing | [022](DECISIONS.md), [029](DECISIONS.md), [030](DECISIONS.md), [031](DECISIONS.md) |
+| **Backpressure** | Bounded block-then-shed ingest queues (HTTP 429 / TCP NACK), opt-in per-series and priority-class admission | [023](DECISIONS.md), [027](DECISIONS.md) |
+| **Anomaly detection** | Per-series online detector, EWMA baseline plus a selectable seasonal Holt-Winters model, streamed live | [024](DECISIONS.md), [028](DECISIONS.md) |
+| **Dashboard** | Canvas 2D strip-charts (no chart library), WebSocket streaming, dark/light themes, accessibility floor | [020](DECISIONS.md), [021](DECISIONS.md) |
 
-Each step is a self-contained instant evaluation: an instant vector takes the most
-recent sample within a 5-minute look-back (a gap stays a gap, never a zero), and a
-range vector `x[5m]` takes the half-open window `(t-5m, t]`. An unset `step`
-auto-sizes so the range yields ~250 points; the step count is capped to bound work
-and pre-empt a query-of-death. Each leaf selector's data is fetched once over the
-whole range and sliced per step, so cost scales with steps, not with re-queries.
-
-### Cluster (microservices tier)
-- **Consistent-hash ring**: a 64-bit SHA-256 ring with virtual nodes and a
-  deterministic nodeID tie-break, so replica placement is a function of membership,
-  not of node-join order. It is the single routing source, built from the configured
-  storage nodes, and shared by the ingestor and querier so writes and reads agree.
-- **Quorum replication (N/W/R)**: each series is written to its **N** ring replicas
-  and succeeds at **W** acks; reads take **R** responses, merge and dedupe by
-  (series, timestamp), and asynchronously **read-repair** stale replicas. Defaults
-  N=3, W=2, R=2 — `W+R>N` gives read-your-writes. A node loss doesn't lose data: the
-  surviving replicas serve complete reads, and a recovered node is caught up by
-  read-repair. Too few live replicas returns a clear quorum error, never silent
-  partial data. (ADR-022.)
-- **Hinted handoff**: a write that can't reach a natural replica (it's down or
-  catching up) buffers a durable, bounded **hint** while quorum still succeeds on the
-  survivors, and replays it on the replica's return so it **fully converges** —
-  including an *interior* gap read-repair can't fill (read-repair only converges points
-  newer than a replica's last; storage rejects out-of-order). Replay goes through an
-  out-of-order-tolerant backfill path, and a returning replica catches up in the
-  `joining` state before it rejoins live routing. (ADR-029.)
-- **Proactive anti-entropy**: a rate-limited, jittered background sweep compares
-  co-replicas with compact **Merkle range digests** (`ring-range × time-window`) and
-  repairs the divergence read-repair and handoff never see — cold data, an unobserved
-  partial write, a series no longer written. Equal digest roots transfer nothing; a
-  differing root ships only the differing window's missing points, back through the same
-  backfill path. (ADR-030.)
-- **Rebalancing on membership change**: adding or removing a storage node re-derives
-  placement *and moves the data*. The coordinator diffs the owner sets before/after the
-  change, **migrates** each moved range to its new owners (reusing the anti-entropy range
-  read + handoff backfill apply), then **GCs** the data a node no longer owns — only after
-  the new owners confirm receipt at quorum, and never the last copy. A joining node catches
-  up out of routing before it serves; a leaving node re-homes its ranges before it is
-  removed; degraded-window over-replication is reclaimed when an owner returns. Reads stay
-  complete throughout. Driven by `POST /api/internal/cluster/{join,leave}`. (ADR-031.)
-- **Health-driven membership**: a background `/health` monitor marks nodes
-  active/dead so routing excludes the dead and re-includes the recovered; a node that
-  returns with a hint backlog passes through `joining` (catching up) before `active`, and
-  the `leaving` state drives graceful departure during a rebalance.
-- **Scope**: this applies to the docker-compose tier (ingestor/storage/querier). The
-  single-binary `serve` is genuinely single-node.
-
-### Write-path backpressure
-- **Bounded ingest queues**: every ingest path — the monolith batch writer, the
-  ingestor's submission pool, and the storage accept queue — sits behind a queue
-  bounded in samples, so resident memory is capped instead of growing under overload.
-  Queue depth ≈ arrival_rate × service_time (Little's Law), so bounding depth bounds
-  both memory and tail latency.
-- **Block-then-shed**: a full queue blocks the producer for up to a short deadline
-  (the backpressure); past it the batch is **shed** — dropped and counted — and the
-  producer is NACKed: **HTTP 429 + `Retry-After`**, or a clear NACK on the raw-TCP
-  path. A stalled replica (quorum write) or slow WAL fsync propagates backpressure
-  upstream rather than OOMing, and a counted drop beats a silent OOM. (ADR-023.)
-- **Per-series fair-share & priority shedding** (opt-in): an admission shaper in front
-  of the queue sheds by **priority class** (a label or `__name__` match → a capacity
-  ceiling, so low priority sheds before high) and **per-series token-bucket fair share**
-  (a hot/high-cardinality series is throttled instead of starving well-behaved ones).
-  Both engage only under contention; per-series state is bounded (sharded), so a
-  cardinality flood can't grow it. Order within a series is preserved; off by default,
-  leaving ADR-023's uniform shedding as the fallback. (ADR-027.)
-- **Observable**: `meridian_dropped_samples_total`, ingest queue depth/capacity, and
-  shed/backpressure-event counters on `/metrics`; queue depth + a derived drop rate on
-  `/api/v1/stats` and the dashboard load view, which the simulator's spikes drive. When
-  admission is enabled, `meridian_admission_*` adds admitted/dropped-by-class and
-  dropped-by-reason (priority vs fair-share) counters.
-
-### Streaming anomaly detection
-- **Per-series online detector**: single-pass and O(1) state per series, run inline
-  in the broadcast loop. Each series tracks an **EWMA baseline + dispersion**; a point
-  is flagged when its *local* z-score `|value − baseline| / dispersion` exceeds a
-  threshold (~3–4). The moving baseline tracks the simulator's **diurnal swing and
-  memory drift without alerting**, while an injected **spike** departs sharply from it
-  and **does** alert — where a naive global mean/z-score would flag the whole diurnal
-  peak. (ADR-024.)
-- **Selectable seasonal model**: switch `anomaly.mode` to **`holt_winters`** for an
-  additive level+trend+seasonal model that *learns the diurnal shape* and scores each
-  value against the band for its own time of day. It catches what EWMA cannot — a value
-  that is **normal globally but abnormal for that phase** (a midday load level in the
-  small hours, a scheduled dip that fails to happen) — at the cost of warming up over
-  one full season. EWMA stays the default. (ADR-028.)
-- **Robust by construction**: a Welford warmup (EWMA) or one-season warmup
-  (Holt-Winters) seeds the baseline before any alert; a Huber clamp bounds a spike's
-  pull on the baseline/dispersion (so it can't blind the detector); a relative scale
-  floor stops a momentarily-flat series from looking anomalous; debounce + hysteresis
-  and timestamp dedup prevent alert storms; stale series are evicted so memory follows
-  live cardinality. The clamp, floor, debounce and emission are shared by both models.
-- **On the wire and the screen**: raise/clear transitions stream as a distinct
-  `anomaly` WebSocket frame and into a bounded recent-buffer (`/api/v1/anomalies`) for
-  late-joining clients; the dashboard's **Anomalies** strip lists them most-recent-first,
-  clears each as it recovers, and shows the active model. `meridian_anomalies_total`,
-  `meridian_active_anomalies` and `meridian_anomaly_model_info` are on `/metrics` and
-  `/api/v1/stats`. Runs uniformly in the monolith and the cluster gateway.
-
-### Dashboard
-- **Canvas-rendered**: charts drawn directly on the Canvas 2D API, no chart library
-- **11 components**: query editor, time-series chart, metric explorer, cluster topology, ingestion monitor, compression gauge, latency histogram, retention timeline, live stream, anomalies strip, theme toggle
-- **Real-time**: WebSocket streaming batched through `requestAnimationFrame`
-- **Themes**: dark and light, sharing one semantic token system
-- **Design**: a calm "precision instrument" visual language — three panel tiers, one accent, tabular-mono figures, self-hosted Inter Tight / Inter / IBM Plex Mono (ADR-020, ADR-021)
-- **Signature chart**: the query result is a strip-chart instrument — a fine graticule, instrument tick marks, and a cursor crosshair with a live tabular-mono readout of the value under the cursor on every series
-- **States & accessibility**: one shared empty / loading / error voice plus a reconnect banner; keyboard-navigable query suggestions (combobox/listbox), visible accent focus rings, and `prefers-reduced-motion` honored throughout
-
-### Observability
-- **`/metrics`**: Prometheus exposition on **every** node — the monolith and each
-  microservice (gateway, querier, storage, ingestor, compactor) — so a docker-compose
-  cluster is scrapeable end-to-end, not just the monolith. Storage nodes expose the
-  full storage metrics (cumulative `meridian_samples_ingested_total`, out-of-order
-  samples rejected, head/block stats, storage bytes by layer, compression ratio,
-  query-latency histogram); the gateway also reports connected WebSocket clients;
-  every ingest-bounding node exposes the flow-control families
-  (`meridian_dropped_samples_total`, ingest queue depth/capacity/high-water,
-  shed/backpressure-event counters — ADR-023, plus the `meridian_admission_*`
-  by-class/by-reason families when per-series/priority shedding is enabled — ADR-027);
-  the monolith and gateway, where the
-  anomaly detector runs, also expose `meridian_anomalies_total` and
-  `meridian_active_anomalies` (ADR-024); and every service exposes `meridian_up` and
-  uptime. (ADR-019.)
-- **`/health`**: liveness probe for orchestrators
-- **`/api/v1/stats`**: JSON snapshot of storage, WAL, ingestion, compression, and
-  ingest-queue load. The `ingestion_rate` field is a live **samples/sec rate**
-  averaged over a short rolling window (it tracks load and falls back to ~0 when
-  idle); the monotonic cumulative count lives in the `meridian_samples_ingested_total`
-  counter (ADR-017). `ingest_queue_depth`/`_capacity` and the cumulative
-  `dropped_samples` expose write-path backpressure (ADR-023); `anomalies_total` and
-  `active_anomalies` expose the detector (ADR-024).
-- **`/api/v1/anomalies`**: the bounded recent-anomalies buffer, most-recent-first,
-  so a late-joining dashboard seeds its alerts strip before live frames arrive (ADR-024).
-- **Single-node honesty**: in default single-node `serve`, `/api/v1/cluster` reports
-  exactly the one real node rather than fabricating zero-stat peers.
-
-### Operations
-- **Downsampling cascade**: a live raw → 1m → 1h rollup cascade (ADR-011). On each
-  background pass, sealed raw blocks are rolled up to resolution-tagged 1m blocks and
-  the 1m tier is chained — count-weighted, so a 1h average equals one built directly
-  from raw — into 1h blocks. Every window stores min/max/sum/count/avg and a reset-aware
-  counter increase (ADR-025). In the single-binary `serve`, the query planner picks a
-  resolution from the query span and step, so a wide view reads coarse rollup points
-  instead of thousands of raw samples (the resolution test serves an 8h span at a 1h step
-  from the 1h tier reading 16 points versus 3840 raw over the span — a 240× reduction),
-  transparently to the caller; the HTTP API reports the chosen `resolution_ms`/`points_read`.
-- **Function-aware rollup queries** (ADR-025): served from a coarse tier, each query reads
-  the stored column that matches its operation — `max_over_time`→max, `sum_over_time`→sum,
-  a bare value/`avg_over_time`→avg — exact for min/max/sum/count, and `rate()` is served
-  from the counter-increase column as `Σincrease / range` (window-averaged, ~1% of raw
-  over a wide span). Short ranges, `last_over_time`, and bare range selectors stay on raw.
-- **Cluster resolution selection**: the distributed query path selects a resolution and
-  aggregate column too, exactly like the monolith. The querier runs the same planner and
-  asks each storage node for the chosen resolution + column; nodes serve the coarsest tier
-  they hold at or below it (advertising availability on `/api/internal/resolutions`), and the
-  client merges the coarse results across replicas — skipping read-repair, since rollups are
-  node-local and raw replication is the convergence layer (ADR-011). A wide cluster query is
-  served from the 1h tier, a narrow one reads raw, and `resolution_ms`/`points_read` are
-  reported just like the single binary.
-- **Per-resolution retention**: each tier has its own TTL — raw expires first while
-  the longer-lived 1m/1h tiers keep answering long-range queries (default raw 15d →
-  1m 30d → 1h 365d). Raw is never dropped before the finest rollup tier has captured it.
-- **Simulator**: diurnal patterns, spike injection, memory drift across 8 hosts
+Component documentation: [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Architecture
 
-```
-HTTP/WS ─→ Query Engine ─→ TSDB (Head + Blocks)
-  │                            │
-  ├── Dashboard (React)        ├── WAL (CRC32)
-  ├── REST API                 ├── Gorilla Compression
-  ├── /metrics (Prometheus)    └── Inverted Index
-  └── WebSocket Hub                │
-                                   │
-TCP Ingestion ─→ BatchWriter ──────┘
-                                   │
-Cluster Ring ──→ Coordinator ──────┘
-```
+<div align="center">
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed component documentation.
+![Meridian architecture: clients stream over TCP/HTTP into the ingestor and consistent-hash ring, which quorum-writes to three self-healing TSDB storage nodes (WAL, Gorilla blocks, rollups); the querier scatter-reads at R=2 with read-repair, the gateway and anomaly detector serve the dashboard over WebSockets, and a downsample cascade feeds the rollup tiers.](docs/assets/architecture.svg)
 
-## API
+</div>
 
-```bash
-# Query (rolling 15-min window by default)
-curl "http://localhost:8080/api/v1/query?q=cpu_usage_percent"
+The single binary collapses ingest, storage, query, and dashboard into one process. The cluster tier splits the same code into gateway, ingestor, storage, querier, and compactor services that route over the ring. Details in [ARCHITECTURE.md](ARCHITECTURE.md); wire protocol in [PROTOCOL.md](PROTOCOL.md). The source for this diagram is [docs/assets/architecture.d2](docs/assets/architecture.d2).
 
-# Range query → matrix (one point per step across [start,end]); step is optional
-curl "http://localhost:8080/api/v1/query?q=rate(http_requests_total[5m])&start=<ms>&end=<ms>&step=30s"
+## Cluster fault tolerance
 
-# Series & labels
-curl "http://localhost:8080/api/v1/series"
-curl "http://localhost:8080/api/v1/labels"
-curl "http://localhost:8080/api/v1/label/__name__/values"
+A storage node is killed mid-stream: the quorum read stays complete, writes buffer as hints, and on restart hinted handoff replays and Merkle anti-entropy reconciles. Recorded from the real service binaries.
 
-# Storage / cluster / blocks
-curl "http://localhost:8080/api/v1/stats"
-curl "http://localhost:8080/api/v1/cluster"
-curl "http://localhost:8080/api/v1/blocks"
+![Cluster ops: a 3-node ring serving quorum reads, a storage node killed while the read stays complete, hints buffering for the dead node, then hinted-handoff replay and Merkle anti-entropy converging on restart.](docs/assets/cluster.gif)
 
-# Recent anomalies (most-recent-first, with total/active counters)
-curl "http://localhost:8080/api/v1/anomalies"
-
-# Prometheus-scrapeable self-metrics
-curl "http://localhost:8080/metrics"
-
-# Live WebSocket stream — stats, per-series metric, and `anomaly` frames
-websocat "ws://localhost:8080/ws/metrics"
-```
-
-See [PROTOCOL.md](PROTOCOL.md) for the full wire protocol.
-
-### CORS & request safety
-
-- **CORS**: cross-origin browser requests are allowed only from configured origins.
-  The default permits `localhost` / `127.0.0.1` / `[::1]` (the dashboard and its dev
-  server) and nothing else — not `*`. Widen it with `server.allowed_origins`
-  (monolith) or `GATEWAY_ALLOWED_ORIGINS` (gateway); a single `"*"` re-enables
-  allow-all for trusted networks. (ADR-018.)
-- **Query limits**: `/api/v1/query` runs under a deadline (`server.query_timeout`,
-  default 30s), validates `start ≤ end`, rejects malformed `start`/`end`/`step` with
-  400, and recovers a panic into a 500 (the engine separately caps the step count).
-- **Static serving**: non-API paths are confined to the dashboard directory;
-  directory-traversal attempts (`..`, percent-encoded or not) return 400 and never
-  escape it.
-
-## Configuration
-
-Meridian reads `meridian.yaml` if present; unknown fields fall back to defaults.
-Durations accept `ns`, `us`, `ms`, `s`, `m`, `h`, plus `d` (days) and `w` (weeks):
-
-```yaml
-server:
-  query_timeout: "30s"    # max execution time for a single /api/v1/query
-  allowed_origins: []     # CORS allow-list; empty = localhost only, ["*"] = all
-storage:
-  block_duration: "15m"   # flush head to a compressed block this often
-  retention:      "15d"   # drop blocks older than this
-cluster:                  # microservices tier only; W+R must exceed N
-  replication_factor: 3   # N — replicas per series
-  write_quorum:       2   # W — acks required for a write
-  read_quorum:        2   # R — replicas a read must hear from
-  virtual_nodes:      256 # ring virtual nodes per physical node
-  handoff:                # hinted handoff (ADR-029); on by default for the tier
-    enabled:             true
-    max_samples_per_node: 1000000  # per-target hint buffer cap (samples); drop-oldest past it
-    replay_interval:    "5s"       # how often buffered hints are replayed to recovered replicas
-  anti_entropy:           # proactive Merkle anti-entropy (ADR-030); on by default for the tier
-    enabled:          true
-    interval:         "30s"  # time between sweep rounds
-    window:           "1h"   # digest time-bucket size (the unit transferred on divergence)
-    lookback:         "0s"   # how far back to reconcile; 0 = all history
-    jitter:           "10s"  # random delay added per round so coordinators don't sweep in lockstep
-    groups_per_round: 16     # replica groups reconciled per round (spatial rate limit)
-  rebalance:              # rebalancing on membership change (ADR-031); on by default for the tier
-    enabled:             true
-    lookback:           "0s" # how far back to migrate/GC; 0 = all history
-    max_bytes_per_round: 0   # soft cap on bytes moved per pass; 0 = unlimited (one pass)
-ingestion:                # write-path backpressure (ADR-023)
-  queue_capacity:       50000   # hard ingest-queue cap in samples (memory bound)
-  queue_high_watermark: 40000   # depth at which producers are flagged to throttle
-  block_deadline:       "250ms" # how long a full queue blocks before shedding
-  max_concurrent_writes: 64     # drain worker-pool size (ingestor/storage)
-  admission:                    # per-series/priority shedding (ADR-027); off by default
-    enabled:            false
-    contention_fraction: 0.8    # depth/capacity at which fair share engages
-    fair_share_rate:    2000    # per-series token refill (samples/sec); 0 = priority only
-    fair_share_burst:   4000    # per-series burst (samples)
-    classes:                    # priority bands, highest first; ceiling = capacity fraction
-      - { name: high,    label: priority, value: high, ceiling: 1.0 }
-      - { name: default,                               ceiling: 0.6 }
-anomaly:                  # streaming anomaly detection (ADR-024, ADR-028)
-  enabled:    true        # toggle the detector on the live path
-  threshold:  3.5         # score above which a sample is out-of-band
-  alpha:      0.1         # level/dispersion smoothing in (0,1]; smaller = steadier
-  warmup:     20          # samples used to seed an EWMA baseline before any alert
-  debounce_k: 2           # consecutive out-of-band samples required to raise
-  mode:          ewma     # scoring model: ewma (default) or holt_winters (seasonal)
-  season_length: 48       # holt_winters: seasonal buckets per period
-  season_period: 24h      # holt_winters: wall-clock span of one season (phase from ts)
-```
-
-The microservice binaries read the same knobs from the environment: replication
-(`REPLICATION_FACTOR`, `WRITE_QUORUM`, `READ_QUORUM`, `VIRTUAL_NODES`) — clamped to
-the live node count so a cluster smaller than N still works — hinted handoff on the
-ingestor (`HINTED_HANDOFF_ENABLED`, `HINT_DIR`, `HINT_MAX_SAMPLES_PER_NODE`,
-`HINT_REPLAY_INTERVAL`) — proactive anti-entropy on the ingestor
-(`ANTI_ENTROPY_ENABLED`, `ANTI_ENTROPY_INTERVAL`, `ANTI_ENTROPY_WINDOW`,
-`ANTI_ENTROPY_LOOKBACK`, `ANTI_ENTROPY_JITTER`, `ANTI_ENTROPY_GROUPS_PER_ROUND`) —
-rebalancing on the ingestor (`REBALANCE_ENABLED`, `REBALANCE_LOOKBACK`,
-`REBALANCE_MAX_BYTES_PER_ROUND`) — backpressure
-(`INGEST_QUEUE_CAPACITY`, `INGEST_QUEUE_HIGH_WATERMARK`, `INGEST_BLOCK_DEADLINE`,
-`MAX_CONCURRENT_WRITES`; the storage node uses the `STORAGE_*` equivalents) — and the
-gateway's anomaly detector (`GATEWAY_ANOMALY_ENABLED`, `GATEWAY_ANOMALY_MODE`). The storage node also reads its
-local TSDB timings from `STORAGE_BLOCK_DURATION`, `STORAGE_FLUSH_INTERVAL`, and
-`STORAGE_RETENTION` (and `STORAGE_DOWNSAMPLE_INTERVAL` for the rollup cascade pass).
-
-## Docker
+## Quickstart
 
 ```bash
-# Single node
-docker build -t meridian .
-docker run -p 8080:8080 -p 9090:9090 meridian
+# Single binary: build, start node + simulator, open the dashboard
+./run.sh demo                       # http://localhost:8080
 
-# 3-node microservices cluster (gateway + 2 ingestors + 3 storage + querier + compactor)
-docker compose up --build
+# Or the microservices cluster
+docker compose up --build           # gateway + 2 ingestors + 3 storage + querier + compactor
 ```
 
-## Project Structure
+```bash
+# Query in PromQL (CLI or HTTP). A range query returns a matrix, one point per step.
+./bin/meridian query 'avg by (host) (cpu_usage_percent)'
+curl "http://localhost:8080/api/v1/query?q=histogram_quantile(0.95,rate(http_request_duration_seconds[5m]))"
+websocat "ws://localhost:8080/ws/metrics"     # live stats, metrics, and anomaly frames
+```
+
+Every node exposes Prometheus `/metrics`, a `/health` probe, and JSON `/api/v1/stats`. Full API: [PROTOCOL.md](PROTOCOL.md). Configuration: [meridian.yaml](meridian.yaml).
+
+## Performance
+
+Measured on Apple M5 (10-core), Go 1.25.6, darwin/arm64, reproducibly via `make bench` and `./bin/meridian bench`. Method and caveats: [PERFORMANCE.md](PERFORMANCE.md).
+
+| Area | Metric | Value |
+| --- | --- | --: |
+| Compression | regular integer-like gauges / continuous floats | **28.3x** / ~2x |
+| Throughput | Gorilla encode / decode (best case, 1 core) | ~88M / ~132M pts/s |
+| WAL group commit | fsync coalescing @ 64 / 8 concurrent writers | **~30-37x** / ~4x |
+| Downsampling | wide query point reduction (8h @ 1h step) | **240x** (16 vs 3840) |
+
+## Project layout
 
 ```
-cmd/meridian/       Monolith CLI (serve, simulate, query, bench)
-cmd/{gateway,ingestor,storage,querier,compactor}/  Per-service binaries
+cmd/meridian/        Monolith CLI: serve, simulate, query, bench
+cmd/{gateway,ingestor,storage,querier,compactor}/   Per-service binaries
 internal/
-  compress/         Gorilla encoder/decoder + benchmarks
-  storage/          WAL, head block, persistent blocks, TSDB
-  query/            Lexer, parser, planner, executor
-  ingestion/        TCP server, batch writer
-  backpressure/     Bounded block-then-shed ingest queue + per-series/priority admission
-  anomaly/          Streaming per-series anomaly detector (EWMA + Holt-Winters)
-  server/           HTTP API, WebSocket hub, /metrics exporter
-  cluster/          Hash ring, coordinator, node lifecycle
-  retention/        TTL enforcer, downsampler
-  config/           YAML configuration (with d/w duration suffixes)
-  service/          Shared service-to-service RPC
-simulator/          Metric generation with diurnal patterns
-dashboard/          React + TypeScript + Tailwind + Canvas
+  compress/          Gorilla encoder/decoder + benchmarks
+  storage/           WAL, head, persistent blocks, TSDB, rollups
+  query/             Lexer, parser, planner, executor
+  ingestion/         TCP server, batch writer
+  backpressure/      Bounded block-then-shed queue + admission shaper
+  anomaly/           Streaming detector (EWMA + Holt-Winters)
+  cluster/           Hash ring, coordinator, node lifecycle
+  service/           Service-to-service RPC, quorum client, handoff/anti-entropy
+  retention/         TTL enforcer, downsampler
+  server/            HTTP API, WebSocket hub, /metrics exporter
+  config/            YAML config (with d/w duration suffixes)
+simulator/           Metric generation with diurnal patterns + spikes
+dashboard/           React + TypeScript + Tailwind + Canvas 2D
+scripts/demo/        Tooling that captures the GIFs above (Playwright, asciinema, agg)
 ```
 
-## Design Decisions
+~17.4k lines of Go across 12 internal packages and 6 binaries, plus ~12k lines of test (**351 tests**, race-clean, 71.1% coverage) and a ~3.3k-line canvas dashboard.
 
-See [DECISIONS.md](DECISIONS.md) for the ADRs covering key trade-offs:
-Gorilla vs generic compression, sorted slices vs roaring bitmaps, JSON vs protobuf
-ingestion, rAF batching for WebSocket, the out-of-order sample policy, the
-crash-consistent flush model, the windowed ingestion-rate vs cumulative counter, the
-CORS policy, cluster-wide `/metrics`, the replication consistency model (quorum
-writes/reads + read-repair), the write-path backpressure model (bounded queues with
-block-then-shed load shedding, plus per-series fair-share / priority admission), the
-streaming anomaly detector (EWMA baseline +
-dispersion, robust to a moving diurnal baseline, with a selectable seasonal
-Holt-Winters model), and more.
+## Documentation
+
+[ARCHITECTURE.md](ARCHITECTURE.md) (components) &middot; [DECISIONS.md](DECISIONS.md) (31 ADRs) &middot; [PROTOCOL.md](PROTOCOL.md) (wire protocol) &middot; [PERFORMANCE.md](PERFORMANCE.md) (measured numbers) &middot; [CHANGELOG.md](CHANGELOG.md)
 
 ## Development
 
 ```bash
 make test       # all tests with the race detector
 make bench      # compression + query benchmarks
-make vet        # static analysis
 make dashboard  # build the React dashboard
-make clean      # remove artifacts
 ```
 
 ## License
 
-MIT
+[MIT](LICENSE) &copy; 2026 qflen

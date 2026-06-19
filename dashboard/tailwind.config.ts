@@ -11,7 +11,9 @@ export default {
   theme: {
     extend: {
       colors: {
-        base: token('--color-bg'),
+        // Named `page`, not `base`: a `base` colour would generate a `text-base`
+        // colour utility that collides with Tailwind's `text-base` font size.
+        page: token('--color-bg'),
         surface: token('--color-surface'),
         border: token('--color-border'),
         text: token('--color-text'),

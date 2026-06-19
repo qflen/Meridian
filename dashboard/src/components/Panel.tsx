@@ -5,7 +5,7 @@ import type { ReactNode } from 'react';
  *
  * Hierarchy is carried by size, heading scale, and density alone (never by
  * shadow or glow): a `primary` panel is full-width with a larger display
- * heading and an accent eyebrow; `secondary` monitors read at body scale; and
+ * heading and a small muted eyebrow; `secondary` monitors read at body scale; and
  * `tertiary` readouts are dense, with a small engraved uppercase label. A fixed
  * `bodyHeight` (drawn from the shared `PANEL_BODY` scale) makes the body a flex
  * column so the chart or list inside fills it — that is where panels in a row
@@ -63,7 +63,7 @@ export function Panel({
         <header className={`flex items-baseline justify-between gap-3 ${HEADER_GAP[tier]}`}>
           <div className="min-w-0">
             {eyebrow && (
-              <div className="text-2xs font-semibold uppercase tracking-[0.18em] text-accent mb-1">
+              <div className="text-2xs font-medium uppercase tracking-wider text-muted mb-1">
                 {eyebrow}
               </div>
             )}

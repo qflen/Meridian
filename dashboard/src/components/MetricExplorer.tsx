@@ -73,11 +73,12 @@ export function MetricExplorer() {
         type="text"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
-        placeholder="Filter metrics..."
+        placeholder="Filter metrics"
+        aria-label="Filter metrics"
         className="input w-full mb-3 text-xs"
       />
-      <div className="flex gap-3 flex-1 min-h-0">
-        <div className="w-1/2 overflow-y-auto space-y-0.5 pr-2">
+      <div className="flex gap-4 flex-1 min-h-0">
+        <div className="w-1/2 overflow-y-auto space-y-px pr-1">
           {filtered.length === 0 &&
             (metrics.length === 0 ? (
               <Placeholder title="No metrics to browse yet." hint="They appear once the server starts reporting." />
@@ -87,19 +88,19 @@ export function MetricExplorer() {
           {filtered.map((m) => (
             <button
               key={m.name}
+              type="button"
               onClick={() => selectMetric(m.name)}
-              className={`w-full text-left px-2 py-1.5 rounded text-xs font-mono transition-colors ${
+              aria-pressed={selected === m.name}
+              className={`w-full flex items-center justify-between gap-3 px-2 py-1 rounded text-xs font-mono transition-colors ${
                 selected === m.name ? 'bg-accent/15 text-accent' : 'text-text hover:bg-text/5'
               }`}
             >
-              <span>{m.name}</span>
-              <span className="ml-2 text-muted">
-                {m.type === 'counter' ? 'CNT' : 'GAU'}
-              </span>
+              <span className="truncate">{m.name}</span>
+              <span className="shrink-0 text-2xs text-muted">{m.type}</span>
             </button>
           ))}
         </div>
-        <div className="w-1/2 min-h-0">
+        <div className="w-1/2 min-h-0 border-l pl-4">
           {selected && liveData.length > 0 ? (
             <div className="w-full h-full">
               <TimeSeriesChart series={liveData} showLegend={false} />

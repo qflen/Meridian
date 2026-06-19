@@ -111,7 +111,7 @@ export function QueryEditor() {
             onFocus={() => setOpen(true)}
             onBlur={() => setTimeout(() => setOpen(false), 150)}
             onKeyDown={handleKeyDown}
-            placeholder="Enter a PromQL query — e.g. rate(http_requests_total[5m])"
+            placeholder="PromQL expression, e.g. rate(http_requests_total[5m])"
             className="input w-full font-mono text-sm"
             spellCheck={false}
           />
@@ -149,17 +149,16 @@ export function QueryEditor() {
           type="submit"
           disabled={loading || !input.trim()}
           aria-busy={loading}
-          aria-label={loading ? 'Running query' : 'Execute query'}
-          className="btn-primary flex items-center gap-2 disabled:opacity-50"
+          aria-label={loading ? 'Running query' : 'Run query'}
+          className="btn-primary flex items-center gap-2 shrink-0"
         >
-          {loading ? (
-            <span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full motion-safe:animate-spin" />
-          ) : (
-            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
-            </svg>
+          {loading && (
+            <span
+              aria-hidden="true"
+              className="inline-block w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full motion-safe:animate-spin"
+            />
           )}
-          Execute
+          Run
         </button>
       </form>
 

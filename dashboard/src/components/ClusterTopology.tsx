@@ -2,6 +2,7 @@ import { useRef, useEffect, useCallback } from 'react';
 import { ClusterNode } from '../types';
 import { useDashboard } from '../state/DashboardContext';
 import { Panel } from './Panel';
+import { Placeholder } from './Placeholder';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
 import { CATEGORICAL } from '../utils/chartPalette';
@@ -156,7 +157,9 @@ export function ClusterTopology() {
     const colors = getCanvasColors(canvas);
     const cx = w / 2;
     const cy = h / 2;
-    const radius = Math.min(w, h) * 0.25;
+    const radius = Math.min(w, h) * 0.32;
+
+    if (nodes.length === 0) return;
 
     // Draw ring
     ctx.strokeStyle = colors.gridColor;
@@ -220,15 +223,15 @@ export function ClusterTopology() {
       ctx.fillText(node.id, nx, ly);
     });
 
-    // Center label
+    // Center label: the member count, correctly pluralised.
     ctx.fillStyle = colors.text;
-    ctx.font = canvasFont(14, { weight: 600 });
+    ctx.font = canvasFont(16, { weight: 500 });
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(`${nodes.length}`, cx, cy - 6);
+    ctx.fillText(`${nodes.length}`, cx, cy - 7);
     ctx.fillStyle = colors.textMuted;
     ctx.font = canvasFont(10, { family: 'sans' });
-    ctx.fillText('services', cx, cy + 8);
+    ctx.fillText(nodes.length === 1 ? 'node' : 'nodes', cx, cy + 9);
   }, []);
 
   // Single coalesced rAF driver: render() never schedules itself, so a repaint
@@ -265,21 +268,34 @@ export function ClusterTopology() {
     [],
   );
 
+  // Legend only the roles actually present, in a fixed pipeline order, so a
+  // single-binary node does not sit under a legend for five services.
+  const presentRoles = Object.keys(ROLE_COLORS).filter(
+    (role) => role !== 'unknown' && nodes.some((n) => n.role === role),
+  );
+  const active = nodes.filter((n) => n.state === 'active').length;
+  const meta = nodes.length > 0 ? `${active} / ${nodes.length} active` : null;
+
   return (
-    <Panel tier="secondary" title="Cluster Topology" bodyHeight={PANEL_BODY.monitor}>
-      <div ref={containerRef} className="w-full flex-1 min-h-0">
+    <Panel tier="secondary" title="Cluster Topology" meta={meta} bodyHeight={PANEL_BODY.monitor}>
+      <div ref={containerRef} className="relative w-full flex-1 min-h-0">
         <canvas ref={canvasRef} className="block w-full h-full" />
+        {nodes.length === 0 && (
+          <div className="pointer-events-none absolute inset-0">
+            <Placeholder title="No cluster members reported yet." hint="Nodes appear on the ring as they join." />
+          </div>
+        )}
       </div>
-      <div className="flex gap-3 mt-2 justify-center flex-wrap">
-        {Object.entries(ROLE_COLORS)
-          .filter(([role]) => role !== 'unknown')
-          .map(([role, color]) => (
+      {presentRoles.length > 0 && (
+        <div className="flex gap-x-4 gap-y-1 mt-2 justify-center flex-wrap">
+          {presentRoles.map((role) => (
             <div key={role} className="flex items-center gap-1.5">
-              <RoleGlyph role={role} color={color} />
+              <RoleGlyph role={role} color={ROLE_COLORS[role]} />
               <span className="text-xs capitalize text-muted">{role}</span>
             </div>
           ))}
-      </div>
+        </div>
+      )}
     </Panel>
   );
 }

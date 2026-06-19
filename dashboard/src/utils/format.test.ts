@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatBytes, formatNumber, formatDuration, formatTime } from './format';
+import { formatBytes, formatNumber, formatDuration, formatTime, formatMillis } from './format';
 
 describe('formatBytes', () => {
   it('prints raw bytes with no decimal', () => {
@@ -89,5 +89,19 @@ describe('formatTime', () => {
 
   it('omits seconds when asked (two fields)', () => {
     expect(formatTime(ts, { seconds: false }).split(':').length).toBe(2);
+  });
+});
+
+describe('formatMillis', () => {
+  it('rounds to the precision a reader can use', () => {
+    expect(formatMillis(0.4)).toBe('<1 ms');
+    expect(formatMillis(3.456)).toBe('3.5 ms');
+    expect(formatMillis(135.334)).toBe('135 ms');
+    expect(formatMillis(1234)).toBe('1.23 s');
+  });
+
+  it('prints -- for bad input', () => {
+    expect(formatMillis(NaN)).toBe('--');
+    expect(formatMillis(-1)).toBe('--');
   });
 });

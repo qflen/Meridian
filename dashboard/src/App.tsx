@@ -14,7 +14,7 @@ import { ThemeToggle } from './components/ThemeToggle';
 import { Panel } from './components/Panel';
 import { Placeholder } from './components/Placeholder';
 import { ConnectionStatus } from './types';
-import { formatDuration, formatNumber } from './utils/format';
+import { formatDuration, formatMillis, formatNumber } from './utils/format';
 import { PANEL_BODY } from './utils/layout';
 
 function connectionDotClass(status: ConnectionStatus): string {
@@ -50,7 +50,7 @@ function ConnectionBanner({ status }: { status: ConnectionStatus }) {
     <div role="status" aria-live="polite" className="border-b border-warn/30 bg-warn/10 text-warn">
       <div className="max-w-[1600px] mx-auto px-4 py-1.5 flex items-center gap-2 text-xs">
         <span className="w-1.5 h-1.5 rounded-full bg-warn motion-safe:animate-pulse" aria-hidden="true" />
-        Connection to the server was lost — reconnecting…
+        Connection to the server was lost. Reconnecting…
       </div>
     </div>
   );
@@ -103,7 +103,7 @@ function Dashboard() {
             {' · '}
             <span className="text-text">{formatNumber(result.stats.samplesFetched)}</span> samples
             {' · '}
-            <span className="text-text">{result.stats.executionMs}</span> ms
+            <span className="text-text">{formatMillis(result.stats.executionMs)}</span>
           </>
         )}
       </>
@@ -124,9 +124,9 @@ function Dashboard() {
               <line x1="9" y1="16" x2="23" y2="16" strokeWidth="1.4" strokeLinecap="round" />
               <circle cx="16" cy="10.5" r="1.9" fill="currentColor" stroke="none" />
             </svg>
-            <div>
-              <h1 className="text-base font-bold tracking-tight">Meridian</h1>
-              <p className="text-2xs -mt-0.5 text-muted">Distributed Time-Series Database</p>
+            <div className="leading-tight">
+              <h1 className="text-base font-semibold tracking-tight text-text">Meridian</h1>
+              <p className="text-2xs text-muted">Distributed time-series database</p>
             </div>
           </div>
 
@@ -148,7 +148,7 @@ function Dashboard() {
             {/* Uptime */}
             {state.stats && Number.isFinite(state.stats.uptimeSeconds) && (
               <span className="text-xs text-muted tabular-nums">
-                Up {formatDuration(state.stats.uptimeSeconds)}
+                up <span className="font-mono text-text">{formatDuration(state.stats.uptimeSeconds)}</span>
               </span>
             )}
 
@@ -183,7 +183,7 @@ function Dashboard() {
             <div className="relative flex-1 min-h-0">
               <TimeSeriesChart series={chartSeries} variant="instrument" />
               {state.queryLoading && (
-                <div className="pointer-events-none absolute top-2 left-2 flex items-center gap-1.5 rounded border bg-surface px-2 py-1 text-2xs font-mono text-muted">
+                <div className="pointer-events-none absolute top-2 left-14 flex items-center gap-1.5 rounded border bg-surface px-2 py-1 text-2xs font-mono text-muted">
                   <span className="h-3 w-3 rounded-full border border-muted/30 border-t-accent motion-safe:animate-spin" />
                   Running…
                 </div>
@@ -207,7 +207,7 @@ function Dashboard() {
               title="Run a query to plot a series."
               hint={
                 <>
-                  Enter a PromQL expression above — e.g.{' '}
+                  Enter a PromQL expression above, for example{' '}
                   <code className="font-mono text-text">rate(http_requests_total[5m])</code>.
                 </>
               }
@@ -241,8 +241,8 @@ function Dashboard() {
 
       {/* Footer */}
       <footer className="border-t mt-8">
-        <div className="max-w-[1600px] mx-auto px-4 py-3 text-xs text-muted">
-          Meridian v0.2.0 — distributed time-series database
+        <div className="max-w-[1600px] mx-auto px-4 py-3 flex items-center justify-between gap-3 text-xs text-muted">
+          <span>Meridian <span className="font-mono tabular-nums">v0.2.0</span></span>
         </div>
       </footer>
     </div>

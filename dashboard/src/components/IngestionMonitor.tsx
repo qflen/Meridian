@@ -52,43 +52,30 @@ export function IngestionMonitor() {
       : highWater > 0 && depth >= highWater
         ? 'bg-warn'
         : 'bg-accent';
-  const dropColor = dropped > 0 ? 'text-warn' : 'text-muted';
 
   return (
     <Panel tier="secondary" title="Ingestion Monitor" bodyHeight={PANEL_BODY.monitor}>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
-        <div>
-          <div className="stat-value">{stats ? stats.ingestionRate.toLocaleString() : '--'}</div>
-          <div className="stat-label">samples/sec</div>
-        </div>
-        <div>
-          <div className="stat-value">{stats ? stats.activeSeries.toLocaleString() : '--'}</div>
-          <div className="stat-label">active series</div>
-        </div>
-        <div>
-          <div className="stat-value">{stats ? formatBytes(stats.memoryBytes) : '--'}</div>
-          <div className="stat-label">memory</div>
-        </div>
-        <div>
-          <div className="stat-value">{stats ? formatBytes(stats.walBytes) : '--'}</div>
-          <div className="stat-label">WAL size</div>
-        </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-3 mb-4">
+        <Stat value={stats ? formatNumber(stats.ingestionRate) : '--'} label="samples/s" />
+        <Stat value={stats ? formatNumber(stats.activeSeries) : '--'} label="active series" />
+        <Stat value={stats ? formatBytes(stats.memoryBytes) : '--'} label="memory" />
+        <Stat value={stats ? formatBytes(stats.walBytes) : '--'} label="WAL size" />
       </div>
 
       {/* Write-path backpressure (ADR-023): bounded queue depth vs capacity, plus
           cumulative drops and the derived shed rate. A spike fills the bar; once it
           reaches the cap, load is shed and the drop counters move. */}
-      <div className="mb-3">
-        <div className="flex items-baseline justify-between gap-2 mb-1">
+      <div className="mb-4">
+        <div className="flex items-baseline justify-between gap-2 mb-1.5">
           <span className="stat-label">ingest queue</span>
           <span className="font-mono text-2xs tabular-nums text-muted">
             <span className="text-text">{stats ? formatNumber(depth) : '--'}</span>
             {' / '}
-            {stats ? formatNumber(capacity) : '--'} samples
+            {stats ? formatNumber(capacity) : '--'}
           </span>
         </div>
         <div
-          className="h-1.5 w-full rounded-full bg-border/50 overflow-hidden"
+          className="track"
           role="meter"
           aria-label="ingest queue depth"
           aria-valuemin={0}
@@ -97,28 +84,38 @@ export function IngestionMonitor() {
         >
           <div className={`h-full ${barColor}`} style={{ width: `${pct}%` }} />
         </div>
-        <div className="flex items-baseline justify-between gap-2 mt-1">
-          <span className="font-mono text-2xs tabular-nums text-muted">
-            drops <span className={dropColor}>{formatNumber(dropped)}</span>
+        <div className="flex items-baseline justify-between gap-2 mt-1.5 font-mono text-2xs tabular-nums text-muted">
+          <span>
+            <span className={dropped > 0 ? 'text-warn' : 'text-text'}>{formatNumber(dropped)}</span> dropped
           </span>
-          {dropRate > 0 && (
-            <span className="font-mono text-2xs tabular-nums text-crit">{formatNumber(dropRate)}/s shed</span>
-          )}
+          {dropRate > 0 && <span className="text-crit">{formatNumber(dropRate)}/s shed</span>}
         </div>
       </div>
 
+      <div className="flex items-baseline justify-between gap-2 mb-1">
+        <span className="stat-label">throughput</span>
+        <span className="font-mono text-2xs text-muted">samples/s</span>
+      </div>
       <div className="flex-1 min-h-0">
         {rateHistory.length > 0 ? (
           <TimeSeriesChart
-            series={[{ label: 'Ingestion Rate', samples: rateHistory }]}
+            series={[{ label: 'Ingestion rate', samples: rateHistory }]}
             showLegend={false}
-            yLabel="samples/s"
-            title="Ingestion Throughput"
+            baseline="zero"
           />
         ) : (
           <Placeholder title="No throughput recorded yet." hint="The ingestion rate plots here once samples arrive." />
         )}
       </div>
     </Panel>
+  );
+}
+
+function Stat({ value, label }: { value: string; label: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="stat-value">{value}</div>
+      <div className="stat-label">{label}</div>
+    </div>
   );
 }

@@ -102,10 +102,7 @@ export function AlertsPanel() {
 
   return (
     <Panel tier="secondary" title="Anomalies" meta={meta} bodyHeight={PANEL_BODY.ticker}>
-      <div
-        className="flex-1 min-h-0 overflow-y-auto font-mono text-xs tabular-nums space-y-px"
-        aria-label="Recent anomalies"
-      >
+      <div className="flex-1 min-h-0 overflow-y-auto space-y-px" aria-label="Recent anomalies">
         {anomalies.length === 0 ? (
           <Placeholder
             title="No anomalies detected."
@@ -119,23 +116,25 @@ export function AlertsPanel() {
   );
 }
 
+// Fixed column widths: value / vs / baseline / score / state line up down the
+// strip no matter how long any one figure is.
 function AnomalyRow({ a }: { a: Anomaly }) {
   const token = statusToken(a);
   const resolved = a.state === 'resolved';
   return (
-    <div
-      className={`flex items-center gap-2 px-2 py-1 rounded cursor-default transition-colors hover:bg-text/5 ${
-        resolved ? 'opacity-60' : ''
-      }`}
-    >
+    <div className={`readout-row ${resolved ? 'opacity-60' : ''}`}>
       <span className={`w-1.5 h-1.5 shrink-0 rounded-full ${token.dot}`} aria-hidden="true" />
-      <span className="w-20 shrink-0 whitespace-nowrap text-muted">{formatTime(a.timestamp)}</span>
-      <span className="flex-1 min-w-0 truncate text-text">{a.series}</span>
-      <span className="hidden shrink-0 text-right text-muted sm:inline">
-        {formatNumber(a.value)} <span className="text-muted/60">vs</span> {formatNumber(a.baseline)}
+      <span className="w-16 shrink-0 text-muted">{formatTime(a.timestamp)}</span>
+      <span className="flex-1 min-w-0 truncate text-text" title={a.series}>
+        {a.series}
+      </span>
+      <span className="hidden sm:flex shrink-0 items-baseline">
+        <span className="w-16 text-right text-text">{formatNumber(a.value)}</span>
+        <span className="w-8 text-center text-muted/60">vs</span>
+        <span className="w-16 text-right text-muted">{formatNumber(a.baseline)}</span>
       </span>
       <span className={`w-14 shrink-0 text-right ${token.text}`}>{formatScore(a.score)}σ</span>
-      <span className={`w-16 shrink-0 text-right text-2xs uppercase tracking-wide ${token.text}`}>
+      <span className={`w-14 shrink-0 text-right text-2xs uppercase tracking-wide ${token.text}`}>
         {resolved ? 'cleared' : a.severity}
       </span>
     </div>

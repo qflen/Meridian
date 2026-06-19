@@ -1,102 +1,66 @@
-import { useRef, useEffect, useCallback } from 'react';
 import { useDashboard } from '../state/DashboardContext';
 import { Panel } from './Panel';
-import { getCanvasColors } from '../utils/canvasColors';
-import { canvasFont } from '../utils/canvasFont';
 import { compressionRatio } from '../utils/compression';
 import { formatBytes } from '../utils/format';
 import { PANEL_BODY } from '../utils/layout';
 
+/**
+ * Gorilla compression as a direct size comparison: the raw footprint is the
+ * full track, the compressed footprint the accent fill, and the ratio between
+ * them is the headline figure. No gauge; the two bars are the measurement.
+ */
 export function CompressionStats() {
   const { state } = useDashboard();
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
-
   const stats = state.stats;
-  const ratio = stats ? compressionRatio(stats.rawBytes, stats.compressedBytes) : 0;
-
-  const render = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    ctx.scale(dpr, dpr);
-    ctx.clearRect(0, 0, w, h);
-
-    const colors = getCanvasColors(canvas);
-    const cx = w / 2;
-    const cy = h / 2 + 8;
-    const r = Math.min(w, h) * 0.35;
-
-    // Background arc
-    ctx.lineWidth = 10;
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = colors.gridColor;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, Math.PI * 0.8, Math.PI * 2.2);
-    ctx.stroke();
-
-    // Ratio arc — the sweep length encodes the ratio; the color is the single
-    // accent, not a decorative rainbow. (~30x covers head + flushed blocks.)
-    const maxRatio = 30;
-    const progress = Math.min(ratio / maxRatio, 1);
-    const startAngle = Math.PI * 0.8;
-    const endAngle = startAngle + progress * Math.PI * 1.4;
-
-    ctx.strokeStyle = colors.accent;
-    ctx.lineWidth = 10;
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, startAngle, endAngle);
-    ctx.stroke();
-
-    // Center text
-    ctx.fillStyle = colors.text;
-    ctx.font = canvasFont(22, { weight: 600 });
-    ctx.textAlign = 'center';
-    ctx.fillText(ratio > 0 ? `${ratio.toFixed(1)}x` : '--', cx, cy + 2);
-    ctx.fillStyle = colors.textMuted;
-    ctx.font = canvasFont(10, { family: 'sans' });
-    ctx.fillText('compression ratio', cx, cy + 18);
-  }, [ratio]);
-
-  useEffect(() => {
-    render();
-  }, [render]);
-
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    const ro = new ResizeObserver(() => render());
-    ro.observe(container);
-    return () => ro.disconnect();
-  }, [render]);
+  const raw = stats?.rawBytes ?? 0;
+  const compressed = stats?.compressedBytes ?? 0;
+  const ratio = stats ? compressionRatio(raw, compressed) : 0;
+  const compressedPct = raw > 0 ? Math.min(100, (compressed / raw) * 100) : 0;
 
   return (
     <Panel tier="tertiary" title="Gorilla Compression" bodyHeight={PANEL_BODY.compact}>
-      <div ref={containerRef} className="flex-1 min-h-0">
-        <canvas ref={canvasRef} className="block w-full h-full" />
-      </div>
-      <div className="grid grid-cols-2 gap-3 mt-2">
-        <div className="text-center">
-          <div className="text-sm font-bold font-mono tabular-nums text-text">
-            {stats ? formatBytes(stats.rawBytes) : '--'}
-          </div>
-          <div className="stat-label">raw size</div>
+      <div className="flex-1 min-h-0 flex flex-col justify-between">
+        <div>
+          <div className="stat-value">{ratio > 0 ? `${ratio.toFixed(1)}x` : '--'}</div>
+          <div className="stat-label">compression ratio</div>
         </div>
-        <div className="text-center">
-          <div className="text-sm font-bold font-mono tabular-nums text-accent">
-            {stats ? formatBytes(stats.compressedBytes) : '--'}
-          </div>
-          <div className="stat-label">compressed</div>
+        <div className="space-y-3">
+          <SizeBar label="raw" value={stats ? formatBytes(raw) : '--'} pct={raw > 0 ? 100 : 0} fill="bg-muted/50" />
+          <SizeBar
+            label="compressed"
+            value={stats ? formatBytes(compressed) : '--'}
+            pct={compressedPct}
+            fill="bg-accent"
+            valueClass="text-accent"
+          />
         </div>
       </div>
     </Panel>
+  );
+}
+
+function SizeBar({
+  label,
+  value,
+  pct,
+  fill,
+  valueClass = 'text-text',
+}: {
+  label: string;
+  value: string;
+  pct: number;
+  fill: string;
+  valueClass?: string;
+}) {
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-2 mb-1.5">
+        <span className="stat-label">{label}</span>
+        <span className={`font-mono text-2xs tabular-nums ${valueClass}`}>{value}</span>
+      </div>
+      <div className="track" role="meter" aria-label={`${label} size`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct)}>
+        <div className={`h-full ${fill}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
   );
 }

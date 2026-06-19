@@ -551,8 +551,9 @@ AI-default looks as well (near-black + acid accent; cream + serif + terracotta).
   lifted shadow. The header is solid, not blurred. (Panel tiers / hierarchy are
   deferred.)
 - **Decoration removed (it encoded nothing).** All canvas glow (`shadowBlur`) on
-  lines, bars, and nodes; the rainbow compression-gauge gradient (replaced by a
-  single-accent arc whose sweep length honestly encodes the ratio) and the indigo
+  lines, bars, and nodes; the rainbow compression-gauge gradient (first replaced
+  by a single-accent arc, later by two raw-vs-compressed size bars: the arc's 30x
+  cap was arbitrary and its centre label collided with the sweep) and the indigo
   bar gradient; the meaningless zebra stripe behind retention lanes; the header
   FPS/frameTime/dropped meter and the `useFrameMetrics` rAF loop it drove (the
   last always-on animation — an idle tab now does ~zero rAF); and the boastful
@@ -594,10 +595,12 @@ A consistent instrument *needs* a hierarchy and one bold focal point.
 - **Hierarchy through size, not decoration.** A `Panel` component renders one
   surface in three tiers — `primary` (the query bar and result), `secondary`
   (live monitors), `tertiary` (dense readouts) — differentiated only by padding,
-  heading scale, and an accent eyebrow on the primary. No tier adds shadow or
-  glow. A single `PANEL_BODY` scale on an 8px module replaces the per-panel magic
-  heights; charts and lists size intrinsically (`flex-1`) inside a fixed body, so
-  panels in a row align without anyone hard-coding a height.
+  heading scale, and a small eyebrow on the primary (set in the accent at first,
+  later muted: the accent is reserved for live data and focus, per ADR-020). No
+  tier adds shadow or glow. A single `PANEL_BODY` scale on an 8px module replaces
+  the per-panel magic heights; charts and lists size intrinsically (`flex-1`)
+  inside a fixed body, so panels in a row align without anyone hard-coding a
+  height.
 - **One signature, the chart.** An `instrument` variant of `TimeSeriesChart` is
   used by the *single* primary chart and nowhere else (boldness spent once). It
   draws a fine graticule (faint minor subdivisions under major lines), instrument

@@ -6,6 +6,10 @@ const THEMES: { value: Theme; label: string; icon: string }[] = [
   { value: 'light', label: 'Light', icon: 'M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z' },
 ];
 
+/**
+ * A two-way segmented control. The selected segment lifts on a neutral tint
+ * rather than the accent, so the header keeps the accent for live data alone.
+ */
 export function ThemeToggle() {
   const { state, dispatch } = useDashboard();
 
@@ -17,26 +21,27 @@ export function ThemeToggle() {
   };
 
   return (
-    <div role="group" aria-label="Color theme" className="flex items-center gap-1 rounded-md p-0.5 border">
-      {THEMES.map((t) => (
-        <button
-          key={t.value}
-          type="button"
-          onClick={() => setTheme(t.value)}
-          title={`${t.label} theme`}
-          aria-label={`${t.label} theme`}
-          aria-pressed={state.theme === t.value}
-          className={`rounded p-1.5 transition-colors ${
-            state.theme === t.value
-              ? 'bg-accent text-white'
-              : 'text-muted hover:text-text'
-          }`}
-        >
-          <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
-            <path strokeLinecap="round" strokeLinejoin="round" d={t.icon} />
-          </svg>
-        </button>
-      ))}
+    <div role="group" aria-label="Color theme" className="flex items-center gap-0.5 rounded-md p-0.5 border">
+      {THEMES.map((t) => {
+        const active = state.theme === t.value;
+        return (
+          <button
+            key={t.value}
+            type="button"
+            onClick={() => setTheme(t.value)}
+            title={`${t.label} theme`}
+            aria-label={`${t.label} theme`}
+            aria-pressed={active}
+            className={`rounded p-1.5 transition-colors ${
+              active ? 'bg-text/10 text-text' : 'text-muted hover:text-text'
+            }`}
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.75} aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" d={t.icon} />
+            </svg>
+          </button>
+        );
+      })}
     </div>
   );
 }

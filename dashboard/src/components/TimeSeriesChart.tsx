@@ -5,6 +5,7 @@ import { canvasFont } from '../utils/canvasFont';
 import { formatNumber, formatTime } from '../utils/format';
 import { CATEGORICAL } from '../utils/chartPalette';
 import { nearestSampleIndex, nearestSample } from '../utils/nearestSample';
+import { niceTicks, formatTick } from '../utils/ticks';
 
 interface SeriesData {
   label: string;
@@ -17,14 +18,18 @@ interface Props {
   showGrid?: boolean;
   showLegend?: boolean;
   animated?: boolean;
-  yLabel?: string;
-  title?: string;
   /**
    * `instrument` is the signature treatment — a finer graticule, instrument
    * tick marks, and a cursor crosshair with a live readout. Reserved for the
    * one primary chart; every other chart stays `plain` and quiet.
    */
   variant?: 'plain' | 'instrument';
+  /**
+   * `auto` fits the y-axis to the data; `zero` anchors it at zero so a rate or
+   * count reads against its true baseline instead of a magnified band around a
+   * near-constant value.
+   */
+  baseline?: 'auto' | 'zero';
 }
 
 /** Plot geometry shared between the base render and the crosshair pass. */
@@ -50,15 +55,17 @@ const prefersReducedMotion = () =>
   window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 const MAX_READOUT_ROWS = 10;
+const LEGEND_ROW_H = 16;
+const LEGEND_SWATCH_W = 12;
+const MAX_LEGEND_ITEMS = 12;
 
 export function TimeSeriesChart({
   series,
   showGrid = true,
   showLegend = true,
   animated = true,
-  yLabel,
-  title,
   variant = 'plain',
+  baseline = 'auto',
 }: Props) {
   const instrument = variant === 'instrument';
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -99,26 +106,13 @@ export function TimeSeriesChart({
     // Absolute transform (not the cumulative ctx.scale): since the backing store
     // is no longer cleared each frame, a cumulative scale would compound.
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    const legendRows = showLegend && series.length > 0 ? Math.ceil(series.length / 3) : 0;
-    const pad = { top: title ? 32 : 16, right: 16, bottom: 28 + legendRows * 16, left: 56 };
-    const plotW = w - pad.left - pad.right;
-    const plotH = h - pad.top - pad.bottom;
+    ctx.clearRect(0, 0, w, h);
 
     const colors = getCanvasColors(canvas);
     // The primary/live trace takes the single accent; extra series fall back to
     // the restrained categorical secondaries.
     const palette = [colors.accent, ...CATEGORICAL];
     paletteRef.current = palette;
-
-    ctx.clearRect(0, 0, w, h);
-
-    if (title) {
-      ctx.fillStyle = colors.textMuted;
-      ctx.font = canvasFont(11, { family: 'sans' });
-      ctx.textAlign = 'left';
-      ctx.fillText(title, pad.left, 14);
-    }
 
     // Compute data bounds
     let minT = Infinity, maxT = -Infinity, minV = Infinity, maxV = -Infinity;
@@ -138,29 +132,59 @@ export function TimeSeriesChart({
       return;
     }
 
-    // Padding for Y range
-    const vRange = maxV - minV || 1;
-    minV -= vRange * 0.05;
-    maxV += vRange * 0.05;
+    // Y range: breathe 5% around the data, then snap to nice ticks. A zero
+    // baseline pins the floor at 0 whenever the data is non-negative.
+    const spread = maxV - minV || Math.abs(maxV) * 0.1 || 1;
+    let lo = minV - spread * 0.05;
+    let hi = maxV + spread * 0.05;
+    if (baseline === 'zero' && minV >= 0) lo = 0;
+    if (minV >= 0 && lo < 0) lo = 0;
+
+    // Legend rows are laid out below the time axis; the gutter grows per row.
+    const legendItems = showLegend ? Math.min(series.length, MAX_LEGEND_ITEMS) : 0;
+    const legendRows = legendItems > 0 ? Math.ceil(legendItems / 3) : 0;
+    const pad = {
+      top: 12,
+      right: 12,
+      bottom: 22 + (legendRows > 0 ? 6 + legendRows * LEGEND_ROW_H : 0),
+      left: 36,
+    };
+
+    // Ticks: about one per 40px vertically, one per 110px horizontally.
+    const provisionalPlotH = h - pad.top - pad.bottom;
+    const yCount = Math.max(2, Math.min(6, Math.floor(provisionalPlotH / 40)));
+    const yAxis = niceTicks(lo, hi, yCount);
+    minV = yAxis.min;
+    maxV = yAxis.max;
+
+    // Size the left gutter to the widest tick label so labels never collide
+    // with the plot frame or each other.
+    ctx.font = canvasFont(10);
+    const yLabels = yAxis.ticks.map((v) => formatTick(v, yAxis.step));
+    const widest = yLabels.reduce((m, l) => Math.max(m, ctx.measureText(l).width), 0);
+    pad.left = Math.max(pad.left, Math.ceil(widest) + (instrument ? 14 : 12));
+
+    const plotW = w - pad.left - pad.right;
+    const plotH = h - pad.top - pad.bottom;
     const tRange = maxT - minT || 1;
 
     geomRef.current = { pad, plotW, plotH, minT, tRange, minV, maxV };
 
     const toX = (t: number) => pad.left + ((t - minT) / tRange) * plotW;
     const toY = (v: number) => pad.top + plotH - ((v - minV) / (maxV - minV)) * plotH;
+    const plotBottom = pad.top + plotH;
 
     // Grid + axes
     if (showGrid) {
-      const yTicks = 5;
-      const xTicks = Math.min(6, Math.max(2, Math.floor(plotW / 100)));
+      const xTicks = Math.max(2, Math.min(6, Math.floor(plotW / 110)));
 
       // Minor graticule subdivisions (instrument only): one faint line between
       // each pair of majors, both axes.
       if (instrument) {
         ctx.strokeStyle = colors.gridFaint;
         ctx.lineWidth = 0.5;
-        for (let i = 0; i < yTicks; i++) {
-          const y = toY(minV + ((i + 0.5) / yTicks) * (maxV - minV));
+        for (let i = 0; i < yAxis.ticks.length - 1; i++) {
+          const y = toY((yAxis.ticks[i] + yAxis.ticks[i + 1]) / 2);
           ctx.beginPath();
           ctx.moveTo(pad.left, y);
           ctx.lineTo(pad.left + plotW, y);
@@ -170,16 +194,14 @@ export function TimeSeriesChart({
           const x = toX(minT + ((i + 0.5) / xTicks) * tRange);
           ctx.beginPath();
           ctx.moveTo(x, pad.top);
-          ctx.lineTo(x, pad.top + plotH);
+          ctx.lineTo(x, plotBottom);
           ctx.stroke();
         }
       }
 
       // Major lines + tabular-mono labels + instrument tick marks
-      ctx.strokeStyle = colors.gridColor;
       ctx.lineWidth = 0.5;
-      for (let i = 0; i <= yTicks; i++) {
-        const v = minV + (i / yTicks) * (maxV - minV);
+      yAxis.ticks.forEach((v, i) => {
         const y = toY(v);
         ctx.strokeStyle = colors.gridColor;
         ctx.beginPath();
@@ -196,41 +218,35 @@ export function TimeSeriesChart({
         ctx.fillStyle = colors.textMuted;
         ctx.font = canvasFont(10);
         ctx.textAlign = 'right';
-        ctx.fillText(formatNumber(v), pad.left - (instrument ? 8 : 6), y + 3);
-      }
+        ctx.textBaseline = 'middle';
+        ctx.fillText(yLabels[i], pad.left - (instrument ? 8 : 6), y);
+      });
 
+      // Time labels: the first is left-aligned and the last right-aligned so
+      // neither runs past the plot edge. A span under ten minutes labels to the
+      // second, otherwise every tick would read the same minute.
+      const seconds = tRange < 10 * 60 * 1000;
+      ctx.textBaseline = 'alphabetic';
       for (let i = 0; i <= xTicks; i++) {
         const t = minT + (i / xTicks) * tRange;
         const x = toX(t);
         ctx.strokeStyle = colors.gridColor;
         ctx.beginPath();
         ctx.moveTo(x, pad.top);
-        ctx.lineTo(x, pad.top + plotH);
+        ctx.lineTo(x, plotBottom);
         ctx.stroke();
         if (instrument) {
           ctx.strokeStyle = colors.gridStrong;
           ctx.beginPath();
-          ctx.moveTo(x, pad.top + plotH);
-          ctx.lineTo(x, pad.top + plotH + 4);
+          ctx.moveTo(x, plotBottom);
+          ctx.lineTo(x, plotBottom + 4);
           ctx.stroke();
         }
         ctx.fillStyle = colors.textMuted;
         ctx.font = canvasFont(10);
-        ctx.textAlign = 'center';
-        ctx.fillText(formatTime(t, { seconds: false }), x, pad.top + plotH + (instrument ? 18 : 16));
+        ctx.textAlign = i === 0 ? 'left' : i === xTicks ? 'right' : 'center';
+        ctx.fillText(formatTime(t, { seconds }), x, plotBottom + 16);
       }
-    }
-
-    // Y-axis label
-    if (yLabel) {
-      ctx.save();
-      ctx.fillStyle = colors.textMuted;
-      ctx.font = canvasFont(10, { family: 'sans' });
-      ctx.translate(12, pad.top + plotH / 2);
-      ctx.rotate(-Math.PI / 2);
-      ctx.textAlign = 'center';
-      ctx.fillText(yLabel, 0, 0);
-      ctx.restore();
     }
 
     // Plot frame
@@ -272,8 +288,8 @@ export function TimeSeriesChart({
         for (let i = 1; i < drawCount; i++) {
           ctx.lineTo(toX(s.samples[i].timestamp), toY(s.samples[i].value));
         }
-        ctx.lineTo(toX(s.samples[drawCount - 1].timestamp), pad.top + plotH);
-        ctx.lineTo(toX(s.samples[0].timestamp), pad.top + plotH);
+        ctx.lineTo(toX(s.samples[drawCount - 1].timestamp), plotBottom);
+        ctx.lineTo(toX(s.samples[0].timestamp), plotBottom);
         ctx.closePath();
         ctx.fill();
         ctx.globalAlpha = 1;
@@ -291,7 +307,7 @@ export function TimeSeriesChart({
       ctx.setLineDash([3, 3]);
       ctx.beginPath();
       ctx.moveTo(cx, pad.top);
-      ctx.lineTo(cx, pad.top + plotH);
+      ctx.lineTo(cx, plotBottom);
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
@@ -315,19 +331,22 @@ export function TimeSeriesChart({
       ctx.restore();
     }
 
-    // Legend — render in rows so items never overlap
-    if (showLegend && series.length > 0) {
-      ctx.font = canvasFont(10, { family: 'sans' });
-      const legendBaseY = pad.top + plotH + 24;
+    // Legend — a short line swatch per series, wrapped into rows beneath the
+    // time labels so the two never share a line.
+    if (legendItems > 0) {
+      ctx.font = canvasFont(10);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      const firstRowY = plotBottom + 22 + 6 + LEGEND_ROW_H / 2;
       let lx = pad.left;
       let row = 0;
 
-      for (let i = 0; i < Math.min(series.length, 12); i++) {
+      for (let i = 0; i < legendItems; i++) {
         const color = series[i].color || palette[i % palette.length];
         const label = series[i].label.length > 28
           ? series[i].label.slice(0, 26) + '..'
           : series[i].label;
-        const itemWidth = 14 + ctx.measureText(label).width + 16;
+        const itemWidth = LEGEND_SWATCH_W + 6 + ctx.measureText(label).width + 16;
 
         // Wrap to next row if this item would overflow
         if (lx + itemWidth > pad.left + plotW && lx > pad.left) {
@@ -335,15 +354,20 @@ export function TimeSeriesChart({
           lx = pad.left;
         }
 
-        const ly = legendBaseY + row * 16;
-        ctx.fillStyle = color;
-        ctx.fillRect(lx, ly - 3, 8, 8);
+        const ly = firstRowY + row * LEGEND_ROW_H;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(lx, ly);
+        ctx.lineTo(lx + LEGEND_SWATCH_W, ly);
+        ctx.stroke();
         ctx.fillStyle = colors.textMuted;
-        ctx.fillText(label, lx + 14, ly + 4);
+        ctx.fillText(label, lx + LEGEND_SWATCH_W + 6, ly);
         lx += itemWidth;
       }
+      ctx.textBaseline = 'alphabetic';
     }
-  }, [series, showGrid, showLegend, animated, yLabel, title, instrument]);
+  }, [series, showGrid, showLegend, animated, instrument, baseline]);
 
   renderRef.current = render;
 
@@ -460,7 +484,7 @@ export function TimeSeriesChart({
           <div className="space-y-0.5">
             {readout.points.slice(0, MAX_READOUT_ROWS).map((p, i) => (
               <div key={`${p.label}-${i}`} className="flex items-center gap-2 text-2xs font-mono tabular-nums">
-                <span className="w-2 h-2 rounded-[1px] shrink-0" style={{ backgroundColor: p.color }} />
+                <span className="w-3 h-0.5 shrink-0" style={{ backgroundColor: p.color }} />
                 <span className="text-muted truncate">{p.label}</span>
                 <span className="ml-auto pl-2 text-text">{formatNumber(p.value)}</span>
               </div>

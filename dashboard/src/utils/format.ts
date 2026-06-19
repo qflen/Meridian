@@ -59,14 +59,29 @@ export function formatDuration(seconds: number): string {
 }
 
 /**
- * Local wall-clock time. Seconds are included by default (live readouts); pass
- * `{ seconds: false }` for coarser HH:MM axis ticks.
+ * Local wall-clock time on a 24-hour clock. Seconds are included by default (live
+ * readouts); pass `{ seconds: false }` for coarser HH:MM axis ticks.
  */
 export function formatTime(ts: number, opts: { seconds?: boolean } = {}): string {
   const withSeconds = opts.seconds !== false;
+  // 24-hour clock: a fixed-width `HH:MM:SS` keeps time columns aligned and
+  // spares every list a ragged AM/PM suffix.
   return new Date(ts).toLocaleTimeString([], {
+    hourCycle: 'h23',
     hour: '2-digit',
     minute: '2-digit',
     ...(withSeconds ? { second: '2-digit' } : {}),
   });
+}
+
+/**
+ * Query execution time: sub-millisecond reads `<1 ms`, single digits keep one
+ * decimal, everything else is a whole number, and a slow query flips to seconds.
+ */
+export function formatMillis(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '--';
+  if (ms < 1) return '<1 ms';
+  if (ms < 10) return `${ms.toFixed(1)} ms`;
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
 }

@@ -53,18 +53,15 @@ export function LiveStream() {
 
   return (
     <Panel tier="secondary" title="Live Stream" meta={connectionChip} bodyHeight={PANEL_BODY.ticker}>
-      <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto font-mono text-xs tabular-nums space-y-px">
+      <div ref={listRef} className="flex-1 min-h-0 overflow-y-auto space-y-px">
         {display.length === 0 && <Placeholder {...emptyCopy(state.connectionStatus)} />}
         {display.map((e) => (
-          <div
-            key={liveRowKey(e)}
-            className="flex items-center gap-2 px-2 py-1 rounded cursor-default transition-colors hover:bg-text/5"
-          >
-            <span className="w-24 shrink-0 whitespace-nowrap text-muted">{formatTime(e.ts)}</span>
-            <span className="flex-1 break-all text-text">{e.key}</span>
-            <span className="text-accent font-medium w-16 text-right shrink-0">
-              {formatNumber(e.value)}
+          <div key={liveRowKey(e)} className="readout-row">
+            <span className="w-16 shrink-0 text-muted">{formatTime(e.ts)}</span>
+            <span className="flex-1 min-w-0 truncate text-text" title={e.key}>
+              {e.key}
             </span>
+            <span className="w-20 shrink-0 text-right text-accent">{formatNumber(e.value)}</span>
           </div>
         ))}
       </div>

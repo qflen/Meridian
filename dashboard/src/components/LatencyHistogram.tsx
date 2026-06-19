@@ -3,12 +3,18 @@ import { Panel } from './Panel';
 import { Placeholder } from './Placeholder';
 import { getCanvasColors } from '../utils/canvasColors';
 import { canvasFont } from '../utils/canvasFont';
+import { formatNumber } from '../utils/format';
+import { niceTicks, formatTick } from '../utils/ticks';
 import { PANEL_BODY } from '../utils/layout';
 
 interface Bucket {
   le: string;
   count: number;
 }
+
+const EMPTY_BUCKETS: Bucket[] = ['1ms', '5ms', '10ms', '25ms', '50ms', '100ms', '250ms', '500ms', '1s'].map(
+  (le) => ({ le, count: 0 }),
+);
 
 export function LatencyHistogram() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -39,23 +45,10 @@ export function LatencyHistogram() {
     return () => clearInterval(interval);
   }, []);
 
-  // Demo buckets when no data
-  const displayBuckets =
-    buckets.length > 0 && buckets.some((b) => b.count > 0)
-      ? buckets
-      : [
-          { le: '1ms', count: 0 },
-          { le: '5ms', count: 0 },
-          { le: '10ms', count: 0 },
-          { le: '25ms', count: 0 },
-          { le: '50ms', count: 0 },
-          { le: '100ms', count: 0 },
-          { le: '250ms', count: 0 },
-          { le: '500ms', count: 0 },
-          { le: '1s', count: 0 },
-        ];
-
+  // Axis scaffolding when no data
+  const displayBuckets = buckets.length > 0 && buckets.some((b) => b.count > 0) ? buckets : EMPTY_BUCKETS;
   const isEmpty = displayBuckets.every((b) => b.count === 0);
+  const total = displayBuckets.reduce((n, b) => n + b.count, 0);
 
   const render = useCallback(() => {
     const canvas = canvasRef.current;
@@ -72,59 +65,71 @@ export function LatencyHistogram() {
     ctx.clearRect(0, 0, w, h);
 
     const colors = getCanvasColors(canvas);
-    const pad = { top: 8, right: 12, bottom: 28, left: 40 };
+    const maxCount = Math.max(...displayBuckets.map((b) => b.count), 1);
+    const yAxis = niceTicks(0, maxCount, Math.max(2, Math.floor((h - 32) / 28)), { integer: true });
+    const yLabels = yAxis.ticks.map((v) => formatTick(v, yAxis.step));
+
+    // The left gutter fits the widest count label.
+    ctx.font = canvasFont(9);
+    const widest = yLabels.reduce((m, l) => Math.max(m, ctx.measureText(l).width), 0);
+    const pad = { top: 8, right: 8, bottom: 22, left: Math.max(24, Math.ceil(widest) + 10) };
     const plotW = w - pad.left - pad.right;
     const plotH = h - pad.top - pad.bottom;
-    const barW = Math.max(4, plotW / displayBuckets.length - 4);
-    const maxCount = Math.max(...displayBuckets.map((b) => b.count), 1);
+    const slotW = plotW / displayBuckets.length;
+    const barW = Math.max(4, slotW - 4);
+    const plotBottom = pad.top + plotH;
 
-    // When every bucket is empty, draw only the bucket axis (faint scaffolding);
-    // the shared Placeholder is overlaid in the DOM, so all empty states match.
-    if (isEmpty) {
-      displayBuckets.forEach((bucket, i) => {
-        const x = pad.left + (i / displayBuckets.length) * plotW + 2;
-        ctx.fillStyle = colors.textMuted;
-        ctx.font = canvasFont(9);
-        ctx.textAlign = 'center';
-        ctx.fillText(bucket.le, x + barW / 2, pad.top + plotH + 14);
-      });
-      return;
-    }
-
+    // Bucket labels: skip every n-th when they would run into each other, so
+    // the axis stays legible at any panel width.
+    const labelW = displayBuckets.reduce((m, b) => Math.max(m, ctx.measureText(b.le).width), 0);
+    const every = Math.max(1, Math.ceil((labelW + 6) / slotW));
+    ctx.fillStyle = colors.textMuted;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
     displayBuckets.forEach((bucket, i) => {
-      const barH = (bucket.count / maxCount) * plotH;
-      const x = pad.left + (i / displayBuckets.length) * plotW + 2;
-      const y = pad.top + plotH - barH;
-
-      // Solid accent bar with a rounded top
-      ctx.fillStyle = colors.accent;
-      const cornerR = Math.min(3, barW / 2);
-      ctx.beginPath();
-      ctx.moveTo(x + cornerR, y);
-      ctx.lineTo(x + barW - cornerR, y);
-      ctx.quadraticCurveTo(x + barW, y, x + barW, y + cornerR);
-      ctx.lineTo(x + barW, y + barH);
-      ctx.lineTo(x, y + barH);
-      ctx.lineTo(x, y + cornerR);
-      ctx.quadraticCurveTo(x, y, x + cornerR, y);
-      ctx.fill();
-
-      // Label
-      ctx.fillStyle = colors.textMuted;
-      ctx.font = canvasFont(9);
-      ctx.textAlign = 'center';
-      ctx.fillText(bucket.le, x + barW / 2, pad.top + plotH + 14);
+      if (i % every !== 0) return;
+      const x = pad.left + i * slotW + slotW / 2;
+      ctx.fillText(bucket.le, x, plotBottom + 14);
     });
 
-    // Y axis ticks
-    ctx.fillStyle = colors.textMuted;
+    // Baseline
+    ctx.strokeStyle = colors.gridStrong;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, plotBottom + 0.5);
+    ctx.lineTo(pad.left + plotW, plotBottom + 0.5);
+    ctx.stroke();
+
+    // When every bucket is empty, draw only the axis scaffolding; the shared
+    // Placeholder is overlaid in the DOM, so all empty states match.
+    if (isEmpty) return;
+
+    // Count gridlines + labels on integer nice ticks (never a repeated value).
     ctx.font = canvasFont(9);
     ctx.textAlign = 'right';
-    for (let i = 0; i <= 4; i++) {
-      const v = Math.round((maxCount / 4) * i);
-      const y = pad.top + plotH - (i / 4) * plotH;
-      ctx.fillText(String(v), pad.left - 6, y + 3);
-    }
+    ctx.textBaseline = 'middle';
+    yAxis.ticks.forEach((v, i) => {
+      const y = plotBottom - (v / yAxis.max) * plotH;
+      if (v > 0) {
+        ctx.strokeStyle = colors.gridColor;
+        ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(pad.left + plotW, y);
+        ctx.stroke();
+      }
+      ctx.fillStyle = colors.textMuted;
+      ctx.fillText(yLabels[i], pad.left - 6, y);
+    });
+
+    displayBuckets.forEach((bucket, i) => {
+      if (bucket.count === 0) return;
+      const barH = (bucket.count / yAxis.max) * plotH;
+      const x = pad.left + i * slotW + (slotW - barW) / 2;
+      const y = plotBottom - barH;
+      ctx.fillStyle = colors.accent;
+      ctx.fillRect(x, y, barW, barH);
+    });
   }, [displayBuckets, isEmpty]);
 
   useEffect(() => {
@@ -139,8 +144,10 @@ export function LatencyHistogram() {
     return () => ro.disconnect();
   }, [render]);
 
+  const meta = isEmpty ? null : `${formatNumber(total)} ${total === 1 ? 'query' : 'queries'}`;
+
   return (
-    <Panel tier="tertiary" title="Query Latency Distribution" bodyHeight={PANEL_BODY.compact}>
+    <Panel tier="tertiary" title="Query Latency" meta={meta} bodyHeight={PANEL_BODY.compact}>
       <div ref={containerRef} className="relative flex-1 min-h-0">
         <canvas ref={canvasRef} className="block w-full h-full" />
         {isEmpty && (

@@ -85,7 +85,7 @@ export function RetentionTimeline() {
     ctx.clearRect(0, 0, w, h);
 
     const colors = getCanvasColors(canvas);
-    const pad = { top: 16, right: 16, bottom: 24, left: 56 };
+    const pad = { top: 8, right: 8, bottom: 22, left: 36 };
     const plotW = w - pad.left - pad.right;
     const plotH = h - pad.top - pad.bottom;
 
@@ -111,7 +111,7 @@ export function RetentionTimeline() {
       ctx.font = canvasFont(9, { family: 'sans' });
       ctx.textAlign = 'right';
       const label = displayBlocks.find((b) => b.tier === tier)?.tierLabel ?? 'raw';
-      ctx.fillText(label, pad.left - 8, y + laneH / 2 + 3);
+      ctx.fillText(label, pad.left - 6, y + laneH / 2 + 3);
 
       // Blocks in this lane
       displayBlocks
@@ -122,7 +122,7 @@ export function RetentionTimeline() {
           const bw = Math.max(x2 - x1, 4);
 
           ctx.fillStyle = color;
-          ctx.globalAlpha = b.id === 'head' ? 0.5 : 0.3;
+          ctx.globalAlpha = b.id === 'head' ? 0.28 : 0.18;
           ctx.fillRect(x1 + 1, y + 4, bw - 2, laneH - 8);
           ctx.globalAlpha = 1;
 
@@ -133,7 +133,7 @@ export function RetentionTimeline() {
           // Block id
           if (bw > 40) {
             ctx.fillStyle = colors.textMuted;
-            ctx.font = canvasFont(8);
+            ctx.font = canvasFont(9);
             ctx.textAlign = 'center';
             ctx.fillText(b.id, x1 + bw / 2, y + laneH / 2 + 3);
           }
@@ -148,14 +148,14 @@ export function RetentionTimeline() {
       ctx.stroke();
     });
 
-    // Time axis
-    const ticks = 5;
+    // Time axis: end labels align inward so neither runs past the plot edge.
+    const ticks = Math.max(2, Math.min(5, Math.floor(plotW / 110)));
     for (let i = 0; i <= ticks; i++) {
       const t = minT + (i / ticks) * tRange;
       const x = pad.left + (i / ticks) * plotW;
       ctx.fillStyle = colors.textMuted;
       ctx.font = canvasFont(9);
-      ctx.textAlign = 'center';
+      ctx.textAlign = i === 0 ? 'left' : i === ticks ? 'right' : 'center';
       ctx.fillText(formatTime(t, { seconds: false }), x, pad.top + plotH + 16);
     }
   }, [displayBlocks]);

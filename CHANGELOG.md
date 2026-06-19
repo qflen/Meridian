@@ -116,6 +116,14 @@ canvas-rendered React dashboard. See [DECISIONS.md](DECISIONS.md) for the full A
   `_FLUSH_INTERVAL` / `_RETENTION`) are set via the environment.
 
 ### Dashboard
+- **Alignment and axis pass**: axes now tick on round steps (20 / 40 / 60, not 62.58 /
+  49.47) with the label gutter sized to its widest label, end time labels aligned inward so
+  none is clipped, and chart legends placed clear of the time axis. Anomaly and live-stream
+  rows use fixed-width columns on a 24-hour clock; the compression readout compares raw
+  and compressed size as two bars instead of an arc gauge; text fields show one focus ring;
+  the ingestion throughput chart is anchored at zero; and the header wordmark is visible
+  again (a `base` colour token had turned Tailwind's `text-base` size into a colour). The
+  README dashboard GIF is re-captured from this build.
 - **"Precision Instrument" design language** (ADR-020, ADR-021): one accent, self-hosted
   fonts, tabular-mono numerics, a signature strip-chart with a cursor crosshair readout,
   dark/light themes, an accessibility floor, and reconnect handling. WAL size is reported in

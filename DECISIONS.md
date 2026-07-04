@@ -2,111 +2,142 @@
 
 ## ADR-001: Go as Implementation Language
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: Need a systems language with good concurrency, fast compilation, and
-single-binary deployment.  
+single-binary deployment.
+
 **Decision**: Go 1.25 with zero CGO dependencies. CI installs the toolchain from
-`go.mod` (`go-version-file`) so the build version never drifts from the module.  
+`go.mod` (`go-version-file`) so the build version never drifts from the module.
+
 **Consequences**: Simple cross-compilation, no shared library issues in containers,
 goroutine-per-connection model fits well.
 
 ## ADR-002: Gorilla Compression for Time-Series Data
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: Time-series data exhibits high temporal locality and value similarity
-that generic compression (gzip, lz4) cannot exploit effectively.  
+that generic compression (gzip, lz4) cannot exploit effectively.
+
 **Decision**: Implement Facebook's Gorilla encoding with delta-of-delta timestamps
 and XOR float encoding. Extended to 64-bit millisecond timestamps (paper uses
-32-bit seconds). 4-byte count header for decoder bootstrapping.  
+32-bit seconds). 4-byte count header for decoder bootstrapping.
+
 **Consequences**: Achieves 20-30x compression on regular metrics vs. 3-5x with
 generic algorithms. Small decoder that can stream without seeking.
 
 ## ADR-003: CRC32-Framed WAL with Segment Rotation
 
-**Status**: Accepted  
-**Context**: Must survive process crashes without losing acknowledged writes.  
+**Status**: Accepted
+
+**Context**: Must survive process crashes without losing acknowledged writes.
+
 **Decision**: Write-ahead log with CRC32 checksums, 8-byte alignment for
-efficient reads, and automatic rotation at 128 MB segments.  
+efficient reads, and automatic rotation at 128 MB segments.
+
 **Consequences**: Crash recovery by replaying WAL. Segment rotation keeps
 individual files manageable and enables garbage collection.
 
 ## ADR-004: Inverted Index with Sorted Slices, Not Roaring Bitmaps
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: Need an inverted index for label-based series lookup. Roaring bitmaps
-are the standard choice but add a dependency.  
+are the standard choice but add a dependency.
+
 **Decision**: Use `map[string]map[string][]uint64` with sorted slices and
-set intersection/union via merge-join.  
+set intersection/union via merge-join.
+
 **Consequences**: Zero external dependencies. Performance is adequate for the
 expected scale (< 100K series). Not optimal for millions of series.
 
 ## ADR-005: JSON-over-TCP Ingestion Protocol
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: Protobuf would be the natural choice for ingestion, but protoc is not
-available in the build environment.  
+available in the build environment.
+
 **Decision**: JSON-over-TCP with newline framing. Same message structure as the
-proto definition for future migration.  
+proto definition for future migration.
+
 **Consequences**: ~3x larger on the wire than protobuf. Simpler debugging with
 netcat/telnet. Easy to switch to protobuf later since struct shapes match.
 
 ## ADR-006: PromQL Subset via Recursive Descent Parser
 
-**Status**: Accepted  
-**Context**: Users expect a familiar query language for time-series databases.  
+**Status**: Accepted
+
+**Context**: Users expect a familiar query language for time-series databases.
+
 **Decision**: Implement a PromQL subset with recursive descent parsing. Supports
 vector/range selectors, label matchers (=, !=, =~, !~), aggregations (sum, avg,
 min, max, count, topk, bottomk), functions (rate, histogram_quantile), binary
-operators, and group-by clauses.  
+operators, and group-by clauses.
+
 **Consequences**: No parser generator dependency. Easy to extend. Covers the
 most common monitoring use cases.
 
 ## ADR-007: Consistent Hash Ring for Data Distribution
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: Need to distribute series across cluster nodes with even load
-balance and minimal disruption during scaling.  
+balance and minimal disruption during scaling.
+
 **Decision**: SHA256-based consistent hash ring with configurable virtual nodes
-(default 64 per node). Series assigned by MetricKey = hash(sorted labels).  
+(default 64 per node). Series assigned by MetricKey = hash(sorted labels).
+
 **Consequences**: Adding/removing a node only redistributes ~1/N of data.
 Virtual nodes smooth out hash distribution.
 
 ## ADR-008: requestAnimationFrame Batching for WebSocket Messages
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: WebSocket messages arrive faster than the display refresh rate.
 Processing each message individually causes excessive React re-renders and
-dropped frames.  
+dropped frames.
+
 **Decision**: Buffer incoming WebSocket messages and flush them in a single batch
-on each requestAnimationFrame callback.  
+on each requestAnimationFrame callback.
+
 **Consequences**: Dashboard maintains 60fps even at high ingestion rates. Slight
 increase in perceived latency (up to 16ms) which is imperceptible.
 
 ## ADR-009: Canvas-Based Chart Rendering, No Chart Library
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: The spec requires zero chart dependencies (no D3, Chart.js,
-Recharts). Charts must render at 60fps for live streaming data.  
+Recharts). Charts must render at 60fps for live streaming data.
+
 **Decision**: Direct Canvas 2D API rendering with custom TimeSeriesChart
 component. Features: area fills, a one-shot load transition, auto-scaling axes,
 and multi-series support. (The original revision also drew decorative glow; that
-was removed under ADR-020.)  
+was removed under ADR-020.)
+
 **Consequences**: Full control over rendering pipeline. No dependency bloat.
 Requires manual hit-testing for interactivity (tooltips, zoom).
 
 ## ADR-010: React Context + useReducer for State Management
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: Dashboard state (theme, time range, query results, live metrics,
-cluster nodes) needs to be shared across many components.  
+cluster nodes) needs to be shared across many components.
+
 **Decision**: Single DashboardContext with useReducer pattern. No external state
-library (Redux, Zustand, etc.).  
+library (Redux, Zustand, etc.).
+
 **Consequences**: Zero dependencies for state management. Action-based updates
 are predictable and debuggable. Adequate for the component count.
 
 ## ADR-011: Three-Tier Downsampling Cascade
 
 **Status**: Accepted (implemented)
+
 **Context**: High-resolution data is expensive to store and slow to scan over long
 ranges: a 30-day view at 5-second resolution is ~518k points per series, far more
 than a screen can show or a user needs. The rollup math (`Rollup`) existed but was
@@ -220,33 +251,41 @@ pass; rollups are regenerable, so the extra on-disk state is never authoritative
 
 ## ADR-012: Single-Binary Architecture
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: Deployment simplicity is a core design goal. Users should be able to
-run `./meridian serve` and have a complete system.  
+run `./meridian serve` and have a complete system.
+
 **Decision**: Single Go binary bundles server, ingestion, query engine, simulator,
-CLI tools, and dashboard static files.  
+CLI tools, and dashboard static files.
+
 **Consequences**: No orchestration required for single-node deployment. Dashboard
 assets are embedded or served from a directory. Trade-off: binary size is larger.
 
 ## ADR-013: Diurnal Simulation with Spike Injection
 
-**Status**: Accepted  
+**Status**: Accepted
+
 **Context**: Testing and demos require realistic-looking metric data, not random
-noise. Real infrastructure exhibits predictable daily patterns.  
+noise. Real infrastructure exhibits predictable daily patterns.
+
 **Decision**: Simulator generates diurnal curves (peak at 14:00 local time) with
 random spike injection (10% probability per host per cycle) and memory drift
-(slow monotonic increase with periodic resets).  
+(slow monotonic increase with periodic resets).
+
 **Consequences**: Dashboard screenshots and demos look realistic. Compression
 benchmarks reflect real-world data patterns.
 
 ## ADR-014: PromQL Evaluation Semantics
 
 **Status**: Accepted
+
 **Context**: The query engine advertised a PromQL subset, but several pieces were
 incorrect rather than merely incomplete: a range window was subtracted twice,
 `rate()` divided by the sample span, `histogram_quantile()` ignored `le` buckets,
 vector÷vector returned the left operand, and `/0` returned `0`. Making the engine
 *correct* required committing to specific semantics.
+
 **Decision**:
 - **Stepped range evaluation → matrix.** `Execute(start, end, step)` evaluates the
   expression as an instant query at each `t` in `{start, start+step, …, end}` and
@@ -283,6 +322,7 @@ vector÷vector returned the left operand, and `/0` returned `0`. Making the engi
   points (floored at 1s); `start > end` is rejected; the step count is capped at
   11000. The cap bounds output size and pre-empts a denial-of-service via
   attacker-controlled `start`/`end`/`step`.
+
 **Consequences**: Evaluation is stepped/range — a query returns a matrix with one
 point per step per series — so `rate(x[5m])`, `sum(...) by (...)`, and `a/b` render
 as smooth multi-point lines rather than single values. The planner's `TimeRange`
@@ -294,6 +334,7 @@ matching, counter resets across windows, and the step-count guard.
 ## ADR-015: Reject Out-of-Order Samples
 
 **Status**: Accepted
+
 **Context**: Samples were appended to a series in arrival order without any ordering
 check, and `WriteBlock` took `Timestamps[0]`/`Timestamps[last]` as a block's min/max
 assuming sorted input. Ingesting `100, 50, 200, 10` therefore produced an *inverted*
@@ -301,7 +342,9 @@ block (`minTime=200, maxTime=10`), which silently dropped overlapping queries
 (`Overlaps` compares against these bounds) and poisoned retention (the enforcer
 deletes by `MaxTime`). A policy was required; the options were reject, sort-on-flush,
 or full out-of-order support.
+
 **Decision**: **Reject**, the Prometheus-classic model.
+
 - A sample with a timestamp strictly older than the series' last is dropped and
   counted in `meridian_out_of_order_samples_total`.
 - A sample whose timestamp equals the series' last is **deduplicated** if its value
@@ -320,6 +363,7 @@ or full out-of-order support.
   accepted into the new head. Blocks may then overlap in time, which the read path
   already handles (it merges and sorts). Cross-flush ordering is intentionally not
   enforced, matching the head-relative out-of-order window of mainstream TSDBs.
+
 **Consequences**: Series stay sorted, so `Timestamps[0]`/`[last]` range checks and
 non-inverted block bounds hold; retention expires correctly. Out-of-order data is
 visibly dropped and counted rather than silently corrupting bounds. Full
@@ -329,6 +373,7 @@ future work.
 ## ADR-016: Crash-Consistent Flush with a Per-Block WAL Low-Water-Mark
 
 **Status**: Accepted
+
 **Context**: `Flush()` ran `WriteBlock(head)` → `head.Reset()` → `wal.Truncate()`
 with no lock spanning the three steps. A sample ingested after the block snapshot but
 before `Reset()` was discarded from the head *and* erased from the WAL by `Truncate()`
@@ -336,6 +381,7 @@ before `Reset()` was discarded from the head *and* erased from the WAL by `Trunc
 next `Open()` to load the block *and* replay the whole WAL — a double-count. Block
 writes were also non-atomic (no temp/rename, nothing fsynced, several ignored I/O
 errors).
+
 **Decision**: A three-phase flush with an atomic in-memory cut and a durable
 low-water-mark.
 1. **Cut (under `db.mu` as writer).** Capture the old head, install a fresh head, and
@@ -360,6 +406,7 @@ low-water-mark.
    cannot record a higher mark that would skip the failed flush's still-uncovered
    segments; that data remains in the WAL and is recovered on the next open. Leftover
    temp block dirs from an interrupted write are removed on open.
+
 **Consequences**: Exactly-once recovery. A crash **before the block is durable**
 leaves no committed block and an un-truncated WAL, so replay rebuilds the data once
 from the WAL (the in-memory cut is lost with the crash, so there is no persistent
@@ -376,13 +423,16 @@ low-water-mark cut — is implemented in ADR-026.
 ## ADR-017: Ingestion Rate as a Windowed Rate, Cumulative Count for the Counter
 
 **Status**: Accepted
+
 **Context**: `TSDB.IngestionRate()` returned the cumulative `ingested` counter. The
 dashboard samples that value once per second and charts it as a rate, so it drew a
 monotonically rising line instead of throughput. Separately, the Prometheus
 exposition needs a *cumulative* `meridian_samples_ingested_total` — a `..._total`
 counter is correct by Prometheus convention (the scraper computes `rate()`). One
 method could not honestly serve both roles.
+
 **Decision**: Split the two concerns.
+
 - `IngestionRate()` returns a **windowed** samples/sec rate: a moving average over
   `RateWindow` (default 5s), fed by a background sampler that records the cumulative
   count every `RateSampleInterval` (default 1s). Idle intervals contribute the same
@@ -394,6 +444,7 @@ method could not honestly serve both roles.
   windowed rate. Wire types stay `int64` (the rate is rounded to whole samples/sec),
   so neither the dashboard nor the inter-service protocol changes. Per-node rates are
   additive, so the gateway sums them into the cluster rate.
+
 **Consequences**: The dashboard charts a true rate that tracks load and falls back to
 ~0 when idle, with no dashboard change. The Prometheus counter remains a proper
 cumulative counter. The reported rate lags a step change by up to the window, and
@@ -404,10 +455,12 @@ rate read ~140/s and fell to 0 within a window of going idle, while
 ## ADR-018: CORS Restricted to Configured Origins (Default Localhost)
 
 **Status**: Accepted
+
 **Context**: Both the monolith and the gateway returned
 `Access-Control-Allow-Origin: *` for every method, POST included. Any web page the
 operator visited could therefore script cross-origin reads and writes against a
 Meridian instance reachable from that browser (e.g. on a private network).
+
 **Decision**: Replace the blanket wildcard with an origin-checked middleware that
 echoes only permitted origins.
 - Default (unconfigured): allow only `localhost` / `127.0.0.1` / `[::1]` origins —
@@ -418,6 +471,7 @@ echoes only permitted origins.
 - The matched origin is reflected back (with `Vary: Origin`) rather than `"*"`, so the
   policy is also correct for credentialed requests. A disallowed cross-origin request
   receives no CORS headers and is blocked by the browser.
+
 **Consequences**: Same-origin dashboard use is unchanged (a same-origin request sends
 no `Origin` header and proceeds normally). Cross-origin browser access now requires
 explicit configuration. The internal service APIs (storage/querier/ingestor) are not
@@ -427,10 +481,12 @@ browser-facing surfaces and keep their permissive CORS; the public entry points
 ## ADR-019: Prometheus /metrics on Every Service
 
 **Status**: Accepted
+
 **Context**: Only the monolith exposed `/metrics`. In the docker-compose topology the
 gateway, querier, storage, ingestor, and compactor had no scrape endpoint, so the
 "cluster" the README advertises could not actually be observed by a
 Prometheus-compatible collector.
+
 **Decision**: Register `/metrics` on every service through shared
 `WriteStorageMetrics`/`WriteServiceMetrics` helpers. Storage nodes expose the full
 storage metrics — the cumulative `meridian_samples_ingested_total`,
@@ -439,6 +495,7 @@ storage bytes by layer, and compression ratio. Every service additionally expose
 `meridian_up` and `meridian_uptime_seconds`, and the gateway reports connected
 WebSocket clients. The monolith handler reuses the same storage helper so a storage
 node emits identical metrics whether run as the monolith or as the storage service.
+
 **Consequences**: The cluster is scrapeable end-to-end and metric names/labels are
 consistent across deployment modes. The endpoints are unauthenticated and intended
 for an internal scrape network (the same trust boundary as the internal RPC APIs).
@@ -446,18 +503,23 @@ for an internal scrape network (the same trust boundary as the internal RPC APIs
 ## ADR-020: Visual Design Language — "Precision Instrument"
 
 **Status**: Accepted
-**Context**: The dashboard was functional but read as templated / AI-generated.
-The concrete tells: the brand palette was verbatim Mantine indigo (`#4c6ef5`);
-every surface used the same glassmorphism (backdrop-blur + lifted shadow +
-`rounded-xl`); charts carried decorative glow and a rainbow compression gradient
-that encoded no scale; `Inter` was named ~30 times but never actually loaded (a
-silent system-font fallback, with the DOM and canvas free to disagree); two
-styling systems coexisted (semantic CSS-var inline styles next to hardcoded
-Tailwind grays monkey-patched per theme); three different `formatBytes` rendered
-the same quantity differently; and the chrome carried a self-congratulatory,
-partly false "60fps" boast backed by an always-on `requestAnimationFrame` meter.
-A single committed point of view was needed — and consistency, not novelty, is
-what removes the generated feel.
+
+**Context**: The dashboard was functional but read as templated / AI-generated. The
+concrete tells:
+- the brand palette was verbatim Mantine indigo (`#4c6ef5`);
+- every surface used the same glassmorphism (backdrop-blur + lifted shadow + `rounded-xl`);
+- charts carried decorative glow and a rainbow compression gradient that encoded no scale;
+- `Inter` was named ~30 times but never actually loaded (a silent system-font fallback,
+  with the DOM and canvas free to disagree);
+- two styling systems coexisted (semantic CSS-var inline styles next to hardcoded Tailwind
+  grays monkey-patched per theme);
+- three different `formatBytes` rendered the same quantity differently;
+- the chrome carried a self-congratulatory, partly false "60fps" boast backed by an
+  always-on `requestAnimationFrame` meter.
+
+A single committed point of view was needed — and consistency, not novelty, is what removes
+the generated feel.
+
 **Decision**: Adopt one design language — *Precision Instrument*
 (mission-console-meets-chronometer: calm, engraved, exact), derived from the name
 *Meridian* (navigation / transit instruments). Deliberately avoid the other two
@@ -501,6 +563,7 @@ AI-default looks as well (near-black + acid accent; cream + serif + terracotta).
   onMouseEnter/Leave hover hacks are gone. `utils/format.ts` is the single source
   for byte / number / duration / time formatting, so identical quantities render
   identically everywhere.
+
 **Consequences**: One coherent identity per theme, verified in both dark and
 light: fonts load over the network (woff2 under `/assets`) and the canvas shares
 the DOM family; there is no Mantine indigo, no glow, and no glassmorphism;
@@ -513,14 +576,20 @@ pass — is delivered in **ADR-021**.
 ## ADR-021: Visual Hierarchy, the Signature Instrument Chart, and the A11y Floor
 
 **Status**: Accepted
-**Context**: ADR-020 committed the "Precision Instrument" language but left the
-identity work for a follow-up: every panel was a uniform `.card` in a flat grid
-(the primary query action and a tertiary stat tile carried identical weight),
-heights were eyeballed magic pixels (`h-[294px]`, canvases pinned to 140/160/180),
-there was no memorable element, the four empty states were worded four different
-ways and drawn at canvas center, the logo was a generic circle-and-rising-line,
-cluster nodes were two-letter codes, and there was no keyboard/focus/reduced-motion
-story. A consistent instrument *needs* a hierarchy and one bold focal point.
+
+**Context**: ADR-020 committed the "Precision Instrument" language but left the identity
+work for a follow-up:
+- every panel was a uniform `.card` in a flat grid (the primary query action and a tertiary
+  stat tile carried identical weight);
+- heights were eyeballed magic pixels (`h-[294px]`, canvases pinned to 140/160/180);
+- there was no memorable element;
+- the four empty states were worded four different ways and drawn at canvas center;
+- the logo was a generic circle-and-rising-line;
+- cluster nodes were two-letter codes;
+- there was no keyboard/focus/reduced-motion story.
+
+A consistent instrument *needs* a hierarchy and one bold focal point.
+
 **Decision**:
 - **Hierarchy through size, not decoration.** A `Panel` component renders one
   surface in three tiers — `primary` (the query bar and result), `secondary`
@@ -560,6 +629,7 @@ story. A consistent instrument *needs* a hierarchy and one bold focal point.
   per-component focus styles, a global `prefers-reduced-motion` reset backs the
   `motion-safe:` utilities, and the layout is responsive to a phone width (header
   wraps, grids stack, stat tiles reflow).
+
 **Consequences**: One coherent, hierarchical identity per theme, verified in dark,
 light, and at a 390px width by driving the live dashboard in a headless browser:
 the crosshair readout tracks the cursor, the empty/loading/error/reconnect states
@@ -569,6 +639,7 @@ one place; everything else stays quiet, which is what makes it land.
 ## ADR-022: Replication — Quorum Writes, Quorum Reads, and Read-Repair
 
 **Status**: Accepted
+
 **Context**: The project claimed "consistent-hash clustering with configurable
 replication," but `internal/cluster` (the ring and coordinator) was dead code with
 zero non-test importers: the live write path sharded each series to a single node
@@ -578,6 +649,7 @@ returned silent partial results. The ring also truncated its hash to 32 bits and
 ignored node state, so it could route to dead nodes. The goal: make replication real
 over the existing docker-compose tier (ingestor → storage ← querier) while leaving
 the single-binary monolith single-node.
+
 **Decision**: Adopt a Dynamo-style quorum model with N, W, R configured in
 `cluster` (defaults N=3, W=2, R=2; `Validate` enforces 1≤W,R≤N and W+R>N for
 read-your-writes). The consistent-hash ring (`internal/cluster`, now widened to a
@@ -639,6 +711,7 @@ smaller than the configured N degrades gracefully rather than rejecting every wr
 ## ADR-023: Write-Path Backpressure — Bounded Queues with Block-Then-Shed Load Shedding
 
 **Status**: Accepted
+
 **Context**: The ingest buffers were effectively unbounded. The monolith
 `BatchWriter` appended into a slice that grew without limit; the ingestor fanned
 out an unbounded number of concurrent quorum writes (one goroutine per HTTP/TCP
@@ -649,6 +722,7 @@ bottleneck — the arrival rate exceeds the service rate, the backlog grows, and
 process simply consumes memory until it OOMs. There was no flow control: no signal
 to the producer to slow down, and no bound on resident work. A policy was required:
 how much to buffer, when to push back, and what to do past the limit.
+
 **Decision**: Put a **bounded queue between accept and the drain-to-storage
 worker** on every ingest path, with **block-then-shed** enqueue. This is flow
 control by a bounded queue: queue depth ≈ arrival_rate × service_time (Little's
@@ -734,6 +808,7 @@ wiring.
 ## ADR-024: Streaming Anomaly Detection — EWMA Baseline + Dispersion, Robust to a Moving Baseline
 
 **Status**: Accepted
+
 **Context**: The telemetry on the live path is not stationary. The simulator (and
 real infrastructure) produces a slow **diurnal swing** (a 24-hour load cycle) and
 slow **drift** (a leaking memory gauge that climbs for minutes then resets), with
@@ -991,6 +1066,7 @@ the whole-batch error path, and that one fsync covers many frames.
 ## ADR-027: Per-Series Fair-Share and Priority-Class Load Shedding
 
 **Status**: Accepted
+
 **Context**: The write-path backpressure of ADR-023 bounds memory by shedding past
 a cap, but it sheds **uniformly**: whatever arrives next when the queue is full is
 dropped, regardless of which series it belongs to or how important it is. Two
@@ -1004,6 +1080,7 @@ spends the scarce queue on whatever shows up rather than on the traffic that
 matters. ADR-023 named both gaps as deferred. The constraint from ADR-015 is that
 order **within** a single series must be preserved (the in-order head depends on
 it), so any fairness scheme must act *across* series only.
+
 **Decision**: Add an **admission shaper** (`internal/backpressure.Shaper`) that is
 consulted **before** the bounded queue on every ingest path. It does not hold
 samples and is not the memory bound — the queue's capacity remains the hard cap
@@ -1204,6 +1281,7 @@ deployment is byte-for-byte unchanged until it opts in.
 ## ADR-029: Hinted Handoff — Buffer Writes for a Down Replica, Replay on Return
 
 **Status**: Accepted
+
 **Context**: ADR-022 made replication real but explicitly deferred hinted handoff, and
 that gap has a sharp edge. Two mechanisms were supposed to keep a replica consistent
 through downtime, and neither closes the hole:
@@ -1311,6 +1389,7 @@ byte-for-byte as ADR-022.
 ## ADR-030: Proactive Anti-Entropy — Merkle Range Digests for Background Replica Convergence
 
 **Status**: Accepted
+
 **Context**: After ADR-022 (replication) and ADR-029 (hinted handoff), every convergence
 path is still *triggered* — and each leaves a gap the others do not close:
 
@@ -1416,6 +1495,7 @@ behaviour.
 ## ADR-031: Rebalancing on Membership Change — Migrate to New Owners, GC the Un-owned
 
 **Status**: Accepted
+
 **Context**: The consistent-hash ring (ADR-022) re-derives *placement* the instant
 membership changes — add a node and `GetNodes`/`PreferenceList`/`ReplicaGroups` immediately
 return the new owner set; remove one and routing flows to the survivors. But the **data**

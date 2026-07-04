@@ -67,19 +67,17 @@ GET /api/query?q=<promql>&start=<ms>&end=<ms>&format=<json|csv|table>
 }
 ```
 
-**Resolution selection** (ADR-011, ADR-025): in the single-binary `serve`, the planner
-transparently serves wide spans from a coarse rollup tier instead of raw, picking the
-resolution from the query span and step. The response carries `resolution_ms` (the
-rollup window served, in ms; `0` = raw) and `points_read` (points fetched from storage)
-so a caller can see that a wide query read far fewer points from a coarse tier. A wide
-range query is also served coarse when its function maps to a stored column — the
-`*_over_time` family reads the matching aggregate (`max_over_time`→max, …) and `rate()`
-reads the counter-increase column as `Σincrease / range` (window-averaged). Short ranges,
-`last_over_time`, and a bare range selector still read raw. This selection runs in the
-docker-compose **cluster** too: the querier runs the same planner and requests the chosen
-resolution + aggregate column from the storage nodes (see Internal Cluster API below), so a
-wide cluster query reports a non-zero `resolution_ms` exactly like the single binary
-(ADR-011).
+**Resolution selection** (ADR-011, ADR-025): the planner transparently serves wide spans
+from a coarse rollup tier instead of raw, picking the resolution from the span and step. The
+response carries `resolution_ms` (the rollup window served in ms; `0` = raw) and `points_read`
+so a caller can see a wide query read far fewer points. A range query is served coarse when
+its function maps to a stored column — the `*_over_time` family reads the matching aggregate
+(`max_over_time`→max, …) and `rate()` reads the counter-increase column as `Σincrease / range`
+(window-averaged); short ranges, `last_over_time`, and a bare range selector still read raw.
+This runs in the single binary and the docker-compose **cluster** alike — the querier runs the
+same planner and requests the chosen resolution + aggregate column from the storage nodes (see
+Internal Cluster API below), so a wide cluster query reports a non-zero `resolution_ms` exactly
+like the single binary.
 
 ### Labels
 
@@ -168,22 +166,20 @@ resolution every live node can serve — the intersection):
 POST /api/internal/backfill
 ```
 
-The catch-up path for hinted handoff (ADR-029). The ingestor replays the hints it
-buffered for a replica that was down through this endpoint when the replica returns. The
-request body is identical to a storage write (`{"time_series":[...]}`); the difference is
-the apply semantics: backfill accepts samples **older** than a series' last (inserting
-them in sorted position, filling only gaps) where `/api/internal/write` would reject them
-as out-of-order (ADR-015). This is what fills an interior gap read-repair cannot. The
-response reports how many samples were applied (an exact duplicate of an existing point is
-skipped):
+The catch-up path for hinted handoff (ADR-029): the ingestor replays hints buffered for a
+down replica through this endpoint when it returns. The body is identical to a storage write
+(`{"time_series":[...]}`); the difference is apply semantics — backfill accepts samples
+**older** than a series' last (inserting them in sorted position, filling only gaps) where
+`/api/internal/write` would reject them as out-of-order (ADR-015). This is what fills an
+interior gap read-repair cannot. The response reports how many samples were applied (an exact
+duplicate is skipped):
 
 ```json
 { "samples_ingested": 128 }
 ```
 
-Backfilled samples are logged under a distinct WAL frame, so they survive a storage
-restart and replay through the same out-of-order-tolerant path; only a recovering replica
-uses this endpoint, so the live in-order write path is unaffected.
+Backfilled samples are logged under a distinct WAL frame, so they survive a storage restart;
+only a recovering replica uses this endpoint, so the live in-order write path is unaffected.
 
 ### Anti-entropy digest & range
 

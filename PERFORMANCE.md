@@ -100,71 +100,66 @@ returns only after the fsync covering its frame.
 These paths have no repeatable benchmark in this repo, so rather than quote invented
 numbers, here are the cost characteristics and where to read the real signal live:
 
-- **Ingestion**: TCP JSON decode → (optional per-series/priority admission, ADR-027) →
-  bounded block-then-shed queue (ADR-023) → WAL
-  append (group-commit fsync, ADR-026 — see below) → in-memory head append (with an
-  inverted-index update). The live
-  rate is on `/api/v1/stats` (`ingestion_rate`, a windowed samples/sec — ADR-017) and
-  the cumulative `meridian_samples_ingested_total` counter; `ingest_queue_depth`/
-  `_capacity` and `meridian_dropped_samples_total` expose backpressure. The default
-  simulator (8 hosts × ~43 series at a 5 s cadence) is a light, steady load.
-- **Admission shaping** (when enabled, ADR-027): one classify (a short scan over the
-  configured classes) plus an allocation-free order-independent hash of the series
-  identity per offered series, and — only above the contention threshold — one
-  sharded token-bucket consult. State is O(shards + metric-buckets), fixed at
-  construction, so cost and memory are independent of series cardinality. Off by
-  default, it adds nothing to the hot path; the selectivity it buys is visible in the
-  `meridian_admission_*` counters.
-- **Query**: cost scales with the number of series matched (inverted-index
-  intersection) × steps — each leaf selector is fetched once over the whole range and
-  sliced per step (ADR-014) — plus the block scan/merge. Per-query latency is recorded
-  in the `meridian_query_latency_seconds` histogram and shown on the dashboard's latency
-  panel.
-- **Memory**: dominated by the in-memory head (per-series label set + sample buffer) and
-  the inverted index. It is bounded over time by flush-to-block plus retention, and
-  bounded under overload by the ingest queue capacity (depth ≤ capacity — ADR-023).
-  Persisted blocks store ~4.5 bits/sample for regular gauges (see above).
-- **Hinted handoff** (ADR-029): off the live write path. A normal write adds, per missed
-  replica, one ring `PreferenceList` walk plus one durable hint file (fsync + rename) on
-  the ingestor — and only while a replica is actually down. Replay and backfill are a
-  background recovery path (one target at a time, FIFO), not the hot path. The buffer is
-  bounded per target by `max_samples_per_node` (drop-oldest past it), so a long outage
-  caps hint disk/memory rather than growing without bound; `meridian_handoff_pending_*`
-  shows the live backlog and `_replayed_/_dropped_samples_total` the catch-up progress.
-- **Anti-entropy** (ADR-030): a background sweep, never on the read or write path, and
-  bounded on both axes. *Spatially*, `groups_per_round` caps how many replica groups a
-  round touches (the round-robin cursor covers the rest over later rounds) and the number
-  of groups tracks the cluster's distinct replica sets, not the virtual-node count.
-  *Temporally*, a round's per-group cost is one match-all read over `[now-lookback, now]`
-  per replica to compute the digest; the agreement case ends at a single root comparison
-  and transfers nothing, and only a divergent `window` is re-read and gap-filled. Smaller
-  `window` re-transfers less per divergence but enlarges the digest; `lookback` bounds the
-  per-round read on large datasets (`0` re-digests all history). `interval`+`jitter` set
-  the cadence and de-sync coordinators. Progress shows in
-  `meridian_anti_entropy_repairs_total` / `_transferred_samples_total`; `_divergent_windows_total`
-  climbing while `_repairs_total` does not flags an unresolvable difference (a same-timestamp
-  value conflict, which gap-fill does not overwrite).
-- **Rebalancing on membership change** (ADR-031): off the live read and write path — it runs
-  only when a node is explicitly joined or left, and the work is proportional to the data that
-  actually moved, not the dataset. The owner-set diff is `O(vnodes × nodes)` over two ring
-  snapshots (no I/O); migration cost is one range read from a current owner plus one backfill
-  push per new owner, per moved arc-group, processed **sequentially** (no thundering herd) with
-  an optional `max_bytes_per_round` to spread a large move across passes. GC is a per-node drop
-  of the shed arcs: the head is flushed once, then only the blocks holding un-owned series are
-  rewritten (decode + re-encode of the kept series) — fully-owned blocks are untouched and
-  fully-un-owned blocks are deleted, so a node that loses a fraction of the keyspace pays for
-  rewriting only the blocks that mix owned and un-owned series. A joining node stays out of
-  routing until its data has arrived, so the migration adds no read-path latency; reads stay
-  complete throughout because the old owners keep their copy until the new owners are confirmed
-  at quorum. `meridian_rebalance_*` shows migrations/bytes moved and GC series/samples
-  reclaimed; `_skipped_total` climbing without `_migrations_total` flags a move that cannot
-  reach a source or a quorum.
-- **Anomaly detection** (ADR-024, ADR-028): on the broadcast tick, not the read or write
-  path — one map lookup and a handful of float ops per live series per tick (~1 Hz), under
-  a single lock. **EWMA** (default) keeps O(1) state per series (a few `float64`s).
-  **Holt-Winters** (`mode: holt_winters`) keeps O(`season_length`) per series (the seasonal
-  array, plus a one-season warmup accumulator that is released once seeded); its per-tick
-  work is still a constant handful of ops (one bucket index from the timestamp, a forecast,
-  three smoothing updates). Memory follows live cardinality because unseen series are
-  evicted. Activity shows in `meridian_anomalies_total` / `meridian_active_anomalies`, and
+- **Ingestion** — TCP JSON decode → optional admission (ADR-027) → bounded block-then-shed
+  queue (ADR-023) → WAL append (group-commit fsync, ADR-026) → in-memory head append (with
+  an inverted-index update). Live signal: `ingestion_rate` (windowed samples/sec, ADR-017)
+  and the cumulative `meridian_samples_ingested_total` on `/api/v1/stats`;
+  `ingest_queue_depth`/`_capacity` and `meridian_dropped_samples_total` expose backpressure.
+  The default simulator (8 hosts × ~43 series at a 5 s cadence) is a light, steady load.
+- **Admission shaping** (when enabled, ADR-027) — per offered series: one classify (a short
+  scan over the configured classes) plus an allocation-free order-independent identity hash,
+  and — only above the contention threshold — one sharded token-bucket consult. State is
+  O(shards + metric-buckets), fixed at construction, so cost and memory are independent of
+  cardinality. Off by default it adds nothing to the hot path; the selectivity shows in
+  `meridian_admission_*`.
+- **Query** — cost scales with matched series (inverted-index intersection) × steps — each
+  leaf selector is fetched once over the whole range and sliced per step (ADR-014) — plus
+  the block scan/merge. Per-query latency is in the `meridian_query_latency_seconds`
+  histogram and on the dashboard's latency panel.
+- **Memory** — dominated by the in-memory head (per-series label set + sample buffer) and
+  the inverted index. Bounded over time by flush-to-block plus retention, and under overload
+  by the ingest queue capacity (depth ≤ capacity, ADR-023). Persisted blocks store ~4.5
+  bits/sample for regular gauges.
+- **Hinted handoff** (ADR-029) — off the live write path. A normal write adds, per missed
+  replica and only while it is down, one ring `PreferenceList` walk plus one durable hint
+  file (fsync + rename) on the ingestor. Replay and backfill are a background recovery path
+  (one target at a time, FIFO). The buffer is bounded per target by `max_samples_per_node`
+  (drop-oldest past it), so a long outage caps hint disk/memory; `meridian_handoff_pending_*`
+  shows the backlog and `_replayed_`/`_dropped_samples_total` the catch-up progress.
+- **Anti-entropy** (ADR-030) — a background sweep, never on the read or write path, bounded
+  on both axes:
+  - *Spatially* — `groups_per_round` caps how many replica groups a round touches (the
+    round-robin cursor covers the rest later), and the group count tracks the cluster's
+    distinct replica sets, not the virtual-node count.
+  - *Temporally* — a round's per-group cost is one match-all read over `[now-lookback, now]`
+    per replica for the digest; agreement ends at a single root comparison and transfers
+    nothing, and only a divergent `window` is re-read and gap-filled.
+  - Tuning: smaller `window` re-transfers less per divergence but enlarges the digest;
+    `lookback` bounds the per-round read (`0` re-digests all history); `interval`+`jitter`
+    set the cadence and de-sync coordinators.
+  - `_repairs_total`/`_transferred_samples_total` show progress; `_divergent_windows_total`
+    climbing while `_repairs_total` does not flags an unresolvable same-timestamp value
+    conflict (gap-fill does not overwrite).
+- **Rebalancing on membership change** (ADR-031) — off the live read and write path; runs
+  only on an explicit join/leave, and the work is proportional to the data that moved, not
+  the dataset:
+  - The owner-set diff is `O(vnodes × nodes)` over two ring snapshots (no I/O); migration is
+    one range read from a current owner plus one backfill push per new owner, per moved
+    arc-group, processed **sequentially** (no thundering herd) with an optional
+    `max_bytes_per_round`.
+  - GC drops the shed arcs per node: the head is flushed once, then only blocks mixing owned
+    and un-owned series are rewritten (decode + re-encode of the kept series) — fully-owned
+    blocks untouched, fully-un-owned deleted.
+  - A joining node stays out of routing until its data arrives, so migration adds no
+    read-path latency; reads stay complete because old owners keep their copy until the new
+    owners are confirmed at quorum.
+  - `meridian_rebalance_*` shows migrations/bytes and GC series/samples; `_skipped_total`
+    climbing without `_migrations_total` flags a move that cannot reach a source or quorum.
+- **Anomaly detection** (ADR-024, ADR-028) — on the broadcast tick, not the read or write
+  path: one map lookup and a handful of float ops per live series per tick (~1 Hz), under a
+  single lock. **EWMA** (default) keeps O(1) state per series; **Holt-Winters**
+  (`mode: holt_winters`) keeps O(`season_length`) (the seasonal array, plus a one-season
+  warmup accumulator released once seeded) with the same constant per-tick work (one bucket
+  index, a forecast, three smoothing updates). Memory follows live cardinality (unseen
+  series evicted). `meridian_anomalies_total`/`meridian_active_anomalies` show activity;
   `meridian_anomaly_model_info` names the active model.
